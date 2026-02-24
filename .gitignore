@@ -1,0 +1,30 @@
+# Dependências
+node_modules/
+
+# Variáveis de ambiente (NUNCA enviar ao GitHub!)
+.env
+.env.local
+.env.*
+
+# Sessão e autenticação do WhatsApp (dados sensíveis)
+data/auth/
+
+# Banco de dados local
+data/*.db
+data/*.sqlite
+
+# Logs
+*.log
+npm-debug.log*
+
+# Sistema operacional
+.DS_Store
+Thumbs.db
+
+# Arquivo com API Key (nome incorreto salvo pelo usuário)
+APi Anthropic.env.txt
+
+# Arquivos temporários do SQLite
+data/*.db-shm
+data/*.db-wal
+data/patients.db

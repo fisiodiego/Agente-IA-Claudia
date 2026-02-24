@@ -1,0 +1,19 @@
+{
+  "name": "whatsapp-patient-agent",
+  "version": "1.0.0",
+  "description": "Agente WhatsApp com IA para gerenciamento de pacientes - follow-ups automáticos",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "@whiskeysockets/baileys": "^6.7.9",
+    "dotenv": "^16.4.5",
+    "node-cron": "^3.0.3",
+    "pino": "^8.19.0",
+    "qrcode-terminal": "^0.12.0"
+  }
+}
