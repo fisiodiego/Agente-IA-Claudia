@@ -252,7 +252,9 @@ Extraia APENAS o que estiver presente na mensagem. Retorne JSON neste formato ex
 Padrões comuns que você deve reconhecer:
 - O paciente pode enviar os 3 dados em linhas separadas (nome na 1ª linha, data na 2ª, telefone na 3ª)
 - O nome pode ter 2 a 5 palavras, com ou sem preposições (de, da, dos, etc.)
-- A data pode vir como DD/MM/AAAA, DD-MM-AAAA ou DD.MM.AAAA
+- A data pode vir COM separadores: DD/MM/AAAA, DD-MM-AAAA, DD.MM.AAAA
+- A data pode vir SEM separadores: "15091983" = 15/09/1983 | "150983" = 15/09/1983 | "1509983" = 15/09/1983 (interprete com bom senso)
+- Sempre retorne a data no formato DD/MM/AAAA
 - O telefone pode vir com ou sem DDD, com traços, espaços ou parênteses — retorne SOMENTE os dígitos
 - Se o telefone tiver 8 dígitos sem DDD, não invente o DDD
 
@@ -273,23 +275,57 @@ Não inclua explicações, apenas o JSON.`,
     console.warn(`⚠️ Falha ao parsear JSON do Haiku: "${extraction.content[0]?.text}" — tentando fallback regex`);
 
     // Fallback: extração direta por regex para o formato de 3 linhas
-    // Linha 1: nome | Linha 2: data | Linha 3: telefone
     const lines = message.trim().split('\n').map(l => l.trim()).filter(Boolean);
 
-    const dateRegex   = /(\d{2})[\/\-\.](\d{2})[\/\-\.](\d{4})/;
-    const phoneRegex  = /[\d\s\(\)\-]{8,}/;
-    const dateMatch   = message.match(dateRegex);
-    const phoneMatch  = message.match(phoneRegex);
+    // Data COM separadores: DD/MM/AAAA
+    const dateWithSep = /(\d{2})[\/\-\.](\d{2})[\/\-\.](\d{4})/;
+    // Data SEM separadores: DDMMYYYY (8 dígitos) ou DDMMYY (6 dígitos) ou typos como 7 dígitos
+    const dateNoSep   = /\b(\d{6,8})\b/;
+    const phoneRegex  = /(?:\(?\d{2}\)?\s?)?\d{4,5}[\-\s]?\d{4}/;
 
-    if (dateMatch) {
-      extracted.birth_date = `${dateMatch[1]}/${dateMatch[2]}/${dateMatch[3]}`;
+    const dateMatchSep = message.match(dateWithSep);
+    if (dateMatchSep) {
+      extracted.birth_date = `${dateMatchSep[1]}/${dateMatchSep[2]}/${dateMatchSep[3]}`;
+    } else {
+      // Tentar data sem separadores em cada linha
+      for (const line of lines) {
+        if (/^\d{6,8}$/.test(line)) {
+          const d = line.replace(/\D/g, '');
+          if (d.length === 8) {
+            // DDMMYYYY
+            extracted.birth_date = `${d.slice(0,2)}/${d.slice(2,4)}/${d.slice(4,8)}`;
+          } else if (d.length === 6) {
+            // DDMMYY → assume 1900s ou 2000s
+            const yy = parseInt(d.slice(4,6));
+            const yyyy = yy > 30 ? `19${d.slice(4,6)}` : `20${d.slice(4,6)}`;
+            extracted.birth_date = `${d.slice(0,2)}/${d.slice(2,4)}/${yyyy}`;
+          } else if (d.length === 7) {
+            // Typo comum: DMMYYYY ou DDMMYYY — tenta DDMMYYYY inserindo dígito
+            extracted.birth_date = `${d.slice(0,2)}/${d.slice(2,4)}/19${d.slice(4,7)}`;
+          }
+          break;
+        }
+      }
     }
+
+    // Telefone: linha com 10-11 dígitos (DDD + número)
+    const phoneMatch = message.match(phoneRegex);
     if (phoneMatch) {
       extracted.contact_phone = phoneMatch[0].replace(/\D/g, '');
+    } else {
+      for (const line of lines) {
+        const digits = line.replace(/\D/g, '');
+        if (digits.length >= 10 && digits.length <= 11) {
+          extracted.contact_phone = digits;
+          break;
+        }
+      }
     }
-    // Nome: primeira linha que não seja data nem só números
+
+    // Nome: primeira linha com 2+ palavras que não seja data nem só números
     for (const line of lines) {
-      if (!dateRegex.test(line) && !/^\d+$/.test(line) && line.split(' ').length >= 2) {
+      const digits = line.replace(/\D/g, '');
+      if (digits.length < 6 && line.split(' ').length >= 2 && /[a-zA-ZÀ-ú]/.test(line)) {
         extracted.name = line;
         break;
       }
