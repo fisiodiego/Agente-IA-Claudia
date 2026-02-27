@@ -151,23 +151,21 @@ export async function processMessage(phone, message) {
       return welcome;
     }
 
-    // 2. Se o cadastro ainda está incompleto, tentar coletar dados
-    if (!patient.registration_complete) {
-      return await handleRegistration(patient, message);
-    }
+    // 2. Detectar resposta ao lembrete do Simples Agenda (CONFIRMAR / CANCELAR)
+    // ⚠️ Deve vir ANTES do cadastro — pacientes que confirmam já são pacientes da clínica
+    const msgTrimmed = message.trim();
+    const isConfirming = /^(confirmar?|confirmado|confirmo|sim\s*,?\s*confirmo?|ok\s*confirmo?)$/i.test(msgTrimmed);
+    const isCancelling = /^(cancelar?|cancelado|cancelo|nao\s*vou|não\s*vou|nao\s*consigo|não\s*consigo)$/i.test(msgTrimmed);
 
-    // 3. Detectar resposta ao lembrete do Simples Agenda (CONFIRMAR / CANCELAR)
-    const upperMsg = message.trim().toUpperCase();
-    if (upperMsg === 'CONFIRMAR') {
+    if (isConfirming) {
       saveMessage(patient.id, 'user', message);
       const reply = appointmentConfirmedReminder(patient.name);
       saveMessage(patient.id, 'assistant', reply);
-      // Agendar check-in para o dia seguinte às 10h
       schedulePostConfirmationFollowup(patient.id);
       console.log(`📅 Agendamento confirmado por ${patient.name || phone}`);
       return reply;
     }
-    if (upperMsg === 'CANCELAR') {
+    if (isCancelling) {
       saveMessage(patient.id, 'user', message);
       const reply = appointmentCancelledResponse(patient.name);
       saveMessage(patient.id, 'assistant', reply);
@@ -175,7 +173,12 @@ export async function processMessage(phone, message) {
       return reply;
     }
 
-    // 4. Verificar se é resposta de pesquisa de satisfação (score 1-5)
+    // 3. Se o cadastro ainda está incompleto, tentar coletar dados
+    if (!patient.registration_complete) {
+      return await handleRegistration(patient, message);
+    }
+
+    // 5. Verificar se é resposta de pesquisa de satisfação (score 1-5)
     const surveyScore = extractSurveyScore(message);
     if (surveyScore) {
       const pendingFollowups = getPatientFollowups(patient.id)
