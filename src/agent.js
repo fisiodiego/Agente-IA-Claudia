@@ -19,6 +19,10 @@ import {
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
+// Anti-duplicata: evita enviar confirmação duas vezes no mesmo período
+const recentlyConfirmed = new Map(); // patientId -> timestamp
+const CONFIRM_COOLDOWN = 60 * 60 * 1000; // 1 hora
+
 // ─── Prompt do Sistema ────────────────────────────────────────────────────────
 
 const SYSTEM_PROMPT = `Você é a Cláudia, assistente virtual do *Instituto Holiz*, clínica especializada em Osteopatia e Quiropraxia.
@@ -154,10 +158,20 @@ export async function processMessage(phone, message) {
     // 2. Detectar resposta ao lembrete do Simples Agenda (CONFIRMAR / CANCELAR)
     // ⚠️ Deve vir ANTES do cadastro — pacientes que confirmam já são pacientes da clínica
     const msgTrimmed = message.trim();
-    const isConfirming = /^(confirmar?|confirmado|confirmo|sim\s*,?\s*confirmo?|ok\s*confirmo?)$/i.test(msgTrimmed);
-    const isCancelling = /^(cancelar?|cancelado|cancelo|nao\s*vou|não\s*vou|nao\s*consigo|não\s*consigo)$/i.test(msgTrimmed);
+
+    // Aceita apenas mensagens curtas do paciente (não mensagens longas do sistema)
+    const isShortEnough = msgTrimmed.length <= 30;
+    const isConfirming = isShortEnough && /^(confirmar?|confirmado|confirmo|sim\s*,?\s*confirmo?|ok\s*confirmo?)$/i.test(msgTrimmed);
+    const isCancelling = isShortEnough && /^(cancelar?|cancelado|cancelo|nao\s*vou|não\s*vou|nao\s*consigo|não\s*consigo)$/i.test(msgTrimmed);
 
     if (isConfirming) {
+      // Anti-duplicata: não envia confirmação duas vezes em 1 hora
+      const lastConfirm = recentlyConfirmed.get(patient.id);
+      if (lastConfirm && Date.now() - lastConfirm < CONFIRM_COOLDOWN) {
+        console.log(`⏭️ Confirmação duplicada ignorada para ${patient.name || phone}`);
+        return null;
+      }
+      recentlyConfirmed.set(patient.id, Date.now());
       saveMessage(patient.id, 'user', message);
       const reply = appointmentConfirmedReminder(patient.name);
       saveMessage(patient.id, 'assistant', reply);
