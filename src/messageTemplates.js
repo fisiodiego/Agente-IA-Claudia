@@ -226,6 +226,16 @@ Estamos sempre à disposição. Cuide-se! 🌿`;
 }
 
 /**
+ * Mensagem enviada quando o paciente pergunta sobre horários disponíveis.
+ * Cláudia sinaliza que vai verificar e passa a conversa para o Dr. Diego.
+ */
+export function availabilityHoldingMessage() {
+  return `${getGreeting()}! 😊 Vou verificar os horários disponíveis para você agora mesmo! 🗓️
+
+Em breve nossa equipe entra em contato com as opções. 😊`;
+}
+
+/**
  * Mapeamento de tipos de follow-up para funções
  */
 export const followupTemplates = {

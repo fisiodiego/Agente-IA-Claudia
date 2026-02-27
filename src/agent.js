@@ -15,6 +15,7 @@ import {
   welcomeMessage,
   appointmentConfirmedReminder,
   appointmentCancelledResponse,
+  availabilityHoldingMessage,
 } from './messageTemplates.js';
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
@@ -190,6 +191,16 @@ export async function processMessage(phone, message) {
     // 3. Se o cadastro ainda está incompleto, tentar coletar dados
     if (!patient.registration_complete) {
       return await handleRegistration(patient, message);
+    }
+
+    // 4. Verificar se é pergunta sobre horários disponíveis
+    // Cláudia responde que vai verificar e ativa o modo humano para o Dr. Diego responder
+    if (isAvailabilityQuestion(message)) {
+      saveMessage(patient.id, 'user', message);
+      const reply = availabilityHoldingMessage();
+      saveMessage(patient.id, 'assistant', reply);
+      console.log(`🗓️ Pergunta sobre horários de ${patient.name || phone} — passando para o Dr. Diego`);
+      return { reply, activateHumanTakeover: true };
     }
 
     // 5. Verificar se é resposta de pesquisa de satisfação (score 1-5)
@@ -408,6 +419,32 @@ Pode me informar? 🙏`;
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/**
+ * Detecta se o paciente está perguntando sobre horários disponíveis para agendar.
+ * Quando true, Cláudia envia mensagem de espera e ativa o modo humano (Dr. Diego responde).
+ */
+function isAvailabilityQuestion(message) {
+  const text = message
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, ''); // remove acentos
+
+  // Não confundir com perguntas sobre horário de funcionamento da clínica
+  if (/horario\s*de\s*(funcionamento|atendimento|abertura)/.test(text)) return false;
+
+  return (
+    /horario[s]?\s*(disponivel[s]?|livre[s]?|vago[s]?)/.test(text) ||  // "horário disponível/livre/vago"
+    /disponivel[s]?\s*horario/.test(text) ||                             // "disponível horário"
+    /tem\s+horario[s]?/.test(text) ||                                    // "tem horário"
+    /quais?\s*(os\s+)?horario[s]?/.test(text) ||                        // "qual/quais horários"
+    /proximo[s]?\s+horario[s]?/.test(text) ||                           // "próximo horário"
+    /tem\s+vaga[s]?/.test(text) ||                                       // "tem vaga"
+    /vaga[s]?\s*(disponivel[s]?|livre[s]?|aberta[s]?)/.test(text) ||    // "vaga disponível/livre"
+    /quando\s+(tem|ha|posso|consigo|da)\s+(horario|agendar|marcar)/.test(text) || // "quando tem horário/posso agendar"
+    /agenda\s+(disponivel|livre|aberta)/.test(text)                      // "agenda disponível/livre"
+  );
+}
 
 /**
  * Verifica se a mensagem é um score de pesquisa de satisfação (1-5).

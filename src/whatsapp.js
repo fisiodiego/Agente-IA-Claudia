@@ -202,14 +202,24 @@ async function handleIncomingMessage(msg) {
     await sock.sendPresenceUpdate('composing', jid);
 
     // Processar com o agente de IA
-    const reply = await processMessage(phone, text);
+    const result = await processMessage(phone, text);
 
     // Parar de "digitar"
     await sock.sendPresenceUpdate('paused', jid);
 
+    // Suporte para retorno com flag de human takeover
+    // (ex: quando paciente pergunta sobre horários disponíveis)
+    const reply = (result && typeof result === 'object') ? result.reply : result;
+    const shouldTakeover = result?.activateHumanTakeover === true;
+
     // Enviar resposta usando o JID original (preserva @lid se necessário)
     if (reply) {
       await sendMessageToJid(jid, phone, reply);
+    }
+
+    // Ativar modo humano APÓS enviar a mensagem de espera
+    if (shouldTakeover) {
+      activateHumanTakeover(phone);
     }
 
   } catch (error) {
