@@ -226,9 +226,9 @@ async function handleIncomingMessage(msg) {
 async function sendMessageToJid(jid, phone, text) {
   if (!sock || !isConnected) throw new Error('WhatsApp não está conectado');
 
-  // Marcar como "enviado pelo bot" antes de enviar (evita race condition)
-  recentBotSentPhones.set(phone, Date.now() + 5000);
-  setTimeout(() => recentBotSentPhones.delete(phone), 6000);
+  // Marcar como "enviado pelo bot" por 60s (janela ampla para evitar race condition)
+  recentBotSentPhones.set(phone, Date.now() + 60000);
+  setTimeout(() => recentBotSentPhones.delete(phone), 61000);
 
   await sock.sendMessage(jid, { text });
   logMessage(phone, 'outbound', text);
@@ -249,9 +249,9 @@ export async function sendMessage(phone, text) {
   const cleanPhone = String(phone).replace(/\D/g, '');
   const jid = `${cleanPhone}@s.whatsapp.net`;
 
-  // Marcar como "enviado pelo bot" antes de enviar (evita race condition)
-  recentBotSentPhones.set(cleanPhone, Date.now() + 5000);
-  setTimeout(() => recentBotSentPhones.delete(cleanPhone), 6000);
+  // Marcar como "enviado pelo bot" por 60s (janela ampla para evitar race condition)
+  recentBotSentPhones.set(cleanPhone, Date.now() + 60000);
+  setTimeout(() => recentBotSentPhones.delete(cleanPhone), 61000);
 
   await sock.sendMessage(jid, { text });
   logMessage(cleanPhone, 'outbound', text);
