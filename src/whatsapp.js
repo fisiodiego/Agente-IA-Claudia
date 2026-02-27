@@ -215,6 +215,17 @@ async function handleIncomingMessage(msg) {
     // Enviar resposta usando o JID original (preserva @lid se necessário)
     if (reply) {
       await sendMessageToJid(jid, phone, reply);
+
+      // Marcar conversa como não lida para o Dr. Diego acompanhar
+      try {
+        await sock.chatModify(
+          { markRead: false, lastMessages: [{ key: msg.key, messageTimestamp: msg.messageTimestamp }] },
+          jid
+        );
+        console.log(`🔵 Conversa marcada como não lida: ${phone}`);
+      } catch (e) {
+        console.warn(`⚠️ Não foi possível marcar como não lida para ${phone}:`, e.message);
+      }
     }
 
     // Ativar modo humano APÓS enviar a mensagem de espera
