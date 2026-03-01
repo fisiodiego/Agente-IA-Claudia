@@ -186,9 +186,6 @@ async function handleIncomingMessage(msg) {
 
     console.log(`📩 Mensagem de ${phone}: "${text.substring(0, 60)}${text.length > 60 ? '...' : ''}"`);
 
-    // Marcar como lida (mesmo em modo humano)
-    await sock.readMessages([msg.key]);
-
     // Se o Dr. Diego está ativo nessa conversa, Cláudia fica quieta
     if (isHumanActive(phone)) {
       console.log(`👨‍⚕️ Modo humano ativo para ${phone} — Cláudia não responde`);
@@ -216,16 +213,6 @@ async function handleIncomingMessage(msg) {
     if (reply) {
       await sendMessageToJid(jid, phone, reply);
 
-      // Marcar conversa como não lida para o Dr. Diego acompanhar
-      try {
-        await sock.chatModify(
-          { markRead: false, lastMessages: [{ key: msg.key, messageTimestamp: msg.messageTimestamp }] },
-          jid
-        );
-        console.log(`🔵 Conversa marcada como não lida: ${phone}`);
-      } catch (e) {
-        console.warn(`⚠️ Não foi possível marcar como não lida para ${phone}:`, e.message);
-      }
     }
 
     // Ativar modo humano APÓS enviar a mensagem de espera
