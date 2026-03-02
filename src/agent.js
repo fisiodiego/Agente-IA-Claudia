@@ -143,21 +143,16 @@ export async function processMessage(phone, message) {
   try {
     // 1. Buscar ou criar paciente
     let patient = getPatientByPhone(phone);
+    const isNewPatient = !patient;
 
     if (!patient) {
-      // Novo paciente — cria registro inicial incompleto
+      // Cria registro inicial (mas ainda não manda boas-vindas — verifica CONFIRMAR antes)
       patient = createPatient({ phone });
-      console.log(`👤 Novo paciente iniciado: ${phone}`);
-
-      // Salva mensagem e retorna boas-vindas com pedido de dados
-      saveMessage(patient.id, 'user', message);
-      const welcome = welcomeMessage();
-      saveMessage(patient.id, 'assistant', welcome);
-      return welcome;
+      console.log(`👤 Novo contato iniciado: ${phone}`);
     }
 
     // 2. Detectar resposta ao lembrete do Simples Agenda (CONFIRMAR / CANCELAR)
-    // ⚠️ Deve vir ANTES do cadastro — pacientes que confirmam já são pacientes da clínica
+    // ⚠️ Deve vir ANTES de tudo — paciente pode confirmar sem nunca ter falado com a Cláudia
     const msgTrimmed = message.trim();
 
     // Aceita apenas mensagens curtas do paciente (não mensagens longas do sistema)
@@ -188,7 +183,15 @@ export async function processMessage(phone, message) {
       return reply;
     }
 
-    // 3. Se o cadastro ainda está incompleto, tentar coletar dados
+    // 3. Se é novo paciente (não confirmou nem cancelou) → boas-vindas e coleta de dados
+    if (isNewPatient) {
+      saveMessage(patient.id, 'user', message);
+      const welcome = welcomeMessage();
+      saveMessage(patient.id, 'assistant', welcome);
+      return welcome;
+    }
+
+    // 3b. Se o cadastro ainda está incompleto, tentar coletar dados
     if (!patient.registration_complete) {
       return await handleRegistration(patient, message);
     }
