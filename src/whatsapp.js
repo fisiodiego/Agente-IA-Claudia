@@ -159,6 +159,12 @@ async function handleIncomingMessage(msg) {
     const phone = extractPhone(jid);
     if (!phone) return;
 
+    // Ignorar números não-brasileiros (sistemas externos como Simples Agenda usam números canadenses/EUA)
+    if (!phone.startsWith('55')) {
+      console.log(`🚫 Mensagem de número não-BR ignorada: ${phone}`);
+      return;
+    }
+
     // ── Mensagens enviadas pelo próprio número ──────────────────────────────
     if (msg.key.fromMe) {
       // Ignorar mensagens para o próprio número (reflexo interno)
