@@ -68,6 +68,11 @@ db.exec(`
   );
 `);
 
+// Adicionar coluna lgpd_consent se ainda não existir (migração segura)
+try {
+  db.exec(`ALTER TABLE patients ADD COLUMN lgpd_consent INTEGER DEFAULT 0`);
+} catch (_) { /* coluna já existe */ }
+
 // ─── Índices para performance ──────────────────────────────────────────────────
 
 db.exec(`
@@ -150,6 +155,10 @@ export const queries = {
   markFollowupResponded: db.prepare(`
     UPDATE followups SET status = 'respondido', response = @response
     WHERE id = @id
+  `),
+
+  setLgpdConsent: db.prepare(`
+    UPDATE patients SET lgpd_consent = 1, updated_at = datetime('now','localtime') WHERE id = ?
   `),
 
   cancelFollowupsByPatient: db.prepare(`

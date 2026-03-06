@@ -226,6 +226,18 @@ Estamos sempre à disposição. Cuide-se! 🌿`;
 }
 
 /**
+ * Mensagem de consentimento LGPD enviada após coletar os dados do paciente.
+ */
+export function lgpdConsentMessage(patientName) {
+  const name = patientName && patientName !== 'Novo Paciente' ? `, *${patientName}*` : '';
+  return `Obrigada${name}! Seus dados foram recebidos.
+
+Precisamos do seu consentimento para cuidar dos seus dados. Eles serão usados apenas para seu atendimento e comunicação. Você pode pedir acesso ou exclusão quando quiser. Ao continuar, você concorda com a LGPD.
+
+Você concorda? (Responda *Sim* para confirmar)`;
+}
+
+/**
  * Mensagem enviada quando o paciente pergunta sobre horários disponíveis.
  * Cláudia sinaliza que vai verificar e passa a conversa para o Dr. Diego.
  */

@@ -38,6 +38,13 @@ export function createPatient({ name = 'Novo Paciente', phone, birth_date = null
  * Atualiza o cadastro do paciente com nome, data de nascimento e telefone de contato.
  * Marca o registro como completo.
  */
+/**
+ * Registra o consentimento LGPD do paciente.
+ */
+export function setLgpdConsent(patientId) {
+  queries.setLgpdConsent.run(patientId);
+}
+
 export function completePatientRegistration(patientId, { name, birth_date, contact_phone }) {
   queries.updatePatientRegistration.run({
     id: patientId,

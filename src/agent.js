@@ -9,6 +9,7 @@ import {
   markFollowupResponded,
   getPatientFollowups,
   schedulePostConfirmationFollowup,
+  setLgpdConsent,
 } from './patientManager.js';
 import {
   thanksSurveyResponse,
@@ -16,6 +17,7 @@ import {
   appointmentConfirmedReminder,
   appointmentCancelledResponse,
   availabilityHoldingMessage,
+  lgpdConsentMessage,
 } from './messageTemplates.js';
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
@@ -71,7 +73,7 @@ Você representa a equipe de atendimento do Instituto Holiz com simpatia, acolhi
 ━━━ TOM E ESTILO DE COMUNICAÇÃO ━━━
 - Seja sempre *cordial e amigável*, como uma recepcionista atenciosa e simpática
 - Use linguagem leve, próxima e acolhedora — sem ser formal demais, mas sempre profissional
-- Use emojis com naturalidade para deixar a conversa mais humana e calorosa 😊
+- Use emojis com moderação — no máximo 1 por mensagem, apenas quando agregar clareza ou calor humano. Nunca use emojis em excesso
 - Chame o paciente pelo primeiro nome sempre que possível
 - Demonstre genuíno interesse pelo bem-estar do paciente
 
@@ -191,7 +193,33 @@ export async function processMessage(phone, message) {
       return welcome;
     }
 
-    // 3b. Se o cadastro ainda está incompleto, tentar coletar dados
+    // 3b. Verificar se está aguardando consentimento LGPD
+    // (dados já coletados, mas paciente ainda não confirmou o consentimento)
+    const hasAllData = patient.name && patient.name !== 'Novo Paciente'
+      && patient.birth_date && patient.contact_phone;
+
+    if (!patient.registration_complete && hasAllData && !patient.lgpd_consent) {
+      saveMessage(patient.id, 'user', message);
+      if (isLgpdConfirmation(message)) {
+        setLgpdConsent(patient.id);
+        completePatientRegistration(patient.id, {
+          name: patient.name,
+          birth_date: patient.birth_date,
+          contact_phone: patient.contact_phone,
+        });
+        console.log(`✅ Consentimento LGPD confirmado por ${patient.name}`);
+        const reply = `Perfeito, *${patient.name}*! Cadastro concluído com sucesso.\n\nComo posso te ajudar hoje?`;
+        saveMessage(patient.id, 'assistant', reply);
+        return reply;
+      } else {
+        // Reenviar mensagem LGPD se paciente não confirmou
+        const reply = lgpdConsentMessage(patient.name);
+        saveMessage(patient.id, 'assistant', reply);
+        return reply;
+      }
+    }
+
+    // 3c. Se o cadastro ainda está incompleto, tentar coletar dados
     if (!patient.registration_complete) {
       return await handleRegistration(patient, message);
     }
@@ -396,17 +424,9 @@ Não inclua explicações, apenas o JSON.`,
   if (!updatedContactPhone) missingFields.push('*número de telefone* para contato');
 
   if (missingFields.length === 0) {
-    // Cadastro completo!
-    completePatientRegistration(patient.id, {
-      name:          updatedName,
-      birth_date:    updatedBirthDate,
-      contact_phone: updatedContactPhone,
-    });
-    console.log(`✅ Cadastro completo: ${updatedName} | ${updatedBirthDate} | ${updatedContactPhone}`);
-
-    const reply = `Obrigada, *${updatedName}*! Cadastro realizado com sucesso. 🎉
-
-Agora me conta: como posso te ajudar hoje? Tem alguma dúvida sobre *Osteopatia* ou *Quiropraxia*, ou gostaria de agendar uma consulta? 😊`;
+    // Todos os dados coletados → solicitar consentimento LGPD antes de concluir o cadastro
+    console.log(`📋 Dados coletados para ${updatedName} — aguardando consentimento LGPD`);
+    const reply = lgpdConsentMessage(updatedName);
     saveMessage(patient.id, 'assistant', reply);
     return reply;
   }
@@ -422,6 +442,16 @@ Pode me informar? 🙏`;
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/**
+ * Detecta se o paciente está confirmando o consentimento LGPD.
+ */
+function isLgpdConfirmation(message) {
+  const text = message.trim().toLowerCase()
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+  return /^(sim|s|ok|concordo|aceito|autorizo|de acordo|confirmo|certo|claro|pode|tudo bem)$/.test(text)
+    || /concordo|aceito|autorizo/.test(text);
+}
 
 /**
  * Detecta se o paciente está perguntando sobre horários disponíveis para agendar.
