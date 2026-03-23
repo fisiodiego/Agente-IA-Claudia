@@ -48,6 +48,7 @@ async function main() {
     console.log('   ✅ Verificação a cada 5 minutos');
     console.log('');
 
+
   } catch (error) {
     console.error('❌ Erro fatal ao iniciar sistema:', error.message);
     console.error(error.stack);

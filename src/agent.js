@@ -1,4 +1,6 @@
 import Anthropic from '@anthropic-ai/sdk';
+import { CRM_TOOLS } from './tools.js';
+import { handleToolCall } from './toolHandler.js';
 import {
   getPatientByPhone,
   createPatient,
@@ -49,7 +51,7 @@ Você representa a equipe de atendimento do Instituto Holiz com simpatia, acolhi
 - Como funciona um atendimento:
   • Anamnese detalhada (histórico de saúde, queixas, estilo de vida)
   • Avaliação postural e de mobilidade
-  • Tratamento manual personalizado (dura em média 50 a 60 minutos)
+  • Tratamento manual personalizado (dura em média 40 a 50 minutos)
   • Orientações e exercícios para casa
 
 🔩 QUIROPRAXIA:
@@ -71,11 +73,20 @@ Você representa a equipe de atendimento do Instituto Holiz com simpatia, acolhi
 - Ao final, convide o paciente a agendar uma avaliação
 
 ━━━ TOM E ESTILO DE COMUNICAÇÃO ━━━
-- Seja sempre *cordial e amigável*, como uma recepcionista atenciosa e simpática
-- Use linguagem leve, próxima e acolhedora — sem ser formal demais, mas sempre profissional
-- Use emojis com moderação — no máximo 1 por mensagem, apenas quando agregar clareza ou calor humano. Nunca use emojis em excesso
-- Chame o paciente pelo primeiro nome sempre que possível
-- Demonstre genuíno interesse pelo bem-estar do paciente
+- Cordial e amigável, como uma recepcionista simpática
+- Linguagem leve e acolhedora, mas profissional
+- Máximo 1 emoji por mensagem
+- Chame pelo primeiro nome
+- ⚠️ RESPOSTAS CURTAS: máximo 4-5 linhas por mensagem. WhatsApp não é e-mail!
+- NUNCA envie listas longas. Se tem muitos horários, mostre no máximo 3-4 opções
+- Vá direto ao ponto. Não repita informações que o paciente já deu
+
+━━━ DATA ATUAL ━━━
+⚠️ IMPORTANTE: A data de HOJE é ${new Date(Date.now() - 3*3600000).toISOString().slice(0,10)}. O ano atual é ${new Date(Date.now() - 3*3600000).getFullYear()}.
+Quando o paciente mencionar datas, SEMPRE use o ano ${new Date(Date.now() - 3*3600000).getFullYear()}.
+- "sexta-feira" = a próxima sexta-feira de ${new Date(Date.now() - 3*3600000).getFullYear()}
+- "27/03" = ${new Date(Date.now() - 3*3600000).getFullYear()}-03-27
+- NUNCA use anos anteriores nas tools
 
 ━━━ REGRAS GERAIS ━━━
 - Sempre se comunique em Português do Brasil
@@ -83,13 +94,13 @@ Você representa a equipe de atendimento do Instituto Holiz com simpatia, acolhi
 - Para emergências, oriente o paciente a ligar para o SAMU (192) ou ir à UPA
 - Se o paciente mencionar que está "de alta", "recebeu alta", "terminou o tratamento" ou similar,
   confirme com entusiasmo e inclua a tag: [ALTA_CONFIRMADA]
-- Mantenha respostas concisas (máximo 3-4 parágrafos)
+- Mantenha respostas CURTAS (máximo 4-5 linhas). Isso é WhatsApp, não e-mail!
 
 ━━━ PLANOS DE TRATAMENTO E PAGAMENTO ━━━
 Quando o paciente perguntar sobre valores, formas de pagamento, planos ou custo do tratamento, utilize exatamente estas informações:
 
 🔸 *Avaliação inicial / Consulta avulsa:*
-• R$ 300,00
+• R$ 280,00
 • Ideal para primeira consulta, check-up ou atendimento isolado
 • Já na primeira consulta, realizamos técnicas de correção para iniciar o cuidado imediatamente
 
@@ -102,7 +113,7 @@ Quando o paciente perguntar sobre valores, formas de pagamento, planos ou custo 
 • 💳 Os planos podem ser parcelados no cartão, tornando mais fácil investir na saúde
 • Após a avaliação inicial, será proposto um plano de tratamento personalizado, com a quantidade de atendimentos necessários para o caso do paciente
 
-IMPORTANTE: Você pode informar o valor da consulta avulsa (R$ 300,00). Para valores dos planos, informe que serão apresentados de forma personalizada após a avaliação inicial.
+IMPORTANTE: Você pode informar o valor da consulta avulsa (R$ 280,00). Para valores dos planos, informe que serão apresentados de forma personalizada após a avaliação inicial.
 
 ━━━ PESQUISA DE SATISFAÇÃO — DOCTORALIA ━━━
 Quando for o momento de pedir avaliação (após atendimento), use o link oficial do Doctoralia:
@@ -113,10 +124,34 @@ Ao solicitar a avaliação, reforce de forma amigável a importância do feedbac
 - As avaliações são fundamentais para a melhoria contínua da qualidade do atendimento
 - Leva menos de 2 minutinhos e faz uma grande diferença! ⭐
 
-━━━ CONFIRMAÇÃO DE AGENDAMENTO ━━━
-O sistema Simples Agenda envia lembretes automáticos de consulta aos pacientes. Quando o paciente responde *CONFIRMAR* ou *CANCELAR*, o sistema já trata automaticamente — você não precisa fazer nada.
+━━━ REGRA CRÍTICA: DADOS DE AGENDAMENTO ━━━
+⚠️ NUNCA invente, suponha ou "adivinhe" horários, datas ou dados de agendamento.
+Se o paciente perguntar sobre sua consulta, horário, ou mencionar agendamento:
+1. USE a tool "get_patient_appointments" para buscar os dados REAIS do CRM
+2. Só informe horários/datas que vieram da tool
+3. Se a tool não retornar dados, diga "Vou verificar seu agendamento" e consulte
+4. NUNCA diga um horário sem ter consultado a tool primeiro
 
-Caso o paciente mencione agendamento de outra forma (ex: "vou agendar", "quero marcar uma consulta"), auxilie normalmente e informe que os agendamentos são feitos pelo Simples Agenda ou pelo telefone da clínica.
+━━━ FLUXO DE AGENDAMENTO ━━━
+Quando o paciente pedir para agendar:
+1. Se ele JÁ disse data, horário e/ou especialidade → NÃO pergunte de novo. Use os dados que ele deu.
+2. Se falta algum dado → pergunte APENAS o que falta, numa frase curta.
+3. Use as tools na ordem: list_professionals → check_availability → find_or_create_patient → create_appointment
+4. Resposta de confirmação: máximo 3 linhas (data, hora, profissional)
+5. Se o horário exato não está disponível, sugira no máximo 2-3 alternativas próximas
+
+Exemplo de resposta IDEAL ao confirmar:
+"Agendado! ✅
+📅 Sexta, 27/03 às 18h
+👨‍⚕️ Dr. Diego Matos - Osteopatia"
+
+Exemplo de resposta RUIM (NÃO faça isso):
+"Perfeito! Vou agendar... Preciso de algumas informações... 1. Qual dia? 2. Qual especialidade? 3. Qual telefone?" ← se ele já disse, NÃO pergunte
+
+━━━ CONFIRMAÇÃO DE AGENDAMENTO ━━━
+Quando o paciente responde *CONFIRMAR* ou *CANCELAR*, o sistema trata automaticamente.
+
+Caso o paciente mencione agendamento de outra forma (ex: "vou agendar", "quero marcar uma consulta"), auxilie normalmente usando as tools do CRM para verificar disponibilidade e criar agendamentos.
 
 ━━━ CONTEXTO DA CLÍNICA ━━━
 - Nome: Instituto Holiz
@@ -159,7 +194,7 @@ export async function processMessage(phone, message) {
 
     // Aceita apenas mensagens curtas do paciente (não mensagens longas do sistema)
     const isShortEnough = msgTrimmed.length <= 30;
-    const isConfirming = isShortEnough && /^(confirmar?|confirmado|confirmo|sim\s*,?\s*confirmo?|ok\s*confirmo?)$/i.test(msgTrimmed);
+    const isConfirming = isShortEnough && /^(confirmar?|confirmou|confirmad[oa]|confirmo|sim[\s,]*confirmo?|ok[\s,]*confirmo?)$/i.test(msgTrimmed);
     const isCancelling = isShortEnough && /^(cancelar?|cancelado|cancelo|nao\s*vou|não\s*vou|nao\s*consigo|não\s*consigo)$/i.test(msgTrimmed);
 
     if (isConfirming) {
@@ -171,6 +206,44 @@ export async function processMessage(phone, message) {
       }
       recentlyConfirmed.set(patient.id, Date.now());
       saveMessage(patient.id, 'user', message);
+
+      // ── Confirmar no CRM ──────────────────────────────────────
+      try {
+        const { getPatientAppointments, confirmAppointment, searchPatientByName } = await import('./crmApi.js');
+        let confirmed = false;
+        // Tenta buscar agendamentos pelo telefone
+        const aptsResult = await getPatientAppointments(phone);
+        if (aptsResult.ok && aptsResult.data?.appointments?.length) {
+          const pending = aptsResult.data.appointments.filter(a => a.status === 'agendado');
+          if (pending.length > 0) {
+            const confirmResult = await confirmAppointment(pending[0].id);
+            if (confirmResult.ok) {
+              console.log(`✅ Agendamento ${pending[0].id} confirmado no CRM para ${patient.name || phone}`);
+              confirmed = true;
+            }
+          }
+        }
+        // Fallback: busca por nome (para pacientes LID)
+        if (!confirmed && patient.name) {
+          const nameResult = await searchPatientByName(patient.name);
+          if (nameResult.ok && nameResult.data?.found && nameResult.data.patient?.phone) {
+            const realPhone = nameResult.data.patient.phone;
+            const aptsResult2 = await getPatientAppointments(realPhone);
+            if (aptsResult2.ok && aptsResult2.data?.appointments?.length) {
+              const pending2 = aptsResult2.data.appointments.filter(a => a.status === 'agendado');
+              if (pending2.length > 0) {
+                const confirmResult2 = await confirmAppointment(pending2[0].id);
+                if (confirmResult2.ok) {
+                  console.log(`✅ Agendamento ${pending2[0].id} confirmado no CRM (via nome) para ${patient.name}`);
+                }
+              }
+            }
+          }
+        }
+      } catch (err) {
+        console.error(`❌ Erro ao confirmar no CRM: ${err.message}`);
+      }
+
       const reply = appointmentConfirmedReminder(patient.name);
       saveMessage(patient.id, 'assistant', reply);
       schedulePostConfirmationFollowup(patient.id);
@@ -185,9 +258,87 @@ export async function processMessage(phone, message) {
       return reply;
     }
 
-    // 3. Se é novo paciente (não confirmou nem cancelou) → boas-vindas e coleta de dados
+    // 3. Se é novo paciente → verificar se já existe no CRM antes de pedir dados
     if (isNewPatient) {
       saveMessage(patient.id, 'user', message);
+      try {
+        const { searchPatientByPhone, searchPatientByName, getUpcomingAppointments } = await import('./crmApi.js');
+        
+        // Detectar se é LID (não é telefone BR válido)
+        const isLID = !/^55\d{10,11}$/.test(phone) && !/^\d{10,11}$/.test(phone);
+        
+        let crmResult = null;
+        
+        if (!isLID) {
+          // Busca normal por telefone
+          crmResult = await searchPatientByPhone(phone);
+        }
+        
+        // Se é LID ou não encontrou por telefone, tenta extrair nome da mensagem
+        if (!crmResult?.found && isLID) {
+          // Tenta buscar nos agendamentos de hoje para encontrar por nome
+          const today = new Date();
+          const brt = new Date(today.getTime() - 3 * 60 * 60 * 1000);
+          const todayStr = brt.toISOString().slice(0, 10);
+          const aptsResult = await getUpcomingAppointments(todayStr, { includeConfirmed: true });
+          if (aptsResult.ok && aptsResult.data?.length) {
+            // Verificar se a mensagem contém um nome de paciente agendado hoje
+            const msgLower = message.toLowerCase().trim();
+            for (const apt of aptsResult.data) {
+              const aptNameLower = apt.patientName?.toLowerCase() || '';
+              const firstName = aptNameLower.split(' ')[0];
+              // Se a mensagem é curta (tipo "Bom dia", "Cheguei", "Irmão") não dá pra saber
+              // Mas se mandar o nome, podemos encontrar
+              if (firstName && msgLower.includes(firstName) && firstName.length > 2) {
+                crmResult = await searchPatientByPhone(apt.patientPhone);
+                if (crmResult?.found) {
+                  console.log(`✅ Paciente LID encontrado via agendamento de hoje: ${apt.patientName}`);
+                  break;
+                }
+              }
+            }
+          }
+          
+          // Se ainda não encontrou, tenta buscar pelo texto da mensagem como nome
+          if (!crmResult?.found && message.trim().length > 3 && message.trim().length < 60) {
+            const nameResult = await searchPatientByName(message.trim());
+            if (nameResult?.ok && nameResult.data?.found) {
+              crmResult = { found: true, patient: nameResult.data.patient };
+              console.log(`✅ Paciente LID encontrado por nome na mensagem: ${nameResult.data.patient.name}`);
+            }
+          }
+        }
+        
+        if (crmResult && crmResult.found && crmResult.patient) {
+          const crmPat = crmResult.patient;
+          console.log(`✅ Paciente encontrado no CRM: ${crmPat.name} (${phone})`);
+          const { queries } = await import('./database.js');
+          queries.updatePatient.run({
+            id: patient.id,
+            name: crmPat.name,
+            email: crmPat.email || '',
+            specialty: crmPat.specialty || 'osteopatia',
+            notes: '',
+          });
+          const db = (await import('./database.js')).default;
+          db.prepare(`UPDATE patients SET
+            birth_date = COALESCE(@birth_date, birth_date),
+            contact_phone = COALESCE(@contact_phone, contact_phone),
+            registration_complete = 1, lgpd_consent = 1,
+            updated_at = datetime('now','localtime')
+            WHERE id = @id`).run({
+            id: patient.id,
+            birth_date: crmPat.birthDate || null,
+            contact_phone: phone,
+          });
+          const firstName = crmPat.name.split(' ')[0];
+          const reply = `Ol\u00e1, *${firstName}*! 😊 Que bom falar com voc\u00ea!\n\nSou a *Cl\u00e1udia*, assistente virtual do Instituto Holiz. Como posso te ajudar hoje?`;
+          saveMessage(patient.id, 'assistant', reply);
+          return reply;
+        }
+      } catch (err) {
+        console.log(`⚠️ Erro ao buscar paciente no CRM: ${err.message}`);
+      }
       const welcome = welcomeMessage();
       saveMessage(patient.id, 'assistant', welcome);
       return welcome;
@@ -195,8 +346,7 @@ export async function processMessage(phone, message) {
 
     // 3b. Verificar se está aguardando consentimento LGPD
     // (dados já coletados, mas paciente ainda não confirmou o consentimento)
-    const hasAllData = patient.name && patient.name !== 'Novo Paciente'
-      && patient.birth_date && patient.contact_phone;
+    const hasAllData = patient.name && patient.name !== 'Novo Paciente';  // nascimento e telefone coletados no agendamento
 
     if (!patient.registration_complete && hasAllData && !patient.lgpd_consent) {
       saveMessage(patient.id, 'user', message);
@@ -221,6 +371,53 @@ export async function processMessage(phone, message) {
 
     // 3c. Se o cadastro ainda está incompleto, tentar coletar dados
     if (!patient.registration_complete) {
+      // Para pacientes LID sem nome, tentar buscar no CRM antes de pedir dados
+      const isLID = !/^55\d{10,11}$/.test(phone) && !/^\d{10,11}$/.test(phone);
+      if (isLID && (!patient.name || patient.name === 'Novo Paciente')) {
+        try {
+          const { searchPatientByName, searchPatientByPhone, getUpcomingAppointments } = await import('./crmApi.js');
+          
+          // 1. Tenta buscar pelo texto da mensagem como nome
+          const trimmed = message.trim();
+          if (trimmed.length > 3 && trimmed.length < 60 && /^[A-ZÀ-Ú][a-zà-ú]/.test(trimmed)) {
+            const nameResult = await searchPatientByName(trimmed);
+            if (nameResult?.ok && nameResult.data?.found && nameResult.data.patient) {
+              const crmPat = nameResult.data.patient;
+              console.log(`✅ Paciente LID identificado por nome: ${crmPat.name}`);
+              const { queries } = await import('./database.js');
+              const db = (await import('./database.js')).default;
+              queries.updatePatient.run({ id: patient.id, name: crmPat.name, email: crmPat.email || '', specialty: crmPat.specialty || 'osteopatia', notes: '' });
+              db.prepare(`UPDATE patients SET registration_complete = 1, lgpd_consent = 1, contact_phone = COALESCE(@contact_phone, contact_phone), birth_date = COALESCE(@birth_date, birth_date), updated_at = datetime('now','localtime') WHERE id = @id`).run({ id: patient.id, contact_phone: crmPat.phone || phone, birth_date: crmPat.birthDate || null });
+              const firstName = crmPat.name.split(' ')[0];
+              saveMessage(patient.id, 'user', message);
+              const reply = `Olá, *${firstName}*! 😊 Te identifiquei!\n\nSou a *Cláudia*, assistente virtual do Instituto Holiz. Como posso te ajudar?`;
+              saveMessage(patient.id, 'assistant', reply);
+              return reply;
+            }
+          }
+          
+          // 2. Tenta buscar nos agendamentos de hoje
+          const now = new Date();
+          const brt = new Date(now.getTime() - 3 * 60 * 60 * 1000);
+          const todayStr = brt.toISOString().slice(0, 10);
+          const aptsResult = await getUpcomingAppointments(todayStr, { includeConfirmed: true });
+          if (aptsResult.ok && aptsResult.data?.length) {
+            const nowHour = brt.getHours();
+            // Buscar pacientes agendados para a próxima hora (provável ser quem está mandando "cheguei")
+            const nearbyApts = aptsResult.data.filter(a => {
+              const aptHour = parseInt(a.time?.split(':')[0] || '0');
+              return Math.abs(aptHour - nowHour) <= 1 && a.status !== 'cancelado';
+            });
+            // Se só tem 1 paciente perto desse horário que ainda não confirmou por outro meio, pode ser ele
+            // Mas não assumir automaticamente — só logar para debug
+            if (nearbyApts.length > 0) {
+              console.log(`ℹ️ LID sem nome, ${nearbyApts.length} agendamento(s) próximo(s): ${nearbyApts.map(a => a.patientName).join(', ')}`);
+            }
+          }
+        } catch (err) {
+          console.log(`⚠️ Erro ao buscar LID no CRM: ${err.message}`);
+        }
+      }
       return await handleRegistration(patient, message);
     }
 
@@ -258,14 +455,49 @@ export async function processMessage(phone, message) {
       { role: 'user', content: message },
     ];
 
-    const response = await anthropic.messages.create({
-      model: 'claude-opus-4-5',
-      max_tokens: 1024,
-      system: SYSTEM_PROMPT,
-      messages,
-    });
+    let currentMessages = [...messages];
+    let assistantReply = "";
+    
+    // Tool use loop - keep calling until we get a text response
+    while (true) {
+      const response = await anthropic.messages.create({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 2048,
+        system: SYSTEM_PROMPT,
+        messages: currentMessages,
+        tools: CRM_TOOLS,
+      });
 
-    const assistantReply = response.content[0].text;
+      // Check if response has tool_use blocks
+      const toolUseBlocks = response.content.filter(b => b.type === 'tool_use');
+      const textBlocks = response.content.filter(b => b.type === 'text');
+
+      if (toolUseBlocks.length === 0) {
+        // No tools called, get text response
+        assistantReply = textBlocks.map(b => b.text).join("") || "";
+        break;
+      }
+
+      // Execute tools and add results
+      currentMessages.push({ role: 'assistant', content: response.content });
+      
+      const toolResults = [];
+      for (const toolBlock of toolUseBlocks) {
+        console.log("Tool call: " + toolBlock.name + " " + JSON.stringify(toolBlock.input));
+        const result = await handleToolCall(toolBlock.name, toolBlock.input);
+        toolResults.push({
+          type: 'tool_result',
+          tool_use_id: toolBlock.id,
+          content: result,
+        });
+      }
+      currentMessages.push({ role: 'user', content: toolResults });
+      
+      // If there was also text with the tool call, capture it
+      if (textBlocks.length > 0) {
+        assistantReply = textBlocks.map(b => b.text).join("");
+      }
+    }
 
     // 6. Salvar resposta do assistente
     saveMessage(patient.id, 'assistant', assistantReply);
@@ -419,24 +651,35 @@ Não inclua explicações, apenas o JSON.`,
 
   // Verificar quais campos ainda faltam
   const missingFields = [];
-  if (!updatedName || updatedName === 'Novo Paciente') missingFields.push('*nome completo*');
-  if (!updatedBirthDate) missingFields.push('*data de nascimento* (dd/mm/aaaa)');
-  if (!updatedContactPhone) missingFields.push('*número de telefone* para contato');
+  if (!updatedName || updatedName === 'Novo Paciente') missingFields.push('*nome*');
+  // Data de nascimento e telefone ser\u00e3o coletados na hora do agendamento
 
   if (missingFields.length === 0) {
-    // Todos os dados coletados → solicitar consentimento LGPD antes de concluir o cadastro
+    // Tentar buscar no CRM por nome (especialmente para pacientes LID)
+    try {
+      const { searchPatientByName } = await import("./crmApi.js");
+      const crmResult = await searchPatientByName(updatedName);
+      if (crmResult && crmResult.found && crmResult.patient) {
+        const crmPat = crmResult.patient;
+        console.log("CRM match by name: " + crmPat.name + " (id: " + crmPat.id + ")");
+        const db = (await import("./database.js")).default;
+        db.prepare("UPDATE patients SET birth_date = COALESCE(@bd, birth_date), contact_phone = COALESCE(@cp, contact_phone), registration_complete = 1, lgpd_consent = 1, updated_at = datetime(now,localtime) WHERE id = @id")
+          .run({ id: patient.id, bd: crmPat.birthDate || null, cp: crmPat.phone ? crmPat.phone.replace(/\D/g, "") : null });
+        const firstName = updatedName.split(" ")[0];
+        const reply = "Ola, *" + firstName + "*! Te encontrei no nosso sistema. Como posso te ajudar? \u{1F60A}";
+        saveMessage(patient.id, "assistant", reply);
+        return reply;
+      }
+    } catch (err) {
+      console.log("CRM name search error: " + err.message);
+    }
     console.log(`📋 Dados coletados para ${updatedName} — aguardando consentimento LGPD`);
     const reply = lgpdConsentMessage(updatedName);
     saveMessage(patient.id, 'assistant', reply);
     return reply;
   }
 
-  // Ainda faltam dados — pedir de forma amigável
-  const reply = `Obrigada pela resposta! 😊
-
-Para finalizar seu cadastro, ainda preciso de:\n${missingFields.map(f => `• ${f}`).join('\n')}
-
-Pode me informar? 🙏`;
+  const reply = `N\u00e3o consegui identificar seu nome. Pode me dizer seu *nome completo*? 😊`;
   saveMessage(patient.id, 'assistant', reply);
   return reply;
 }

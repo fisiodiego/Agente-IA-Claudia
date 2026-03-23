@@ -81,6 +81,67 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_followups_status ON followups(status);
   CREATE INDEX IF NOT EXISTS idx_followups_date   ON followups(scheduled_date);
   CREATE INDEX IF NOT EXISTS idx_conversations_patient ON conversations(patient_id);
+
+  CREATE TABLE IF NOT EXISTS processed_discharges (
+    patient_id     INTEGER NOT NULL,
+    discharge_date TEXT    NOT NULL,
+    processed_at   TEXT    NOT NULL,
+    PRIMARY KEY (patient_id, discharge_date)
+  );
+
+  CREATE TABLE IF NOT EXISTS config (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+  );
+`);
+
+// ─── Tabelas para automações Claudia IA ────────────────────────────────────────
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS package_reminders (
+    package_id TEXT NOT NULL,
+    level      INTEGER NOT NULL,
+    sent_at    TEXT NOT NULL,
+    PRIMARY KEY (package_id, level)
+  );
+
+  CREATE TABLE IF NOT EXISTS processed_noshows (
+    appointment_id TEXT PRIMARY KEY,
+    processed_at   TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS processed_completions (
+    appointment_id TEXT PRIMARY KEY,
+    scheduled_date TEXT NOT NULL,
+    processed_at   TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS sent_birthdays (
+    patient_phone TEXT NOT NULL,
+    year          INTEGER NOT NULL,
+    sent_at       TEXT NOT NULL,
+    PRIMARY KEY (patient_phone, year)
+  );
+
+  CREATE TABLE IF NOT EXISTS sent_reactivations (
+    patient_id   TEXT PRIMARY KEY,
+    sent_at      TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS notified_completed_packages (
+    package_id TEXT PRIMARY KEY,
+    sent_at    TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS sent_referrals (
+    patient_phone TEXT PRIMARY KEY,
+    sent_at       TEXT NOT NULL
+  );
+
+    CREATE TABLE IF NOT EXISTS sent_sameday_reminders (
+      appointment_id TEXT PRIMARY KEY,
+      sent_at TEXT NOT NULL
+    );
 `);
 
 // ─── Queries preparadas ────────────────────────────────────────────────────────
@@ -170,6 +231,7 @@ export const queries = {
   getConversationHistory: db.prepare(`
     SELECT role, content FROM conversations
     WHERE patient_id = ?
+      AND created_at >= datetime('now', 'localtime', '-48 hours')
     ORDER BY created_at DESC
     LIMIT 20
   `),

@@ -10,6 +10,10 @@ import { fileURLToPath } from 'url';
 import fs from 'fs';
 
 import { processMessage } from './agent.js';
+
+// ─── Debounce: agrupa mensagens rápidas do mesmo contato ───────────────────
+const messageBuffer = new Map(); // phone -> { texts: [], jid, timer }
+const DEBOUNCE_MS = 5000; // 5 segundos
 import { logMessage } from './patientManager.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -38,11 +42,35 @@ const knownPatientJids = new Set();    // JIDs de pacientes que já enviaram men
  */
 function extractPhone(jid) {
   if (!jid) return null;
-  return jid
+  const raw = jid
     .replace(/@s\.whatsapp\.net$/, '')
     .replace(/@c\.us$/, '')
     .replace(/@lid$/, '')
     .replace(/\D/g, '');
+  return normalizeBRPhone(raw);
+}
+
+/**
+ * Normaliza número BR: garante formato 55 + DDD (2 dígitos) + número (9 dígitos).
+ * Ex: 71993507884 -> 5571993507884, 557193507884 -> 5571993507884
+ */
+function normalizeBRPhone(phone) {
+  if (!phone) return phone;
+  let p = String(phone).replace(/\D/g, '');
+  // Sem código do país (10-11 dígitos): adicionar 55
+  if (p.length >= 10 && p.length <= 11) {
+    p = '55' + p;
+  }
+  // Formato novo BR com 9 extra: 55 + DDD(2) + 9XXXXXXXX = 13 dígitos
+  // Converter para formato WhatsApp (12 dígitos): remover o 9 extra
+  if (p.length === 13 && p.startsWith('55')) {
+    const ddd = p.substring(2, 4);
+    const num = p.substring(4); // 9 dígitos
+    if (num.startsWith('9')) {
+      p = '55' + ddd + num.substring(1); // 12 dígitos (formato WhatsApp)
+    }
+  }
+  return p;
 }
 
 /**
@@ -160,9 +188,15 @@ async function handleIncomingMessage(msg) {
     if (!phone) return;
 
     // Ignorar números não-brasileiros (sistemas externos como Simples Agenda usam números canadenses/EUA)
-    if (!phone.startsWith('55')) {
+    // Ignorar números não-brasileiros — MAS permitir JIDs @lid (formato interno multi-device)
+    const isLid = jid.endsWith('@lid');
+    if (!phone.startsWith('55') && !isLid) {
       console.log(`🚫 Mensagem de número não-BR ignorada: ${phone}`);
       return;
+    }
+    // Para LIDs, logar para debug
+    if (isLid) {
+      console.log(`🔗 Mensagem LID recebida: ${phone} (jid: ${jid})`);
     }
 
     // ── Mensagens enviadas pelo próprio número ──────────────────────────────
@@ -201,11 +235,39 @@ async function handleIncomingMessage(msg) {
 
     logMessage(phone, 'inbound', text);
 
+    // ── Debounce: agrupa mensagens rápidas ──────────────────────────────
+    const existing = messageBuffer.get(phone);
+    if (existing) {
+      existing.texts.push(text);
+      clearTimeout(existing.timer);
+      existing.timer = setTimeout(() => processBuffered(phone), DEBOUNCE_MS);
+      return;
+    }
+    messageBuffer.set(phone, {
+      texts: [text],
+      jid,
+      timer: setTimeout(() => processBuffered(phone), DEBOUNCE_MS),
+    });
+    return;
+  } catch (error) {
+    console.error('❌ Erro ao processar mensagem:', error.message);
+  }
+}
+
+async function processBuffered(phone) {
+  const buf = messageBuffer.get(phone);
+  if (!buf) return;
+  messageBuffer.delete(phone);
+
+  const { texts, jid } = buf;
+  const combinedText = texts.join('\n');
+
+  try {
     // Mostrar "digitando..."
     await sock.sendPresenceUpdate('composing', jid);
 
     // Processar com o agente de IA
-    const result = await processMessage(phone, text);
+    const result = await processMessage(phone, combinedText);
 
     // Parar de "digitar"
     await sock.sendPresenceUpdate('paused', jid);
@@ -260,7 +322,7 @@ export async function sendMessage(phone, text) {
     throw new Error('WhatsApp não está conectado');
   }
 
-  const cleanPhone = String(phone).replace(/\D/g, '');
+  const cleanPhone = normalizeBRPhone(String(phone));
   const jid = `${cleanPhone}@s.whatsapp.net`;
 
   // Marcar como "enviado pelo bot" por 60s (janela ampla para evitar race condition)

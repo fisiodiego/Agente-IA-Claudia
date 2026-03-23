@@ -19,12 +19,7 @@ export function welcomeMessage() {
 
 Sou a *Cláudia*, assistente virtual do Instituto. Estou aqui para te ajudar com agendamentos, dúvidas sobre nossos tratamentos e muito mais. 🌿
 
-Para começarmos, poderia me informar:
-1️⃣ Seu *nome completo*
-2️⃣ Sua *data de nascimento* (dd/mm/aaaa)
-3️⃣ Seu *número de telefone* para contato
-
-Assim consigo te atender da melhor forma! 😊`;
+Para começar, qual é o seu *nome*? 😊`;
 }
 
 /**
@@ -196,21 +191,16 @@ Estamos sempre aqui para te apoiar nessa jornada! Qualquer dúvida, é só chama
  */
 export function appointmentConfirmedReminder(patientName) {
   const name = patientName && patientName !== 'Novo Paciente' ? patientName.split(' ')[0] : '';
-  const greeting = name ? `Ótimo, *${name}*! ` : 'Ótimo! ';
+  const greeting = name ? `Ótimo, *${name}*!` : 'Ótimo!';
 
-  return `${greeting}Consulta confirmada com sucesso! 🎉
+  return `${greeting} Consulta confirmada! ✅
 
-Só alguns lembretes importantes antes da sua consulta:
+Venha com roupas confortáveis (legging, moletom ou roupa de ginástica).
 
-👕 *Roupas adequadas:*
-Venha com roupas confortáveis e fáceis de movimentar — roupa de ginástica, legging ou moletom são ótimas opções! Isso facilita muito a avaliação e o tratamento. 😊
+Se precisar *reagendar ou cancelar*, nos avise com pelo menos *12 horas de antecedência*.
 
-⚠️ *Política de cancelamento:*
-Caso precise cancelar ou reagendar, pedimos que nos avise com pelo menos *12 horas de antecedência*. Ausências sem aviso prévio após a confirmação serão *contabilizadas como consulta realizada*.
-
-Te esperamos! Qualquer dúvida, é só chamar. 🌿`;
+Te esperamos! 🌿`;
 }
-
 /**
  * Resposta quando o paciente cancela o agendamento via Simples Agenda
  */
@@ -270,3 +260,299 @@ export const followupDescriptions = {
   lembrete_6meses:      'Lembrete de 6 meses pós-alta',
   lembrete_12meses:     'Lembrete de 12 meses pós-alta',
 };
+
+/**
+ * Lembrete de consulta enviado 24h antes do agendamento.
+ */
+export function appointmentReminder24h(patientName, date, time, professionalName, specialty) {
+  const name = patientName && patientName !== 'Novo Paciente' ? patientName.split(' ')[0] : '';
+  const greeting = getGreeting();
+  const specialtyLabel = specialty === 'quiropraxia' ? 'Quiropraxia' : specialty === 'psicologia' ? 'Psicologia' : 'Osteopatia';
+
+  return `${greeting}${name ? `, *${name}*` : ''}! 😊
+
+Passando para lembrar que você tem *consulta amanhã*:
+
+📅 *Data:* ${date}
+🕐 *Horário:* ${time}
+👨‍⚕️ *Profissional:* ${professionalName}
+🩺 *Especialidade:* ${specialtyLabel}
+
+📍 *Local:* Av. Vasco da Gama, 3691 - Edf. Vasco da Gama Plaza, sala 1401 — Salvador/BA
+
+👕 Lembre-se de vir com *roupas confortáveis* (legging, moletom ou roupa de ginástica).
+
+Se precisar *reagendar ou cancelar*, por favor nos avise com pelo menos *12 horas de antecedência*.
+
+Te esperamos! 🌿`;
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TEMPLATES: Lembrete de retorno de pacote (3 níveis de urgência)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Nível 1 (7+ dias sem agendar): Lembrete gentil
+ */
+export function packageReminderLevel1(patientName, freeSessions, productName, deadlineDate) {
+  const name = patientName ? patientName.split(' ')[0] : '';
+  const greeting = getGreeting();
+  return `${greeting}${name ? `, *${name}*` : ''}! 😊
+
+Passando para lembrar que você ainda tem *${freeSessions} sessão(ões)* disponível(eis) no seu pacote *${productName}*! 🌿
+
+Você tem até *${deadlineDate}* para concluir seu pacote. Que tal agendarmos sua próxima sessão?
+
+Responda aqui e encontramos o melhor horário para você! 📅`;
+}
+
+/**
+ * Nível 2 (14+ dias sem agendar): Mais direto
+ */
+export function packageReminderLevel2(patientName, freeSessions, productName, deadlineDate) {
+  const name = patientName ? patientName.split(' ')[0] : '';
+  const greeting = getGreeting();
+  return `${greeting}${name ? `, *${name}*` : ''}! 😊
+
+Não esqueça! Você tem *${freeSessions} sessão(ões)* restante(s) no seu pacote *${productName}* e o prazo para conclusão é *${deadlineDate}*. ⏰
+
+A regularidade do tratamento é fundamental para os melhores resultados! Vamos agendar sua próxima sessão? 💚
+
+É só responder aqui que marcamos pra você! 📅`;
+}
+
+/**
+ * Nível 3 (21+ dias ou <2 semanas do vencimento): Urgente
+ */
+export function packageReminderLevel3(patientName, freeSessions, productName, deadlineDate) {
+  const name = patientName ? patientName.split(' ')[0] : '';
+  const greeting = getGreeting();
+  return `${greeting}${name ? `, *${name}*` : ''}! ⚠️
+
+*Atenção:* Seu pacote *${productName}* está próximo do vencimento!
+
+📋 Você ainda tem *${freeSessions} sessão(ões)* para usar
+📅 Prazo final: *${deadlineDate}*
+
+As sessões não utilizadas dentro do prazo serão perdidas. Não deixe para a última hora!
+
+Responda agora e agendamos suas sessões restantes! 🗓️`;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TEMPLATE: Reagendamento de faltantes
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Mensagem enviada quando paciente falta à consulta
+ */
+export function noShowRescheduling(patientName, date, time, professionalName) {
+  const name = patientName ? patientName.split(' ')[0] : '';
+  const greeting = getGreeting();
+  const [y, m, d] = date.split('-');
+  const dateBR = `${d}/${m}/${y}`;
+  return `${greeting}${name ? `, *${name}*` : ''}! 😊
+
+Sentimos sua falta na consulta de hoje (${dateBR} às ${time}) com *${professionalName}*! 💚
+
+Sabemos que imprevistos acontecem. Gostaria de *reagendar* sua consulta? Estamos aqui para encontrar o melhor horário para você! 📅
+
+Lembrando que a regularidade do tratamento faz toda a diferença nos resultados. 🌿
+
+Responda aqui e agendamos rapidinho! 😊`;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TEMPLATE: Lista de espera — notificação de vaga
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Mensagem enviada quando abre vaga para paciente na lista de espera
+ */
+export function waitlistNotification(patientName, date, professionalName) {
+  const name = patientName ? patientName.split(' ')[0] : '';
+  const greeting = getGreeting();
+  const [y, m, d] = date.split('-');
+  const dateBR = `${d}/${m}/${y}`;
+  return `${greeting}${name ? `, *${name}*` : ''}! 🎉
+
+Ótima notícia! Abriu uma *vaga* na agenda do dia *${dateBR}* com *${professionalName}*!
+
+Você estava na nossa lista de espera para esse dia. Gostaria de aproveitar e *agendar*? 📅
+
+Responda rápido para garantir o horário! 😊🌿`;
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TEMPLATE: Pós-consulta — check-in dia seguinte
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Mensagem enviada no dia seguinte após consulta concluída.
+ * Pergunta como o paciente está, sem pesquisa de satisfação.
+ */
+export function postConsultationCheckIn(patientName) {
+  const name = patientName ? patientName.split(' ')[0] : '';
+  const greeting = getGreeting();
+  return `${greeting}${name ? `, *${name}*` : ''}! 😊
+
+Passando aqui para saber como você está se sentindo após a consulta! 💚
+
+Já conseguiu começar a fazer os exercícios que foram orientados? Manter a regularidade faz toda a diferença no resultado do tratamento! 🏃
+
+Qualquer dúvida, desconforto ou necessidade — pode chamar aqui, estamos sempre à disposição! 🌿`;
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TEMPLATE: Aniversário
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Mensagem de parabéns enviada no dia do aniversário do paciente.
+ */
+export function birthdayMessage(patientName) {
+  const name = patientName ? patientName.split(' ')[0] : '';
+  return `${getGreeting()}${name ? `, *${name}*` : ''}! 🎂🎉
+
+Hoje é um dia muito especial — *FELIZ ANIVERSÁRIO!* 🥳
+
+Toda a equipe do *Instituto Holiz* deseja a você muita saúde, alegria e bem-estar! 💚
+
+Que esse novo ciclo traga equilíbrio ao corpo e à mente. Estamos aqui para cuidar de você sempre! 🌿
+
+Um abraço carinhoso de toda a equipe! 🤗`;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TEMPLATE: Reativação de paciente inativo
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Mensagem para pacientes inativos há 3+ meses, convidando a retornar.
+ */
+export function reactivationMessage(patientName, daysSince) {
+  const name = patientName ? patientName.split(' ')[0] : '';
+  const greeting = getGreeting();
+  const months = Math.floor(daysSince / 30);
+  const timeLabel = months >= 2 ? `${months} meses` : 'algum tempo';
+  return `${greeting}${name ? `, *${name}*` : ''}! 😊
+
+Faz *${timeLabel}* que não nos vemos por aqui no *Instituto Holiz*! Sentimos sua falta! 💚
+
+Cuidar do corpo de forma regular é essencial para manter os benefícios do tratamento e prevenir novos desconfortos. 🌿
+
+Que tal agendar uma *consulta de retorno*? Vamos avaliar como você está e traçar o melhor caminho para o seu bem-estar! 💪
+
+Responda aqui e encontramos o melhor horário para você! 📅`;
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TEMPLATE: Relatório semanal para o profissional
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Relatório semanal enviado via WhatsApp ao profissional.
+ */
+export function weeklyReportMessage(data) {
+  const { period, completedAppointments, noShows, cancelled, newAppointments, newPatients, revenue, discharges, nextWeekAppointments } = data;
+
+  const [sy, sm, sd] = period.startDate.split('-');
+  const [ey, em, ed] = period.endDate.split('-');
+  const periodStr = `${sd}/${sm} a ${ed}/${em}`;
+
+  const noShowRate = (completedAppointments + noShows) > 0
+    ? ((noShows / (completedAppointments + noShows)) * 100).toFixed(1)
+    : '0.0';
+
+  return `📊 *RELATÓRIO SEMANAL — Instituto Holiz*
+📅 Período: ${periodStr}
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+📋 *Atendimentos:*
+✅ Realizados: *${completedAppointments}*
+🚫 Faltas: *${noShows}* (${noShowRate}%)
+❌ Cancelamentos: *${cancelled}*
+
+📈 *Movimentação:*
+🆕 Novos agendamentos: *${newAppointments}*
+👤 Novos pacientes: *${newPatients}*
+🏥 Altas: *${discharges}*
+
+💰 *Receita:* R$ ${revenue.toFixed(2).replace('.', ',')}
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+📅 *Próxima semana:* ${nextWeekAppointments} consulta(s) agendada(s)
+
+_Relatório gerado automaticamente pela Cláudia IA_ 🤖`;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TEMPLATE: Pacote concluído
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Mensagem quando o paciente conclui todas as sessões do pacote.
+ */
+export function packageCompletedMessage(patientName, productName, totalSessions) {
+  const name = patientName ? patientName.split(' ')[0] : '';
+  const greeting = getGreeting();
+  return `${greeting}${name ? `, *${name}*` : ''}! 🎉
+
+Parabéns! Você concluiu todas as *${totalSessions} sessões* do seu pacote *${productName}*! 💪🌟
+
+Esperamos que você esteja se sentindo muito melhor! O tratamento trouxe benefícios importantes para o seu corpo.
+
+🔄 *Para manter os resultados*, recomendamos:
+- Continuar com os exercícios orientados
+- Agendar uma *consulta de manutenção* em 1-2 meses
+- Manter atenção à postura no dia a dia
+
+Quer saber mais sobre nossos planos de manutenção ou agendar um retorno? É só responder aqui! 😊🌿`;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TEMPLATE: Campanha de indicação
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Mensagem de indicação enviada após feedback positivo do pós-consulta.
+ */
+export function referralMessage(patientName) {
+  const name = patientName ? patientName.split(' ')[0] : '';
+  const greeting = getGreeting();
+  return `${greeting}${name ? `, *${name}*` : ''}! 😊
+
+Ficamos muito felizes em saber que você está se sentindo bem! 💚
+
+Sabia que você pode ajudar alguém que está precisando? 🤝
+
+Se você conhece algum amigo, familiar ou colega que sofre com:
+• Dores nas costas ou no pescoço
+• Enxaquecas ou dores de cabeça
+• Problemas posturais
+• Desconfortos articulares
+
+Indique o *Instituto Holiz*! É só encaminhar nosso contato. Cuidar da saúde com quem a gente confia faz toda a diferença! 🌿
+
+Obrigada por confiar no nosso trabalho! 💚`;
+}
+
+// ── Lembrete no dia da consulta (manhã) ─────────────────────────────────────
+
+export function sameDayReminder(patientName, time, professionalName) {
+  const firstName = patientName.split(' ')[0];
+  return `Bom dia, ${firstName}! 😊
+
+Lembrando que sua consulta é *hoje às ${time}* com ${professionalName}.
+
+📍 *Av. Vasco da Gama, 3691, sala 1401 - Ed. Office Vasco da Gama*
+
+Venha com roupa confortável!
+
+Até logo! 🤗`;
+}
+
