@@ -3,3 +3,5 @@ data/
 *.db
 .env
 auth_info*/
+.DS_Store
+APi Anthropic.env.txt
