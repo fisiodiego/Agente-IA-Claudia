@@ -103,6 +103,7 @@ Quando o paciente mencionar datas, SEMPRE use o ano ${new Date(Date.now() - 3*36
 - Para CANCELAR: use cancel_appointment OBRIGATORIAMENTE
 - Se o paciente pedir para agendar às 15h e o check_availability mostrar que 15h está ocupado, INFORME que está ocupado e sugira outro horário
 - NUNCA diga "Está tudo certo para [horário]" sem ter usado create_appointment e recebido confirmação de sucesso
+- REGRA DE 12H: agendamentos precisam ter no mínimo 12 horas de antecedência. Se o paciente pedir um horário para daqui a poucas horas, explique gentilmente: "Para garantir que o Dr. Diego visualize seu agendamento a tempo, precisamos de pelo menos 12h de antecedência. Posso verificar os horários disponíveis a partir de amanhã?" 
 
 ━━━ REGRA CRÍTICA: NÃO INVENTE DADOS ━━━
 ⚠️ NUNCA invente telefones, emails, links ou dados de contato da clínica.
@@ -220,7 +221,7 @@ export async function processMessage(phone, message, options = {}) {
     let patient = getPatientByPhone(phone);
 
     // 1b. Se não encontrou e temos pushName (WhatsApp), buscar no CRM por nome
-    if (!patient && pushName) {
+    if (!patient && pushName && pushName.length >= 3) {
       try {
         const { searchPatientByName, getPatientAppointments } = await import('./crmApi.js');
         const nameResult = await searchPatientByName(pushName);
@@ -254,8 +255,8 @@ export async function processMessage(phone, message, options = {}) {
 
     // Aceita apenas mensagens curtas do paciente (não mensagens longas do sistema)
     const isShortEnough = msgTrimmed.length <= 30;
-    const isConfirming = isShortEnough && /^(confirmar?|confirmou|confirmad[oa]|confirmo|sim[\s,]*confirmo?|ok[\s,]*confirmo?)$/i.test(msgTrimmed);
-    const isCancelling = isShortEnough && /^(cancelar?|cancelado|cancelo|nao\s*vou|não\s*vou|nao\s*consigo|não\s*consigo)$/i.test(msgTrimmed);
+    const isConfirming = isShortEnough && /^(confirmar?|confirmou|confirmad[oa]|confirmo|sim[\s,]*confirmo?|ok[\s,]*confirmo?)[!\.\s]*$/i.test(msgTrimmed);
+    const isCancelling = isShortEnough && /^(cancelar?|cancelado|cancelo|nao\s*vou|não\s*vou|nao\s*consigo|não\s*consigo)[!\.\s]*$/i.test(msgTrimmed);
 
     if (isConfirming) {
       // Anti-duplicata: não envia confirmação duas vezes em 1 hora

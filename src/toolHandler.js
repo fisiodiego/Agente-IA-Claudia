@@ -57,9 +57,17 @@ export async function handleToolCall(toolName, toolInput) {
 
         const { professionalName, dayOfWeek, slots } = result.data;
 
-        if (slots.length === 0) {
+        // Filtrar slots com mínimo 12h de antecedência
+        const nowBRT = new Date(Date.now() - 3 * 3600000); // UTC-3
+        const minTime = new Date(nowBRT.getTime() + 12 * 3600000); // +12h
+        const filteredSlots = slots.filter(slot => {
+          const slotDate = new Date(`${date}T${slot}:00`);
+          return slotDate >= minTime;
+        });
+
+        if (filteredSlots.length === 0) {
           return JSON.stringify({
-            message: `Não há horários disponíveis para ${professionalName} em ${formatDateBR(date)} (${dayOfWeek}).`,
+            message: `Não há horários disponíveis para ${professionalName} em ${formatDateBR(date)} (${dayOfWeek}). Agendamentos precisam de no mínimo 12h de antecedência.`,
             dayOfWeek,
             slots: [],
           });
@@ -70,7 +78,7 @@ export async function handleToolCall(toolName, toolInput) {
           professionalName,
           date,
           dayOfWeek,
-          slots,
+          slots: filteredSlots,
         });
       }
 
@@ -90,6 +98,13 @@ export async function handleToolCall(toolName, toolInput) {
       }
 
       case 'create_appointment': {
+        // Validar mínimo 12h de antecedência
+        const aptDate = new Date(`${toolInput.date}T${toolInput.time}:00`);
+        const nowBRT2 = new Date(Date.now() - 3 * 3600000);
+        const minTime2 = new Date(nowBRT2.getTime() + 12 * 3600000);
+        if (aptDate < minTime2) {
+          return JSON.stringify({ error: 'Não é possível agendar com menos de 12 horas de antecedência. Por favor, escolha um horário mais adiante.' });
+        }
         const result = await createAppointment(toolInput);
         if (!result.ok) {
           return JSON.stringify({

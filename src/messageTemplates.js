@@ -298,7 +298,7 @@ export function packageReminderLevel1(patientName, freeSessions, productName, de
   const greeting = getGreeting();
   return `${greeting}${name ? `, *${name}*` : ''}! 😊
 
-Passando para lembrar que você ainda tem *${freeSessions} sessão(ões)* disponível(eis) no seu pacote *${productName}*! 🌿
+Passando para lembrar que você ainda tem *${freeSessions} ${freeSessions === 1 ? "sessão disponível" : "sessões disponíveis"} no seu pacote *${productName}*! 🌿
 
 Você tem até *${deadlineDate}* para concluir seu pacote. Que tal agendarmos sua próxima sessão?
 
@@ -313,7 +313,7 @@ export function packageReminderLevel2(patientName, freeSessions, productName, de
   const greeting = getGreeting();
   return `${greeting}${name ? `, *${name}*` : ''}! 😊
 
-Não esqueça! Você tem *${freeSessions} sessão(ões)* restante(s) no seu pacote *${productName}* e o prazo para conclusão é *${deadlineDate}*. ⏰
+Não esqueça! Você tem *${freeSessions} ${freeSessions === 1 ? "sessão restante" : "sessões restantes"} no seu pacote *${productName}* e o prazo para conclusão é *${deadlineDate}*. ⏰
 
 A regularidade do tratamento é fundamental para os melhores resultados! Vamos agendar sua próxima sessão? 💚
 
@@ -330,7 +330,7 @@ export function packageReminderLevel3(patientName, freeSessions, productName, de
 
 *Atenção:* Seu pacote *${productName}* está próximo do vencimento!
 
-📋 Você ainda tem *${freeSessions} sessão(ões)* para usar
+📋 Você ainda tem *${freeSessions} ${freeSessions === 1 ? "sessão" : "sessões"}* para usar
 📅 Prazo final: *${deadlineDate}*
 
 As sessões não utilizadas dentro do prazo serão perdidas. Não deixe para a última hora!
