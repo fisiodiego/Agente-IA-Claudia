@@ -96,6 +96,22 @@ Quando o paciente mencionar datas, SEMPRE use o ano ${new Date(Date.now() - 3*36
   confirme com entusiasmo e inclua a tag: [ALTA_CONFIRMADA]
 - Mantenha respostas CURTAS (máximo 4-5 linhas). Isso é WhatsApp, não e-mail!
 
+━━━ REGRA CRÍTICA: NÃO INVENTE DADOS DE AGENDAMENTO ━━━
+⚠️ NUNCA confirme, crie ou altere um agendamento sem usar as tools.
+- Para VERIFICAR horários: use check_availability OBRIGATORIAMENTE
+- Para CRIAR agendamento: use create_appointment OBRIGATORIAMENTE  
+- Para CANCELAR: use cancel_appointment OBRIGATORIAMENTE
+- Se o paciente pedir para agendar às 15h e o check_availability mostrar que 15h está ocupado, INFORME que está ocupado e sugira outro horário
+- NUNCA diga "Está tudo certo para [horário]" sem ter usado create_appointment e recebido confirmação de sucesso
+
+━━━ REGRA CRÍTICA: NÃO INVENTE DADOS ━━━
+⚠️ NUNCA invente telefones, emails, links ou dados de contato da clínica.
+- Os ÚNICOS dados reais que você conhece estão NESTE prompt (endereço, Doctoralia, horários).
+- Se o paciente precisar falar com a clínica por telefone, diga: "Você pode nos enviar sua solicitação por aqui mesmo neste WhatsApp que resolvemos!"
+- Se não conseguir resolver algo (reagendar, cancelar etc.), use as tools do CRM. Se as tools falharem, diga: "Vou encaminhar para a equipe e retornamos em breve."
+- Telefone/WhatsApp da clínica: (71) 98709-3555
+- Só forneça ESTE número. NUNCA invente outros.
+
 ━━━ PLANOS DE TRATAMENTO E PAGAMENTO ━━━
 Quando o paciente perguntar sobre valores, formas de pagamento, planos ou custo do tratamento, utilize exatamente estas informações:
 
@@ -136,7 +152,16 @@ Se o paciente perguntar sobre sua consulta, horário, ou mencionar agendamento:
 Quando o paciente pedir para agendar:
 1. Se ele JÁ disse data, horário e/ou especialidade → NÃO pergunte de novo. Use os dados que ele deu.
 2. Se falta algum dado → pergunte APENAS o que falta, numa frase curta.
-3. Use as tools na ordem: list_professionals → check_availability → find_or_create_patient → create_appointment
+3. Use as tools na ordem:
+   a) list_professionals → pegar ID do profissional
+   b) check_availability → verificar horários livres
+   c) find_or_create_patient → pegar ID do paciente
+   d) get_patient_packages → verificar se tem pacote ativo (IMPORTANTE!)
+   e) create_appointment → criar o agendamento
+   Se o paciente TEM pacote ativo, informe: "Será descontado do seu pacote (X/Y sessões usadas)"
+   Se NÃO tem pacote, NÃO mencione valor na confirmação. Só informe valor se o paciente PERGUNTAR.
+
+
 4. Resposta de confirmação: máximo 3 linhas (data, hora, profissional)
 5. Se o horário exato não está disponível, sugira no máximo 2-3 alternativas próximas
 
@@ -152,6 +177,17 @@ Exemplo de resposta RUIM (NÃO faça isso):
 Quando o paciente responde *CONFIRMAR* ou *CANCELAR*, o sistema trata automaticamente.
 
 Caso o paciente mencione agendamento de outra forma (ex: "vou agendar", "quero marcar uma consulta"), auxilie normalmente usando as tools do CRM para verificar disponibilidade e criar agendamentos.
+
+━━━ CANCELAMENTO E REAGENDAMENTO ━━━
+Quando o paciente pedir para desmarcar/cancelar:
+1. Cancele o agendamento no CRM
+2. SEMPRE pergunte se deseja reagendar para outro dia
+3. Se sim, inicie o fluxo de agendamento normalmente
+Exemplo: "Cancelado! Deseja reagendar para outro dia? Posso verificar os horários disponíveis."
+
+IMPORTANTE na confirmação de agendamento:
+- NÃO mostre o valor da consulta na mensagem de confirmação
+- Só informe valores se o paciente PERGUNTAR sobre preço
 
 ━━━ CONTEXTO DA CLÍNICA ━━━
 - Nome: Instituto Holiz
@@ -176,10 +212,34 @@ Quando o paciente perguntar sobre localização ou como chegar, envie essas info
  * @param {string} message - texto da mensagem recebida
  * @returns {string} - resposta gerada pelo agente
  */
-export async function processMessage(phone, message) {
+export async function processMessage(phone, message, options = {}) {
   try {
+    const { pushName } = options;
+
     // 1. Buscar ou criar paciente
     let patient = getPatientByPhone(phone);
+
+    // 1b. Se não encontrou e temos pushName (WhatsApp), buscar no CRM por nome
+    if (!patient && pushName) {
+      try {
+        const { searchPatientByName, getPatientAppointments } = await import('./crmApi.js');
+        const nameResult = await searchPatientByName(pushName);
+        if (nameResult.ok && nameResult.data?.found && nameResult.data.patient) {
+          const crmPatient = nameResult.data.patient;
+          console.log(`🔍 LID ${phone} identificado como ${crmPatient.name} via pushName`);
+          // Criar registro local com dados do CRM
+          patient = createPatient({
+            name: crmPatient.name,
+            phone,
+            contact_phone: crmPatient.phone,
+            registration_complete: 1,
+          });
+        }
+      } catch (err) {
+        console.warn(`⚠️ Erro pushName CRM: ${err.message}`);
+      }
+    }
+
     const isNewPatient = !patient;
 
     if (!patient) {
@@ -252,6 +312,44 @@ export async function processMessage(phone, message) {
     }
     if (isCancelling) {
       saveMessage(patient.id, 'user', message);
+
+      // ── Cancelar no CRM ──────────────────────────────────────
+      try {
+        const { getPatientAppointments, cancelAppointment, searchPatientByName } = await import('./crmApi.js');
+        let cancelled = false;
+        // Tenta buscar agendamentos pelo telefone
+        const aptsResult = await getPatientAppointments(phone);
+        if (aptsResult.ok && aptsResult.data?.appointments?.length) {
+          const pending = aptsResult.data.appointments.filter(a => a.status === 'agendado' || a.status === 'confirmado');
+          if (pending.length > 0) {
+            const cancelResult = await cancelAppointment(pending[0].id, 'Cancelado pelo paciente via WhatsApp');
+            if (cancelResult.ok) {
+              console.log(`❌ Agendamento ${pending[0].id} cancelado no CRM para ${patient.name || phone}`);
+              cancelled = true;
+            }
+          }
+        }
+        // Fallback: busca por nome (para pacientes LID)
+        if (!cancelled && patient.name) {
+          const nameResult = await searchPatientByName(patient.name);
+          if (nameResult.ok && nameResult.data?.found && nameResult.data.patient?.phone) {
+            const realPhone = nameResult.data.patient.phone;
+            const aptsResult2 = await getPatientAppointments(realPhone);
+            if (aptsResult2.ok && aptsResult2.data?.appointments?.length) {
+              const pending2 = aptsResult2.data.appointments.filter(a => a.status === 'agendado' || a.status === 'confirmado');
+              if (pending2.length > 0) {
+                const cancelResult2 = await cancelAppointment(pending2[0].id, 'Cancelado pelo paciente via WhatsApp');
+                if (cancelResult2.ok) {
+                  console.log(`❌ Agendamento ${pending2[0].id} cancelado no CRM (via nome) para ${patient.name}`);
+                }
+              }
+            }
+          }
+        }
+      } catch (err) {
+        console.error(`❌ Erro ao cancelar no CRM: ${err.message}`);
+      }
+
       const reply = appointmentCancelledResponse(patient.name);
       saveMessage(patient.id, 'assistant', reply);
       console.log(`❌ Agendamento cancelado por ${patient.name || phone}`);
@@ -421,15 +519,6 @@ export async function processMessage(phone, message) {
       return await handleRegistration(patient, message);
     }
 
-    // 4. Verificar se é pergunta sobre horários disponíveis
-    // Cláudia responde que vai verificar e ativa o modo humano para o Dr. Diego responder
-    if (isAvailabilityQuestion(message)) {
-      saveMessage(patient.id, 'user', message);
-      const reply = availabilityHoldingMessage();
-      saveMessage(patient.id, 'assistant', reply);
-      console.log(`🗓️ Pergunta sobre horários de ${patient.name || phone} — passando para o Dr. Diego`);
-      return { reply, activateHumanTakeover: true };
-    }
 
     // 5. Verificar se é resposta de pesquisa de satisfação (score 1-5)
     const surveyScore = extractSurveyScore(message);

@@ -208,11 +208,9 @@ export function appointmentCancelledResponse(patientName) {
   const name = patientName && patientName !== 'Novo Paciente' ? patientName.split(' ')[0] : '';
   const greeting = name ? `Entendido, *${name}*!` : 'Entendido!';
 
-  return `${greeting} Seu agendamento foi cancelado. 😊
+  return `${greeting} Seu agendamento foi cancelado.
 
-Quando quiser remarcar, é só nos chamar aqui que encontramos o melhor horário para você! 📅
-
-Estamos sempre à disposição. Cuide-se! 🌿`;
+Deseja reagendar para outro dia? Posso verificar os horários disponíveis pra você! 📅`;
 }
 
 /**

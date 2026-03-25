@@ -212,6 +212,11 @@ async function checkAndSendReminders() {
     console.log(`📋 ${appointments.length} agendamento(s) encontrado(s) para amanhã`);
 
     for (const apt of appointments) {
+      // Ignorar agendamentos cancelados
+      if (apt.status === 'cancelado' || apt.status === 'cancelled') {
+        continue;
+      }
+
       // Chave única para evitar duplicatas
       const reminderKey = `${apt.id}-${tomorrowStr}`;
 
@@ -995,6 +1000,11 @@ async function sendSameDayReminders() {
     console.log(`🌅 ${appointments.length} agendamento(s) hoje`);
 
     for (const apt of appointments) {
+      // Ignorar agendamentos cancelados
+      if (apt.status === 'cancelado' || apt.status === 'cancelled') {
+        continue;
+      }
+
       try {
         // Verificar se já enviou
         const already = db.prepare(

@@ -221,10 +221,13 @@ async function handleIncomingMessage(msg) {
     const text = extractMessageText(msg);
     if (!text || text.trim() === '') return;
 
+    // Capturar pushName do WhatsApp (nome do contato)
+    const pushName = msg.pushName || null;
+
     // Registrar JID como paciente conhecido (para detectar takeover via @lid)
     knownPatientJids.add(jid);
 
-    console.log(`📩 Mensagem de ${phone}: "${text.substring(0, 60)}${text.length > 60 ? '...' : ''}"`);
+    console.log(`📩 Mensagem de ${phone}${pushName ? ' (' + pushName + ')' : ''}: "${text.substring(0, 60)}${text.length > 60 ? '...' : ''}"`);
 
     // Se o Dr. Diego está ativo nessa conversa, Cláudia fica quieta
     if (isHumanActive(phone)) {
@@ -246,6 +249,7 @@ async function handleIncomingMessage(msg) {
     messageBuffer.set(phone, {
       texts: [text],
       jid,
+      pushName,
       timer: setTimeout(() => processBuffered(phone), DEBOUNCE_MS),
     });
     return;
@@ -259,7 +263,7 @@ async function processBuffered(phone) {
   if (!buf) return;
   messageBuffer.delete(phone);
 
-  const { texts, jid } = buf;
+  const { texts, jid, pushName } = buf;
   const combinedText = texts.join('\n');
 
   try {
@@ -267,7 +271,7 @@ async function processBuffered(phone) {
     await sock.sendPresenceUpdate('composing', jid);
 
     // Processar com o agente de IA
-    const result = await processMessage(phone, combinedText);
+    const result = await processMessage(phone, combinedText, { pushName });
 
     // Parar de "digitar"
     await sock.sendPresenceUpdate('paused', jid);
