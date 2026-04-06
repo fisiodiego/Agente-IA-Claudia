@@ -21,12 +21,18 @@ import {
   availabilityHoldingMessage,
   lgpdConsentMessage,
 } from './messageTemplates.js';
+import { saveLidMapping } from './lidMap.js';
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 // Anti-duplicata: evita enviar confirmação duas vezes no mesmo período
 const recentlyConfirmed = new Map(); // patientId -> timestamp
 const CONFIRM_COOLDOWN = 60 * 60 * 1000; // 1 hora
+
+// Phones que receberam lembrete recentemente (set pelo scheduler)
+export const recentReminderPhones = new Map(); // phone -> timestamp
+export const recentReminderNames = new Map(); // phone -> patientName (set pelo scheduler)
+const REMINDER_WINDOW = 24 * 60 * 60 * 1000; // 24h
 
 // ─── Prompt do Sistema ────────────────────────────────────────────────────────
 
@@ -80,13 +86,17 @@ Você representa a equipe de atendimento do Instituto Holiz com simpatia, acolhi
 - ⚠️ RESPOSTAS CURTAS: máximo 4-5 linhas por mensagem. WhatsApp não é e-mail!
 - NUNCA envie listas longas. Se tem muitos horários, mostre no máximo 3-4 opções
 - Vá direto ao ponto. Não repita informações que o paciente já deu
+- NÃO interprete mensagens casuais como informação de saúde. "Fique em paz", "como vc ta", "tudo bem" são cumprimentos — responda naturalmente sem assumir que o paciente está relatando seu estado de saúde
+- Só envie mensagem de indicação/referência se for um follow-up agendado, NUNCA como resposta a uma conversa casual
 
 ━━━ DATA ATUAL ━━━
-⚠️ IMPORTANTE: A data de HOJE é ${new Date(Date.now() - 3*3600000).toISOString().slice(0,10)}. O ano atual é ${new Date(Date.now() - 3*3600000).getFullYear()}.
+⚠️ IMPORTANTE: A data de HOJE é ${new Date(Date.now() - 3*3600000).toISOString().slice(0,10)} (${['Domingo','Segunda-feira','Terça-feira','Quarta-feira','Quinta-feira','Sexta-feira','Sábado'][new Date(Date.now() - 3*3600000).getDay()]}). O ano atual é ${new Date(Date.now() - 3*3600000).getFullYear()}.
 Quando o paciente mencionar datas, SEMPRE use o ano ${new Date(Date.now() - 3*3600000).getFullYear()}.
 - "sexta-feira" = a próxima sexta-feira de ${new Date(Date.now() - 3*3600000).getFullYear()}
 - "27/03" = ${new Date(Date.now() - 3*3600000).getFullYear()}-03-27
+- "amanhã" = ${new Date(Date.now() - 3*3600000 + 86400000).toISOString().slice(0,10)}
 - NUNCA use anos anteriores nas tools
+- Use SEMPRE o dia da semana correto baseado na data acima. NÃO tente calcular o dia da semana por conta própria.
 
 ━━━ REGRAS GERAIS ━━━
 - Sempre se comunique em Português do Brasil
@@ -229,26 +239,46 @@ Quando o paciente perguntar sobre localização ou como chegar, envie essas info
  */
 export async function processMessage(phone, message, options = {}) {
   try {
-    const { pushName } = options;
+    const { pushName, isLid, lidJid } = options;
 
     // 1. Buscar ou criar paciente
     let patient = getPatientByPhone(phone);
 
-    // 1b. Se não encontrou e temos pushName (WhatsApp), buscar no CRM por nome
-    if (!patient && pushName && pushName.length >= 3) {
+    // 1b. Se não encontrou OU encontrou incompleto ("Novo Paciente"), buscar no CRM por pushName
+    const needsCrmLookup = !patient || (patient && !patient.registration_complete && patient.name === 'Novo Paciente');
+    if (needsCrmLookup && pushName && pushName.length >= 3) {
       try {
-        const { searchPatientByName, getPatientAppointments } = await import('./crmApi.js');
+        const { searchPatientByName } = await import('./crmApi.js');
         const nameResult = await searchPatientByName(pushName);
         if (nameResult.ok && nameResult.data?.found && nameResult.data.patient) {
           const crmPatient = nameResult.data.patient;
           console.log(`🔍 LID ${phone} identificado como ${crmPatient.name} via pushName`);
-          // Criar registro local com dados do CRM
-          patient = createPatient({
-            name: crmPatient.name,
-            phone,
-            contact_phone: crmPatient.phone,
-            registration_complete: 1,
-          });
+          if (patient) {
+            // Atualizar registro existente com dados do CRM
+            completePatientRegistration(patient.id, {
+              name: crmPatient.name,
+              birth_date: crmPatient.birthDate || null,
+              contact_phone: crmPatient.phone,
+            });
+            patient = { ...patient, name: crmPatient.name, contact_phone: crmPatient.phone, registration_complete: 1 };
+            console.log(`✅ Paciente #${patient.id} atualizado com dados do CRM: ${crmPatient.name}`);
+            // Salvar mapeamento LID → telefone real se veio de LID
+            if (options.lidJid && crmPatient.phone) {
+              saveLidMapping(options.lidJid, crmPatient.phone, pushName);
+            }
+          } else {
+            // Criar registro local com dados do CRM
+            patient = createPatient({
+              name: crmPatient.name,
+              phone,
+              contact_phone: crmPatient.phone,
+              registration_complete: 1,
+            });
+            // Salvar mapeamento LID → telefone real se veio de LID
+            if (options.lidJid && crmPatient.phone) {
+              saveLidMapping(options.lidJid, crmPatient.phone, pushName);
+            }
+          }
         }
       } catch (err) {
         console.warn(`⚠️ Erro pushName CRM: ${err.message}`);
@@ -269,7 +299,12 @@ export async function processMessage(phone, message, options = {}) {
 
     // Aceita apenas mensagens curtas do paciente (não mensagens longas do sistema)
     const isShortEnough = msgTrimmed.length <= 30;
-    const isConfirming = isShortEnough && /^(confirmar?|confirmou|confirmad[oa]|confirmo|sim[\s,]*confirmo?|ok[\s,]*confirmo?)[!\.\s]*$/i.test(msgTrimmed);
+    // Palavras explícitas de confirmação (sempre tratadas como confirmação)
+    const isExplicitConfirm = isShortEnough && /^(confirmar?|confirmou|confirmad[oa]|confirmo|sim[\s,]*confirmo?|ok[\s,]*confirmo?|combinado|estarei l[aá]|vou sim|pode sim)[!\.\s]*$/i.test(msgTrimmed);
+    // Respostas curtas genéricas (só contam como confirmação se recebeu lembrete recente)
+    const hasRecentReminder = recentReminderPhones.has(phone) && (Date.now() - recentReminderPhones.get(phone)) < REMINDER_WINDOW;
+    const isGenericYes = isShortEnough && hasRecentReminder && /^(sim|s|ok|certo|pode|tudo bem|beleza|perfeito|fechado|blz|show)[!\.\s]*$/i.test(msgTrimmed);
+    const isConfirming = isExplicitConfirm || isGenericYes;
     const isCancelling = isShortEnough && /^(cancelar?|cancelado|cancelo|nao\s*vou|não\s*vou|nao\s*consigo|não\s*consigo)[!\.\s]*$/i.test(msgTrimmed);
 
     if (isConfirming) {
@@ -298,18 +333,36 @@ export async function processMessage(phone, message, options = {}) {
             }
           }
         }
-        // Fallback: busca por nome (para pacientes LID)
-        if (!confirmed && patient.name) {
-          const nameResult = await searchPatientByName(patient.name);
-          if (nameResult.ok && nameResult.data?.found && nameResult.data.patient?.phone) {
-            const realPhone = nameResult.data.patient.phone;
-            const aptsResult2 = await getPatientAppointments(realPhone);
-            if (aptsResult2.ok && aptsResult2.data?.appointments?.length) {
-              const pending2 = aptsResult2.data.appointments.filter(a => a.status === 'agendado');
-              if (pending2.length > 0) {
-                const confirmResult2 = await confirmAppointment(pending2[0].id);
-                if (confirmResult2.ok) {
-                  console.log(`✅ Agendamento ${pending2[0].id} confirmado no CRM (via nome) para ${patient.name}`);
+        // Fallback: busca por contact_phone (número real salvo do CRM para LIDs)
+        if (!confirmed && patient.contact_phone) {
+          const aptsResult3 = await getPatientAppointments(patient.contact_phone);
+          if (aptsResult3.ok && aptsResult3.data?.appointments?.length) {
+            const pending3 = aptsResult3.data.appointments.filter(a => a.status === 'agendado');
+            if (pending3.length > 0) {
+              const confirmResult3 = await confirmAppointment(pending3[0].id);
+              if (confirmResult3.ok) {
+                console.log(`✅ Agendamento ${pending3[0].id} confirmado no CRM (via contact_phone) para ${patient.name}`);
+                confirmed = true;
+              }
+            }
+          }
+        }
+        // Fallback: busca por pushName ou patient.name no CRM
+        if (!confirmed) {
+          const searchName = (pushName && pushName !== 'Novo Paciente' && pushName.length >= 3) ? pushName : patient.name;
+          if (searchName && searchName !== 'Novo Paciente') {
+            const nameResult = await searchPatientByName(searchName);
+            if (nameResult.ok && nameResult.data?.found && nameResult.data.patient?.phone) {
+              const realPhone = nameResult.data.patient.phone;
+              const aptsResult2 = await getPatientAppointments(realPhone);
+              if (aptsResult2.ok && aptsResult2.data?.appointments?.length) {
+                const pending2 = aptsResult2.data.appointments.filter(a => a.status === 'agendado');
+                if (pending2.length > 0) {
+                  const confirmResult2 = await confirmAppointment(pending2[0].id);
+                  if (confirmResult2.ok) {
+                    console.log(`✅ Agendamento ${pending2[0].id} confirmado no CRM (via nome "${searchName}") para ${patient.name}`);
+                    confirmed = true;
+                  }
                 }
               }
             }
@@ -319,10 +372,42 @@ export async function processMessage(phone, message, options = {}) {
         console.error(`❌ Erro ao confirmar no CRM: ${err.message}`);
       }
 
-      const reply = appointmentConfirmedReminder(patient.name);
+      // Se o phone é um LID (não parece BR), tentar pegar o nome correto dos lembretes recentes
+      let confirmName = patient.name;
+      const isLidPhone = !/^55\d{10,11}$/.test(phone) && !/^\d{10,11}$/.test(phone);
+      if (isLidPhone || confirmName === 'Novo Paciente') {
+        // Verificar nos lembretes recentes quem foi lembrado
+        for (const [remPhone, remName] of recentReminderNames) {
+          if (remName && remName !== 'Novo Paciente') {
+            // Verificar se esse lembrete é recente (< 24h)
+            const remTs = recentReminderPhones.get(remPhone);
+            if (remTs && Date.now() - remTs < REMINDER_WINDOW) {
+              // Verificar se esse paciente tem agendamento pendente no CRM
+              try {
+                const { getPatientAppointments } = await import('./crmApi.js');
+                const crmApts = await getPatientAppointments(remPhone);
+                if (crmApts.ok && crmApts.data?.appointments?.some(a => a.status === 'agendado' || a.status === 'confirmado')) {
+                  confirmName = remName;
+                  console.log(`🔄 LID confirmação: corrigido nome de "${patient.name}" para "${confirmName}" via lembrete recente (${remPhone})`);
+                  // Confirmar o agendamento do paciente correto no CRM
+                  const pending = crmApts.data.appointments.filter(a => a.status === 'agendado');
+                  if (pending.length > 0) {
+                    const { confirmAppointment } = await import('./crmApi.js');
+                    await confirmAppointment(pending[0].id);
+                    console.log(`✅ Agendamento ${pending[0].id} confirmado no CRM para ${confirmName}`);
+                  }
+                  break;
+                }
+              } catch (e) { console.warn(`⚠️ Erro ao verificar lembrete: ${e.message}`); }
+            }
+          }
+        }
+      }
+      const firstName = confirmName.split(' ')[0];
+      const reply = appointmentConfirmedReminder(confirmName);
       saveMessage(patient.id, 'assistant', reply);
       schedulePostConfirmationFollowup(patient.id);
-      console.log(`📅 Agendamento confirmado por ${patient.name || phone}`);
+      console.log(`📅 Agendamento confirmado por ${confirmName || phone}`);
       return reply;
     }
     if (isCancelling) {
@@ -562,12 +647,16 @@ export async function processMessage(phone, message, options = {}) {
     let currentMessages = [...messages];
     let assistantReply = "";
     
+    // Inject patient context into system prompt so Claude uses the correct phone
+    const patientPhone = patient.contact_phone || phone;
+    const patientContext = `\n\n\u2501\u2501\u2501 CONTEXTO DO PACIENTE ATUAL \u2501\u2501\u2501\nNome: ${patient.name || "Desconhecido"}\nTelefone para tools: ${patientPhone}\n\u26a0\ufe0f Ao usar tools (get_patient_appointments, find_or_create_patient, etc), SEMPRE use este telefone: ${patientPhone}`;
+    
     // Tool use loop - keep calling until we get a text response
     while (true) {
       const response = await anthropic.messages.create({
         model: 'claude-sonnet-4-20250514',
         max_tokens: 2048,
-        system: SYSTEM_PROMPT,
+        system: SYSTEM_PROMPT + patientContext,
         messages: currentMessages,
         tools: CRM_TOOLS,
       });

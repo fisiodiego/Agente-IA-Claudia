@@ -142,13 +142,25 @@ db.exec(`
       appointment_id TEXT PRIMARY KEY,
       sent_at TEXT NOT NULL
     );
-`);
+`)
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS phone_lid_map (
+    lid_jid    TEXT PRIMARY KEY,
+    phone      TEXT NOT NULL,
+    push_name  TEXT,
+    updated_at TEXT DEFAULT (datetime('now','localtime'))
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_lid_map_phone ON phone_lid_map(phone);
+`);;
 
 // ─── Queries preparadas ────────────────────────────────────────────────────────
 
 export const queries = {
   // Pacientes
   getPatientByPhone:  db.prepare(`SELECT * FROM patients WHERE phone = ?`),
+  getPatientByContactPhone: db.prepare(`SELECT * FROM patients WHERE contact_phone = ?`),
   getPatientById:     db.prepare(`SELECT * FROM patients WHERE id = ?`),
   getAllPatients:     db.prepare(`SELECT * FROM patients ORDER BY name`),
   getDischargedPatients: db.prepare(`SELECT * FROM patients WHERE status = 'alta_confirmada'`),
@@ -244,6 +256,24 @@ export const queries = {
   logMessage: db.prepare(`
     INSERT INTO message_log (phone, direction, content, type) VALUES (?, ?, ?, ?)
   `),
+
+  // LID mapping
+  getLidMapping: db.prepare(`SELECT phone, push_name FROM phone_lid_map WHERE lid_jid = ?`),
+  upsertLidMapping: db.prepare(`
+    INSERT INTO phone_lid_map (lid_jid, phone, push_name, updated_at)
+    VALUES (@lid_jid, @phone, @push_name, datetime('now','localtime'))
+    ON CONFLICT(lid_jid) DO UPDATE SET
+      phone = @phone,
+      push_name = COALESCE(@push_name, phone_lid_map.push_name),
+      updated_at = datetime('now','localtime')
+  `),
+  getRecentOutboundPhones: db.prepare(`
+    SELECT DISTINCT phone FROM message_log
+    WHERE direction = 'outbound'
+      AND created_at >= datetime('now', 'localtime', '-5 minutes')
+    ORDER BY created_at DESC
+  `),
 };
+
 
 export default db;

@@ -276,7 +276,7 @@ Passando para lembrar que você tem *consulta amanhã*:
 👨‍⚕️ *Profissional:* ${professionalName}
 🩺 *Especialidade:* ${specialtyLabel}
 
-📍 *Local:* Av. Vasco da Gama, 3691 - Edf. Vasco da Gama Plaza, sala 1401 — Salvador/BA
+📍 *Local:* Av. Vasco da Gama, nº 3691 — Edf. Vasco da Gama Plaza, sala 1401 — Salvador, Bahia
 
 👕 Lembre-se de vir com *roupas confortáveis* (legging, moletom ou roupa de ginástica).
 
@@ -547,7 +547,7 @@ export function sameDayReminder(patientName, time, professionalName) {
 
 Lembrando que sua consulta é *hoje às ${time}* com ${professionalName}.
 
-📍 *Av. Vasco da Gama, 3691, sala 1401 - Ed. Office Vasco da Gama*
+📍 *Av. Vasco da Gama, nº 3691 — Edf. Vasco da Gama Plaza, sala 1401 — Salvador, Bahia*
 
 Venha com roupa confortável!
 

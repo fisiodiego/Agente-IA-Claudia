@@ -3,6 +3,7 @@ import { getPendingFollowups, markFollowupSent, getPatientByPhone, confirmDischa
 import { followupTemplates, followupDescriptions, appointmentReminder24h, getGreeting, packageReminderLevel1, packageReminderLevel2, packageReminderLevel3, noShowRescheduling, waitlistNotification, postConsultationCheckIn, birthdayMessage, reactivationMessage, weeklyReportMessage, packageCompletedMessage, referralMessage, sameDayReminder } from './messageTemplates.js';
 import { getUpcomingAppointments, getRecentDischarges, getStalePackages, getRecentNoShows, getWaitlistMatches, removeFromWaitlist, getCompletedAppointments, getBirthdays, getInactivePatients, getWeeklyReport, getCompletedPackages, logClaudiaActivity } from './crmApi.js';
 import db from './database.js';
+import { recentReminderPhones, recentReminderNames } from './agent.js';
 
 let sendMessageFn = null;
 
@@ -42,8 +43,8 @@ export function startScheduler() {
     await checkAndSendFollowups();
   });
 
-  // Lembretes 24h: verificar às 8h, 12h e 17h
-  cron.schedule('0 11,15,20 * * *', async () => {
+  // Lembretes 23h: verificar a cada hora (8h-20h BRT) para cobrir janela de 23h
+  cron.schedule('0 11,12,13,14,15,16,17,18,19,20,21,22,23 * * *', async () => {
     await checkAndSendReminders();
   });
 
@@ -184,32 +185,38 @@ async function checkAndSendReminders() {
   }
 
   try {
-    // Calcular data de amanhã
-    const tomorrow = new Date();
-    tomorrow.setDate(tomorrow.getDate() + 1);
-    const tomorrowStr = tomorrow.toISOString().slice(0, 10);
+    // Calcular janela de 23h a partir de agora (para caber na janela de 24h do WhatsApp)
+    const now = new Date();
+    const windowStart = new Date(now.getTime() + 22 * 60 * 60 * 1000); // +22h
+    const windowEnd = new Date(now.getTime() + 25 * 60 * 60 * 1000);   // +25h
+    const targetDate = windowStart.toISOString().slice(0, 10);
+    const targetDate2 = windowEnd.toISOString().slice(0, 10);
 
-    // Formatar data em BR
-    const [y, m, d] = tomorrowStr.split('-');
+    const [y, m, d] = targetDate.split('-');
     const dateBR = `${d}/${m}/${y}`;
 
-    console.log(`🔔 Verificando agendamentos para ${dateBR} (lembretes 24h)...`);
+    console.log(`\u{1F514} Verificando agendamentos (janela 23h)...`);
 
-    const result = await getUpcomingAppointments(tomorrowStr);
+    const result = await getUpcomingAppointments(targetDate);
+    let appointments = result.ok ? (result.data || []) : [];
+    if (targetDate2 !== targetDate) {
+      const result2 = await getUpcomingAppointments(targetDate2);
+      if (result2.ok && result2.data) {
+        appointments = appointments.concat(result2.data);
+      }
+    }
 
     if (!result.ok) {
       console.error('❌ Erro ao buscar agendamentos para lembretes:', result.error);
       return;
     }
 
-    const appointments = result.data;
-
     if (!appointments || appointments.length === 0) {
-      console.log('📭 Nenhum agendamento para amanhã');
+      console.log('📭 Nenhum agendamento na janela de 23h');
       return;
     }
 
-    console.log(`📋 ${appointments.length} agendamento(s) encontrado(s) para amanhã`);
+    console.log(`📋 ${appointments.length} agendamento(s) na janela`);
 
     for (const apt of appointments) {
       // Ignorar agendamentos cancelados
@@ -217,10 +224,17 @@ async function checkAndSendReminders() {
         continue;
       }
 
-      // Chave única para evitar duplicatas
-      const reminderKey = `${apt.id}-${tomorrowStr}`;
+      // Filtrar: so enviar se consulta esta entre 22h e 25h a frente
+      const aptDateTime = new Date(`${apt.date}T${apt.time}:00-03:00`);
+      const hoursUntil = (aptDateTime.getTime() - now.getTime()) / (60 * 60 * 1000);
+      if (hoursUntil < 22 || hoursUntil > 25) {
+        continue;
+      }
 
-      if (sentReminders.has(reminderKey) || wasReminderSent(db, apt.id, 'reminder_24h', tomorrowStr)) {
+      // Chave única para evitar duplicatas
+      const reminderKey = `${apt.id}-${apt.date}`;
+
+      if (sentReminders.has(reminderKey) || wasReminderSent(db, apt.id, 'reminder_24h', apt.date)) {
         continue;
       }
 
@@ -242,7 +256,7 @@ async function checkAndSendReminders() {
 
         await sendMessageFn(apt.patientPhone, message);
         sentReminders.add(reminderKey);
-        markReminderSent(db, apt.id, 'reminder_24h', tomorrowStr);
+        markReminderSent(db, apt.id, 'reminder_24h', apt.date);
 
         // Log na dashboard
         await logClaudiaActivity('reminder_24h', {
@@ -252,6 +266,10 @@ async function checkAndSendReminders() {
         });
 
         console.log(`✅ Lembrete enviado para ${apt.patientName}`);
+        // Marcar phone para aceitar respostas curtas como confirmação
+        const reminderPhone = String(apt.patientPhone).replace(/\D/g, '');
+        recentReminderPhones.set(reminderPhone, Date.now());
+        recentReminderNames.set(reminderPhone, apt.patientName);
 
         // Pausa entre mensagens
         await sleep(3000);
@@ -1044,6 +1062,10 @@ async function sendSameDayReminders() {
         });
 
         console.log(`✅ Lembrete do dia enviado para ${apt.patientName}`);
+        // Marcar phone para aceitar respostas curtas como confirmação
+        const reminderPhoneDay = String(apt.patientPhone).replace(/\D/g, '');
+        recentReminderPhones.set(reminderPhoneDay, Date.now());
+        recentReminderNames.set(reminderPhoneDay, apt.patientName);
 
         await sleep(3000);
       } catch (error) {

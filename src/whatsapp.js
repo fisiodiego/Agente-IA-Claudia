@@ -10,6 +10,7 @@ import { fileURLToPath } from 'url';
 import fs from 'fs';
 
 import { processMessage } from './agent.js';
+import { resolveLidPhone, isValidPhone } from './lidMap.js';
 
 // ─── Debounce: agrupa mensagens rápidas do mesmo contato ───────────────────
 const messageBuffer = new Map(); // phone -> { texts: [], jid, timer }
@@ -326,7 +327,14 @@ export async function sendMessage(phone, text) {
     throw new Error('WhatsApp não está conectado');
   }
 
-  const cleanPhone = normalizeBRPhone(String(phone));
+  // Rejeitar phones com prefixo lid_ ou números inválidos (LIDs têm 14+ dígitos)
+  const rawPhone = String(phone).replace(/^lid_/, '');
+  if (!isValidPhone(rawPhone)) {
+    console.warn(`⛔ Telefone inválido/LID detectado, mensagem NÃO enviada: ${phone}`);
+    return;
+  }
+
+  const cleanPhone = normalizeBRPhone(rawPhone);
   const jid = `${cleanPhone}@s.whatsapp.net`;
 
   // Marcar como "enviado pelo bot" por 60s (janela ampla para evitar race condition)

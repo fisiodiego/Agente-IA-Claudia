@@ -4,11 +4,66 @@ import { queries } from './database.js';
 
 /**
  * Busca paciente pelo número de telefone.
- * Normaliza o número removendo caracteres especiais.
+ * Tenta match exato, depois por contact_phone, depois variações (com/sem DDI, com/sem 9).
  */
 export function getPatientByPhone(rawPhone) {
   const phone = normalizePhone(rawPhone);
-  return queries.getPatientByPhone.get(phone);
+  
+  // 1. Match exato por phone
+  let patient = queries.getPatientByPhone.get(phone);
+  if (patient) return patient;
+  
+  // 2. Match por contact_phone (pacientes registrados via LID)
+  patient = queries.getPatientByContactPhone.get(phone);
+  if (patient) return patient;
+  
+  // 3. Tentar variações do número (com/sem DDI 55, com/sem nono dígito 9)
+  const variations = getPhoneVariations(phone);
+  for (const v of variations) {
+    patient = queries.getPatientByPhone.get(v);
+    if (patient) return patient;
+    patient = queries.getPatientByContactPhone.get(v);
+    if (patient) return patient;
+  }
+  
+  return null;
+}
+
+/**
+ * Gera variações de um número BR: com/sem DDI 55, com/sem nono dígito 9.
+ */
+function getPhoneVariations(phone) {
+  const variations = new Set();
+  let p = String(phone).replace(/\D/g, '');
+  
+  if (p.startsWith('55') && p.length >= 12) {
+    const semDDI = p.substring(2);
+    variations.add(semDDI);
+    const ddd = semDDI.substring(0, 2);
+    const num = semDDI.substring(2);
+    if (num.length === 8) {
+      variations.add('55' + ddd + '9' + num);
+      variations.add(ddd + '9' + num);
+    }
+    if (num.length === 9 && num.startsWith('9')) {
+      variations.add('55' + ddd + num.substring(1));
+      variations.add(ddd + num.substring(1));
+    }
+  } else if (p.length >= 10 && p.length <= 11) {
+    variations.add('55' + p);
+    const ddd = p.substring(0, 2);
+    const num = p.substring(2);
+    if (num.length === 8) {
+      variations.add(ddd + '9' + num);
+      variations.add('55' + ddd + '9' + num);
+    }
+    if (num.length === 9 && num.startsWith('9')) {
+      variations.add(ddd + num.substring(1));
+      variations.add('55' + ddd + num.substring(1));
+    }
+  }
+  
+  return [...variations];
 }
 
 /**
