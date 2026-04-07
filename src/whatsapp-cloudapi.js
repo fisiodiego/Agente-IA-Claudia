@@ -23,6 +23,8 @@ const GRAPH_API_URL   = CHAKRA_PLUGIN_ID
 // ─── Debounce: agrupa mensagens rápidas do mesmo contato ────────────────────
 const messageBuffer = new Map(); // phone -> { texts: [], pushName, timer }
 const DEBOUNCE_MS = 5000;
+const processingLock = new Map(); // phone -> true (se está processando)
+const pendingQueue = new Map(); // phone -> { texts: [], pushName } (msgs que chegaram durante processamento)
 
 // ─── Estado ─────────────────────────────────────────────────────────────────
 let isConnected = false;
@@ -125,6 +127,63 @@ export async function sendMessage(phone, text) {
   console.log(`📤 [CloudAPI] Mensagem enviada para ${cleanPhone}`);
 }
 
+
+
+/**
+ * Envia uma mensagem usando Message Template (para fora da janela de 24h)
+ */
+export async function sendTemplateMessage(phone, templateName, parameters = []) {
+  const rawPhone = String(phone).replace(/^lid_/, '');
+  if (!isValidPhone(rawPhone)) {
+    console.warn('[TEMPLATE] Telefone invalido:', phone);
+    return false;
+  }
+  const cleanPhone = normalizeBRPhone(rawPhone);
+
+  const components = [];
+  if (parameters.length > 0) {
+    components.push({
+      type: 'body',
+      parameters: parameters.map(p => ({ type: 'text', text: String(p) }))
+    });
+  }
+
+  const body = {
+    messaging_product: 'whatsapp',
+    recipient_type: 'individual',
+    to: cleanPhone,
+    type: 'template',
+    template: {
+      name: templateName,
+      language: { code: 'pt_BR' },
+      components: components
+    }
+  };
+
+  try {
+    const res = await fetch(GRAPH_API_URL, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${ACCESS_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(body),
+    });
+
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      console.error(`[TEMPLATE] Erro ao enviar ${templateName} para ${cleanPhone}:`, JSON.stringify(err));
+      return false;
+    }
+
+    console.log(`📤 [TEMPLATE] ${templateName} enviado para ${cleanPhone}`);
+    return true;
+  } catch (err) {
+    console.error(`[TEMPLATE] Erro:`, err.message);
+    return false;
+  }
+}
+
 // ─── Processamento de mensagens recebidas ───────────────────────────────────
 
 async function handleIncomingMessage(from, text, pushName) {
@@ -169,12 +228,24 @@ async function processBuffered(phone) {
   messageBuffer.delete(phone);
 
   const { texts, pushName } = buf;
+
+  // Se já está processando msg desse paciente, enfileirar
+  if (processingLock.get(phone)) {
+    const pending = pendingQueue.get(phone);
+    if (pending) {
+      pending.texts.push(...texts);
+    } else {
+      pendingQueue.set(phone, { texts: [...texts], pushName });
+    }
+    console.log("⏳ Msgs enfileiradas para " + phone + " (processamento em andamento): " + texts.length + " msg(s)");
+    return;
+  }
+
+  // Adquirir lock e processar
+  processingLock.set(phone, true);
   const combinedText = texts.join('\n');
 
   try {
-    // Cloud API: marcar como "lida" (opcional, melhora UX)
-    // await markAsRead(messageId); // TODO quando tiver message IDs
-
     const result = await processMessage(phone, combinedText, { pushName });
 
     const reply = (result && typeof result === 'object') ? result.reply : result;
@@ -189,6 +260,22 @@ async function processBuffered(phone) {
     }
   } catch (error) {
     console.error('❌ Erro ao processar mensagem:', error.message);
+  } finally {
+    // Liberar lock
+    processingLock.delete(phone);
+
+    // Processar msgs que ficaram na fila durante o processamento
+    const pending = pendingQueue.get(phone);
+    if (pending) {
+      pendingQueue.delete(phone);
+      console.log("📨 Processando " + pending.texts.length + " msg(s) enfileirada(s) de " + phone);
+      // Colocar no buffer e disparar processamento
+      messageBuffer.set(phone, {
+        texts: pending.texts,
+        pushName: pending.pushName,
+        timer: setTimeout(() => processBuffered(phone), 1000),
+      });
+    }
   }
 }
 

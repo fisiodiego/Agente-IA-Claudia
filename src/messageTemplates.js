@@ -278,9 +278,11 @@ Passando para lembrar que você tem *consulta amanhã*:
 
 📍 *Local:* Av. Vasco da Gama, nº 3691 — Edf. Vasco da Gama Plaza, sala 1401 — Salvador, Bahia
 
-👕 Lembre-se de vir com *roupas confortáveis* (legging, moletom ou roupa de ginástica).
+👕 Venha com *roupas confortáveis* (legging, moletom ou roupa de ginástica).
 
-Se precisar *reagendar ou cancelar*, por favor nos avise com pelo menos *12 horas de antecedência*.
+Por favor, *confirme sua presença* respondendo:
+✅ *CONFIRMAR*
+❌ *CANCELAR* (avise com pelo menos 12h de antecedência)
 
 Te esperamos! 🌿`;
 }

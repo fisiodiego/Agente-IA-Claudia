@@ -6,6 +6,7 @@ import db from './database.js';
 import { recentReminderPhones, recentReminderNames } from './agent.js';
 
 let sendMessageFn = null;
+let sendTemplateFn = null;
 
 // Controle para não enviar lembrete duplicado
 const sentReminders = new Set();
@@ -28,9 +29,49 @@ function markReminderSent(db, appointmentId, type, date) {
 /**
  * Registra a função de envio de mensagens do WhatsApp.
  */
-export function registerSendMessage(fn) {
+export function registerSendMessage(fn, templateFn) {
   sendMessageFn = fn;
+  sendTemplateFn = templateFn || null;
 }
+/**
+ * Envia mensagem com fallback para template se fora da janela de 24h.
+ * @param {string} phone
+ * @param {string} text - texto normal
+ * @param {string} templateName - nome do template de fallback
+ * @param {Array} templateParams - parametros do template
+ * @returns {boolean} true se enviou com sucesso
+ */
+async function smartSend(phone, text, templateName, templateParams = []) {
+  // Estrategia: TEMPLATE-FIRST para mensagens proativas
+  // Motivo: Cloud API retorna 200 OK para texto mesmo fora da janela 24h,
+  // mas o erro 131047 so chega async via webhook — nunca cai no catch.
+  
+  if (sendTemplateFn && templateName) {
+    try {
+      console.log(`📋 Enviando template ${templateName} para ${phone}...`);
+      const ok = await sendTemplateFn(phone, templateName, templateParams);
+      if (ok) {
+        console.log(`✅ Template ${templateName} enviado com sucesso para ${phone}`);
+        return true;
+      }
+      console.warn(`⚠️ Template ${templateName} retornou falso para ${phone}, tentando texto...`);
+    } catch (err) {
+      console.warn(`⚠️ Template ${templateName} falhou para ${phone}: ${err.message}. Tentando texto...`);
+    }
+  }
+
+  // Fallback: texto normal (funciona se paciente mandou msg nas ultimas 24h)
+  try {
+    await sendMessageFn(phone, text);
+    console.log(`📝 Texto enviado para ${phone} (fallback)`);
+    return true;
+  } catch (err) {
+    console.error(`❌ Falha total ao enviar para ${phone}: ${err.message}`);
+    return false;
+  }
+}
+
+
 
 /**
  * Inicia o agendador de follow-ups e lembretes.
@@ -43,8 +84,8 @@ export function startScheduler() {
     await checkAndSendFollowups();
   });
 
-  // Lembretes 23h: verificar a cada hora (8h-20h BRT) para cobrir janela de 23h
-  cron.schedule('0 11,12,13,14,15,16,17,18,19,20,21,22,23 * * *', async () => {
+  // Lembrete noturno: 20h BRT (23h UTC) — envia para todos os agendamentos do dia seguinte
+  cron.schedule('0 23 * * *', async () => {
     await checkAndSendReminders();
   });
 
@@ -163,7 +204,41 @@ async function sendFollowup(followup) {
 
   console.log(`📨 Enviando "${description}" para ${followup.name} (${followup.phone})`);
 
-  await sendMessageFn(followup.phone, message);
+  const firstName = followup.name.split(' ')[0];
+  
+  // Mapear tipo de follow-up para template específico do Meta
+  const followupTemplateMap = {
+    'lembrete_1mes': 'followup_1mes',
+    'lembrete_3meses': 'followup_3meses',
+    'lembrete_6meses': 'followup_6meses',
+    'lembrete_12meses': 'followup_12meses',
+    'pesquisa_satisfacao': 'followup_satisfacao',
+    'pos_confirmacao_d1': 'followup_satisfacao',
+  };
+  const templateName = followupTemplateMap[followup.type] || 'followup_satisfacao';
+  
+  // Para follow-ups pós-alta, incluir data da alta como param
+  let templateParams = [firstName];
+  if (['lembrete_1mes', 'lembrete_3meses', 'lembrete_6meses', 'lembrete_12meses'].includes(followup.type)) {
+    // Buscar data de alta do paciente
+    try {
+      const patient = db.prepare("SELECT discharge_date FROM patients WHERE phone = ?").get(followup.phone);
+      if (patient && patient.discharge_date) {
+        const [y, m, d] = patient.discharge_date.split('-');
+        templateParams.push(d + '/' + m + '/' + y);
+      } else {
+        templateParams.push('--');
+      }
+    } catch (e) {
+      templateParams.push('--');
+    }
+  }
+  
+  const ok = await smartSend(followup.phone, message, templateName, templateParams);
+  if (!ok) {
+    console.error(`❌ Falha ao enviar follow-up "${description}" para ${followup.name}`);
+    return;
+  }
   markFollowupSent(followup.id);
 
   await logClaudiaActivity('follow_up', {
@@ -185,55 +260,42 @@ async function checkAndSendReminders() {
   }
 
   try {
-    // Calcular janela de 23h a partir de agora (para caber na janela de 24h do WhatsApp)
+    // Calcular data de amanhã em BRT (UTC-3)
     const now = new Date();
-    const windowStart = new Date(now.getTime() + 22 * 60 * 60 * 1000); // +22h
-    const windowEnd = new Date(now.getTime() + 25 * 60 * 60 * 1000);   // +25h
-    const targetDate = windowStart.toISOString().slice(0, 10);
-    const targetDate2 = windowEnd.toISOString().slice(0, 10);
+    const brt = new Date(now.getTime() - 3 * 60 * 60 * 1000);
+    const tomorrow = new Date(brt);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    const targetDate = tomorrow.toISOString().slice(0, 10);
 
     const [y, m, d] = targetDate.split('-');
     const dateBR = `${d}/${m}/${y}`;
 
-    console.log(`\u{1F514} Verificando agendamentos (janela 23h)...`);
+    console.log(`🌙 Lembrete noturno (20h) — buscando agendamentos de ${dateBR}...`);
 
     const result = await getUpcomingAppointments(targetDate);
-    let appointments = result.ok ? (result.data || []) : [];
-    if (targetDate2 !== targetDate) {
-      const result2 = await getUpcomingAppointments(targetDate2);
-      if (result2.ok && result2.data) {
-        appointments = appointments.concat(result2.data);
-      }
-    }
-
     if (!result.ok) {
       console.error('❌ Erro ao buscar agendamentos para lembretes:', result.error);
       return;
     }
 
+    const appointments = result.ok ? (result.data || []) : [];
+
     if (!appointments || appointments.length === 0) {
-      console.log('📭 Nenhum agendamento na janela de 23h');
+      console.log(`📭 Nenhum agendamento para ${dateBR}`);
       return;
     }
 
-    console.log(`📋 ${appointments.length} agendamento(s) na janela`);
+    console.log(`📋 ${appointments.length} agendamento(s) para amanhã`);
 
+    let enviados = 0;
     for (const apt of appointments) {
-      // Ignorar agendamentos cancelados
+      // Ignorar cancelados
       if (apt.status === 'cancelado' || apt.status === 'cancelled') {
-        continue;
-      }
-
-      // Filtrar: so enviar se consulta esta entre 22h e 25h a frente
-      const aptDateTime = new Date(`${apt.date}T${apt.time}:00-03:00`);
-      const hoursUntil = (aptDateTime.getTime() - now.getTime()) / (60 * 60 * 1000);
-      if (hoursUntil < 22 || hoursUntil > 25) {
         continue;
       }
 
       // Chave única para evitar duplicatas
       const reminderKey = `${apt.id}-${apt.date}`;
-
       if (sentReminders.has(reminderKey) || wasReminderSent(db, apt.id, 'reminder_24h', apt.date)) {
         continue;
       }
@@ -252,31 +314,32 @@ async function checkAndSendReminders() {
           apt.specialty
         );
 
-        console.log(`🔔 Enviando lembrete 24h para ${apt.patientName} (${apt.patientPhone}) — ${apt.time}`);
+        console.log(`🔔 Enviando lembrete para ${apt.patientName} (${apt.patientPhone}) — amanhã ${apt.time}`);
 
-        await sendMessageFn(apt.patientPhone, message);
+        const firstName = apt.patientName.split(' ')[0];
+        await smartSend(apt.patientPhone, message, 'lembrete_consulta', [firstName, dateBR, apt.time, apt.professionalName]);
         sentReminders.add(reminderKey);
         markReminderSent(db, apt.id, 'reminder_24h', apt.date);
 
-        // Log na dashboard
         await logClaudiaActivity('reminder_24h', {
           patientName: apt.patientName,
           phone: apt.patientPhone,
-          details: { appointmentId: apt.id, time: apt.time, date: tomorrowStr }
+          details: { appointmentId: apt.id, time: apt.time, date: apt.date }
         });
 
         console.log(`✅ Lembrete enviado para ${apt.patientName}`);
-        // Marcar phone para aceitar respostas curtas como confirmação
         const reminderPhone = String(apt.patientPhone).replace(/\D/g, '');
         recentReminderPhones.set(reminderPhone, Date.now());
         recentReminderNames.set(reminderPhone, apt.patientName);
 
-        // Pausa entre mensagens
+        enviados++;
         await sleep(3000);
       } catch (error) {
         console.error(`❌ Erro ao enviar lembrete para ${apt.patientName}:`, error.message);
       }
     }
+
+    console.log(`📊 Lembretes noturno: ${enviados} enviado(s) para ${dateBR}`);
   } catch (error) {
     console.error('❌ Erro geral no sistema de lembretes:', error.message);
   }
@@ -418,7 +481,8 @@ async function checkStalePackages() {
 
         console.log(`📦 Enviando lembrete nível ${level} para ${pkg.patientName} (pacote: ${pkg.productName})`);
 
-        await sendMessageFn(pkg.phone, message);
+        const pkgFirstName = pkg.patientName.split(' ')[0];
+        await smartSend(pkg.phone, message, 'lembrete_pacote_v2', [pkgFirstName, String(pkg.freeSessions), pkg.productName, deadlineBR]);
 
         // Registrar envio
         db.prepare(
@@ -490,7 +554,10 @@ async function checkNoShows() {
 
         console.log(`🚫 Enviando reagendamento para ${ns.patientName} (faltou ${ns.date} ${ns.time})`);
 
-        await sendMessageFn(ns.patientPhone, message);
+        const nsFirstName = ns.patientName.split(' ')[0];
+        const [ny, nm, nd] = ns.date.split('-');
+        const nsDateBR = `${nd}/${nm}/${ny}`;
+        await smartSend(ns.patientPhone, message, 'falta_reagendamento_v2', [nsFirstName, nsDateBR, ns.time, ns.professionalName]);
 
         // Marcar como processado
         db.prepare(
@@ -643,7 +710,10 @@ async function sendPostConsultationMessages() {
 
         console.log(`💬 Enviando pós-consulta para ${apt.patientName} (${apt.patientPhone})`);
 
-        await sendMessageFn(apt.patientPhone, message);
+        const postFirstName = apt.patientName.split(' ')[0];
+        const [py, pm, pd] = (apt.date || yesterdayStr).split('-');
+        const postDateBR = pd + '/' + pm + '/' + py;
+        await smartSend(apt.patientPhone, message, 'pos_consulta_v2', [postFirstName, postDateBR, apt.professionalName || 'Dr. Diego']);
 
         // Marcar como processado
         db.prepare(
@@ -713,7 +783,8 @@ async function sendBirthdayMessages() {
 
         console.log(`🎂 Enviando parabéns para ${patient.name} (${patient.phone})`);
 
-        await sendMessageFn(patient.phone, message);
+        const bdayFirstName = patient.name.split(' ')[0];
+        await smartSend(patient.phone, message, 'aniversario_paciente', [bdayFirstName]);
 
         db.prepare(
           'INSERT OR IGNORE INTO sent_birthdays (patient_phone, year, sent_at) VALUES (?, ?, ?)'
@@ -779,7 +850,8 @@ async function sendReactivationMessages() {
 
         console.log(`🔄 Enviando reativação para ${patient.name} (${patient.daysSinceLastAppointment} dias sem consulta)`);
 
-        await sendMessageFn(patient.phone, message);
+        const reactFirstName = patient.name.split(' ')[0];
+        await smartSend(patient.phone, message, 'reativacao_paciente', [reactFirstName]);
 
         db.prepare(
           'INSERT OR IGNORE INTO sent_reactivations (patient_id, sent_at) VALUES (?, ?)'
@@ -1046,7 +1118,8 @@ async function sendSameDayReminders() {
 
         console.log(`🌅 Enviando lembrete do dia para ${apt.patientName} (${apt.patientPhone}) — ${apt.time}`);
 
-        await sendMessageFn(apt.patientPhone, message);
+        const sameDayFirstName = apt.patientName.split(' ')[0];
+        await smartSend(apt.patientPhone, message, 'lembrete_dia', [sameDayFirstName, apt.time, apt.professionalName]);
 
         // Registrar envio
         db.prepare(

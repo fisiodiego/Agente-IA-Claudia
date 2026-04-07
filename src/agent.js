@@ -34,6 +34,61 @@ export const recentReminderPhones = new Map(); // phone -> timestamp
 export const recentReminderNames = new Map(); // phone -> patientName (set pelo scheduler)
 const REMINDER_WINDOW = 24 * 60 * 60 * 1000; // 24h
 
+
+// ─── Gerador dinâmico de seção de datas ───────────────────────────────────────
+// Cache de profissionais (atualizado a cada restart)
+let _professionalsCache = null;
+let _professionalsCacheTime = 0;
+
+async function getProfessionalsCache() {
+  const now = Date.now();
+  if (_professionalsCache && (now - _professionalsCacheTime) < 3600000) {
+    return _professionalsCache;
+  }
+  try {
+    const { listProfessionals } = await import('./crmApi.js');
+    const result = await listProfessionals();
+    if (result.ok) {
+      _professionalsCache = result.data;
+      _professionalsCacheTime = now;
+    }
+  } catch(e) { /* ignora */ }
+  return _professionalsCache || [];
+}
+
+function getDateSection(professionalsInfo) {
+  const now = new Date(Date.now() - 3*3600000);
+  const hoje = now.toISOString().slice(0,10);
+  const diasNomes = ['Domingo','Segunda-feira','Terça-feira','Quarta-feira','Quinta-feira','Sexta-feira','Sábado'];
+  const hojeDia = diasNomes[now.getDay()];
+  const ano = now.getFullYear();
+  const amanha = new Date(now.getTime() + 86400000).toISOString().slice(0,10);
+  
+  const proxDias = [];
+  for (let i = 1; i <= 7; i++) {
+    const d = new Date(now.getTime() + i * 86400000);
+    const nome = diasNomes[d.getDay()].toLowerCase();
+    const data = d.toISOString().slice(0,10);
+    proxDias.push('- "' + nome + '" = ' + data);
+  }
+  
+  return `⚠️ IMPORTANTE: A data de HOJE é ${hoje} (${hojeDia}). O ano atual é ${ano}.
+Quando o paciente mencionar datas, SEMPRE use o ano ${ano}.
+- "amanhã" = ${amanha}
+- "27/03" = ${ano}-03-27
+
+📅 TABELA DE REFERÊNCIA — próximos 7 dias (USE ESTA TABELA, não calcule datas):
+${proxDias.join('\n')}
+
+- NUNCA use anos anteriores nas tools
+- NUNCA calcule datas mentalmente. SEMPRE consulte a tabela acima.
+- Quando a tool check_availability retornar o campo dayOfWeek, USE ESSE VALOR na resposta ao paciente. Não substitua pelo dia que o paciente pediu.
+
+━━━ PROFISSIONAIS DA CLÍNICA (CACHE) ━━━
+${professionalsInfo}
+⚠️ Use estes IDs diretamente. SÓ use list_professionals se precisar de dados atualizados ou se o profissional não estiver listado aqui.`;
+}
+
 // ─── Prompt do Sistema ────────────────────────────────────────────────────────
 
 const SYSTEM_PROMPT = `Você é a Cláudia, assistente virtual do *Instituto Holiz*, clínica especializada em Osteopatia e Quiropraxia.
@@ -90,13 +145,7 @@ Você representa a equipe de atendimento do Instituto Holiz com simpatia, acolhi
 - Só envie mensagem de indicação/referência se for um follow-up agendado, NUNCA como resposta a uma conversa casual
 
 ━━━ DATA ATUAL ━━━
-⚠️ IMPORTANTE: A data de HOJE é ${new Date(Date.now() - 3*3600000).toISOString().slice(0,10)} (${['Domingo','Segunda-feira','Terça-feira','Quarta-feira','Quinta-feira','Sexta-feira','Sábado'][new Date(Date.now() - 3*3600000).getDay()]}). O ano atual é ${new Date(Date.now() - 3*3600000).getFullYear()}.
-Quando o paciente mencionar datas, SEMPRE use o ano ${new Date(Date.now() - 3*3600000).getFullYear()}.
-- "sexta-feira" = a próxima sexta-feira de ${new Date(Date.now() - 3*3600000).getFullYear()}
-- "27/03" = ${new Date(Date.now() - 3*3600000).getFullYear()}-03-27
-- "amanhã" = ${new Date(Date.now() - 3*3600000 + 86400000).toISOString().slice(0,10)}
-- NUNCA use anos anteriores nas tools
-- Use SEMPRE o dia da semana correto baseado na data acima. NÃO tente calcular o dia da semana por conta própria.
+__DATE_BLOCK__
 
 ━━━ REGRAS GERAIS ━━━
 - Sempre se comunique em Português do Brasil
@@ -178,11 +227,12 @@ Quando o paciente pedir para agendar:
 1. Se ele JÁ disse data, horário e/ou especialidade → NÃO pergunte de novo. Use os dados que ele deu.
 2. Se falta algum dado → pergunte APENAS o que falta, numa frase curta.
 3. Use as tools na ordem:
-   a) list_professionals → pegar ID do profissional
-   b) check_availability → verificar horários livres
-   c) find_or_create_patient → pegar ID do paciente
-   d) get_patient_packages → verificar se tem pacote ativo (IMPORTANTE!)
-   e) create_appointment → criar o agendamento
+   a) check_availability → verificar horários livres (use o ID do profissional do CACHE acima, NÃO chame list_professionals antes)
+   b) find_or_create_patient → pegar ID do paciente
+   c) get_patient_packages → verificar se tem pacote ativo (IMPORTANTE!)
+   d) create_appointment → criar o agendamento
+⚠️ OTIMIZAÇÃO: NÃO chame list_professionals se o profissional já está no cache acima. Vá direto para check_availability com o ID do cache.
+⚠️ NUNCA chame a mesma tool 2 vezes na mesma interação com os mesmos parâmetros.
    Se o paciente TEM pacote ativo, informe: "Será descontado do seu pacote (X/Y sessões usadas)"
    Se NÃO tem pacote, NÃO mencione valor na confirmação. Só informe valor se o paciente PERGUNTAR.
 
@@ -202,6 +252,25 @@ Exemplo de resposta RUIM (NÃO faça isso):
 Quando o paciente responde *CONFIRMAR* ou *CANCELAR*, o sistema trata automaticamente.
 
 Caso o paciente mencione agendamento de outra forma (ex: "vou agendar", "quero marcar uma consulta"), auxilie normalmente usando as tools do CRM para verificar disponibilidade e criar agendamentos.
+
+━━━ REGRA CRÍTICA: MANTER DATA DO CONTEXTO ━━━
+⚠️ Quando o paciente já mencionou uma DATA ou DIA DA SEMANA na conversa e depois envia APENAS o horário (ex: "8h", "14:30", "manhã"):
+- USE A MESMA DATA que já estava no contexto da conversa
+- NÃO mude a data para outro dia
+- NÃO recalcule a data — reutilize a que já foi discutida
+Exemplo correto:
+  Paciente: "Quero agendar para sexta-feira" → check_availability com sexta
+  Paciente: "8h" → check_availability com a MESMA sexta, horário 08:00
+Exemplo ERRADO:
+  Paciente: "Quero agendar para sexta-feira" → check_availability com sexta
+  Paciente: "8h" → check_availability com sábado ← NUNCA FAÇA ISSO
+
+━━━ REGRA CRÍTICA: CORRIGIR AGENDAMENTO ERRADO ━━━
+⚠️ Se o paciente disser que a data/horário está ERRADO (ex: "quero na sexta", "não, era segunda", "errou o dia"):
+1. PRIMEIRO cancele o agendamento errado com cancel_appointment
+2. DEPOIS crie o agendamento correto com create_appointment
+- NUNCA crie um segundo agendamento sem cancelar o primeiro
+- Ao responder, confirme que o anterior foi cancelado e o novo foi criado
 
 ━━━ CANCELAMENTO E REAGENDAMENTO ━━━
 Quando o paciente pedir para desmarcar/cancelar:
@@ -288,9 +357,10 @@ export async function processMessage(phone, message, options = {}) {
     const isNewPatient = !patient;
 
     if (!patient) {
-      // Cria registro inicial (mas ainda não manda boas-vindas — verifica CONFIRMAR antes)
-      patient = createPatient({ phone });
-      console.log(`👤 Novo contato iniciado: ${phone}`);
+      // Cria registro inicial — usa pushName do WhatsApp se disponível
+      const initialName = (pushName && pushName.length >= 2 && pushName.length <= 50 && /[a-zA-ZÀ-ú]/.test(pushName)) ? pushName : 'Novo Paciente';
+      patient = createPatient({ phone, name: initialName });
+      console.log(`👤 Novo contato iniciado: ${phone} (nome: ${initialName})`);
     }
 
     // 2. Detectar resposta ao lembrete do Simples Agenda (CONFIRMAR / CANCELAR)
@@ -472,7 +542,20 @@ export async function processMessage(phone, message, options = {}) {
           crmResult = await searchPatientByPhone(phone);
         }
         
-        // Se é LID ou não encontrou por telefone, tenta extrair nome da mensagem
+        // Se não encontrou por telefone (qualquer tipo), tenta buscar por pushName no CRM
+        if (!crmResult?.found && pushName && pushName.length >= 3) {
+          try {
+            const nameResult = await searchPatientByName(pushName);
+            if (nameResult?.ok && nameResult.data?.found && nameResult.data.patient) {
+              crmResult = { found: true, patient: nameResult.data.patient };
+              console.log("✅ Paciente encontrado no CRM por pushName " + pushName + ": " + nameResult.data.patient.name);
+            }
+          } catch (e) {
+            console.log("⚠️ Erro ao buscar por pushName: " + e.message);
+          }
+        }
+
+        // Se é LID e ainda não encontrou, tenta extrair nome da mensagem
         if (!crmResult?.found && isLID) {
           // Tenta buscar nos agendamentos de hoje para encontrar por nome
           const today = new Date();
@@ -651,12 +734,16 @@ export async function processMessage(phone, message, options = {}) {
     const patientPhone = patient.contact_phone || phone;
     const patientContext = `\n\n\u2501\u2501\u2501 CONTEXTO DO PACIENTE ATUAL \u2501\u2501\u2501\nNome: ${patient.name || "Desconhecido"}\nTelefone para tools: ${patientPhone}\n\u26a0\ufe0f Ao usar tools (get_patient_appointments, find_or_create_patient, etc), SEMPRE use este telefone: ${patientPhone}`;
     
+    // Load professionals cache
+    const profs = await getProfessionalsCache();
+    const professionalsInfo = profs.map(p => `- ${p.name} | ID: ${p.id} | Especialidade(s): ${p.specialty}`).join('\n') || 'Nenhum profissional cacheado. Use list_professionals.';
+
     // Tool use loop - keep calling until we get a text response
     while (true) {
       const response = await anthropic.messages.create({
         model: 'claude-sonnet-4-20250514',
         max_tokens: 2048,
-        system: SYSTEM_PROMPT + patientContext,
+        system: SYSTEM_PROMPT.replace("__DATE_BLOCK__", getDateSection(professionalsInfo)) + patientContext,
         messages: currentMessages,
         tools: CRM_TOOLS,
       });
@@ -815,6 +902,21 @@ Não inclua explicações, apenas o JSON.`,
       }
     }
     console.log(`🔍 Extração fallback:`, JSON.stringify(extracted));
+  }
+
+  // Validar nome extraído — rejeitar se parecer uma frase, não um nome
+  if (extracted.name) {
+    const nameCandidate = extracted.name.trim();
+    const wordCount = nameCandidate.split(/\s+/).length;
+    const hasNonNameChars = /[!?.,;:(){}\[\]@#$%&*=+0-9]/.test(nameCandidate);
+    const tooLong = nameCandidate.length > 60;
+    const tooManyWords = wordCount > 6;
+    const looksLikeSentence = /(que|como|pode|fazer|emita|valor|paguei|quero|preciso|gostaria|obrigad|bom dia|boa tarde|boa noite|ola|oi)/i.test(nameCandidate);
+    
+    if (hasNonNameChars || tooLong || tooManyWords || looksLikeSentence) {
+      console.log(`⚠️ Nome extraído rejeitado (parece frase): "${nameCandidate}"`);
+      extracted.name = null;
+    }
   }
 
   // Merge com o que já temos no banco (coletas parciais anteriores)
