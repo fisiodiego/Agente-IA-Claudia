@@ -131,6 +131,8 @@ export async function sendMessage(phone, text) {
 
 /**
  * Envia uma mensagem usando Message Template (para fora da janela de 24h)
+ * Usa pass-through do Chakra com formato nativo da Graph API
+ * Templates devem existir na WABA do Chakra (122098688444003982)
  */
 export async function sendTemplateMessage(phone, templateName, parameters = []) {
   const rawPhone = String(phone).replace(/^lid_/, '');
@@ -150,7 +152,6 @@ export async function sendTemplateMessage(phone, templateName, parameters = []) 
 
   const body = {
     messaging_product: 'whatsapp',
-    recipient_type: 'individual',
     to: cleanPhone,
     type: 'template',
     template: {
@@ -170,20 +171,20 @@ export async function sendTemplateMessage(phone, templateName, parameters = []) 
       body: JSON.stringify(body),
     });
 
+    const responseData = await res.json().catch(() => ({}));
+
     if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      console.error(`[TEMPLATE] Erro ao enviar ${templateName} para ${cleanPhone}:`, JSON.stringify(err));
+      console.error(`[TEMPLATE] Erro ao enviar ${templateName} para ${cleanPhone}:`, JSON.stringify(responseData));
       return false;
     }
 
-    console.log(`📤 [TEMPLATE] ${templateName} enviado para ${cleanPhone}`);
+    console.log(`\U0001f4e4 [TEMPLATE] ${templateName} enviado para ${cleanPhone}`);
     return true;
   } catch (err) {
     console.error(`[TEMPLATE] Erro:`, err.message);
     return false;
   }
 }
-
 // ─── Processamento de mensagens recebidas ───────────────────────────────────
 
 async function handleIncomingMessage(from, text, pushName) {

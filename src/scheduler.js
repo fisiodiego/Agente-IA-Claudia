@@ -206,33 +206,10 @@ async function sendFollowup(followup) {
 
   const firstName = followup.name.split(' ')[0];
   
-  // Mapear tipo de follow-up para template específico do Meta
-  const followupTemplateMap = {
-    'lembrete_1mes': 'followup_1mes',
-    'lembrete_3meses': 'followup_3meses',
-    'lembrete_6meses': 'followup_6meses',
-    'lembrete_12meses': 'followup_12meses',
-    'pesquisa_satisfacao': 'followup_satisfacao',
-    'pos_confirmacao_d1': 'followup_satisfacao',
-  };
-  const templateName = followupTemplateMap[followup.type] || 'followup_satisfacao';
-  
-  // Para follow-ups pós-alta, incluir data da alta como param
-  let templateParams = [firstName];
-  if (['lembrete_1mes', 'lembrete_3meses', 'lembrete_6meses', 'lembrete_12meses'].includes(followup.type)) {
-    // Buscar data de alta do paciente
-    try {
-      const patient = db.prepare("SELECT discharge_date FROM patients WHERE phone = ?").get(followup.phone);
-      if (patient && patient.discharge_date) {
-        const [y, m, d] = patient.discharge_date.split('-');
-        templateParams.push(d + '/' + m + '/' + y);
-      } else {
-        templateParams.push('--');
-      }
-    } catch (e) {
-      templateParams.push('--');
-    }
-  }
+  // Todos os follow-ups usam template followup_satisfacao do Chakra WABA
+  // Params: {{1}}=nome, {{2}}=link doctoralia
+  const templateName = 'followup_satisfacao';
+  const templateParams = [firstName, 'https://www.doctoralia.com.br/adicionar-opiniao/diego-matos#/opiniao'];
   
   const ok = await smartSend(followup.phone, message, templateName, templateParams);
   if (!ok) {
@@ -482,7 +459,7 @@ async function checkStalePackages() {
         console.log(`📦 Enviando lembrete nível ${level} para ${pkg.patientName} (pacote: ${pkg.productName})`);
 
         const pkgFirstName = pkg.patientName.split(' ')[0];
-        await smartSend(pkg.phone, message, 'lembrete_pacote_v2', [pkgFirstName, String(pkg.freeSessions), pkg.productName, deadlineBR]);
+        await smartSend(pkg.phone, message, 'lembrete_pacote', [pkgFirstName, String(pkg.freeSessions), pkg.productName, deadlineBR]);
 
         // Registrar envio
         db.prepare(
@@ -557,7 +534,7 @@ async function checkNoShows() {
         const nsFirstName = ns.patientName.split(' ')[0];
         const [ny, nm, nd] = ns.date.split('-');
         const nsDateBR = `${nd}/${nm}/${ny}`;
-        await smartSend(ns.patientPhone, message, 'falta_reagendamento_v2', [nsFirstName, nsDateBR, ns.time, ns.professionalName]);
+        await smartSend(ns.patientPhone, message, 'falta_reagendamento', [nsFirstName, nsDateBR, ns.time, ns.professionalName]);
 
         // Marcar como processado
         db.prepare(
@@ -713,7 +690,7 @@ async function sendPostConsultationMessages() {
         const postFirstName = apt.patientName.split(' ')[0];
         const [py, pm, pd] = (apt.date || yesterdayStr).split('-');
         const postDateBR = pd + '/' + pm + '/' + py;
-        await smartSend(apt.patientPhone, message, 'pos_consulta_v2', [postFirstName, postDateBR, apt.professionalName || 'Dr. Diego']);
+        await smartSend(apt.patientPhone, message, 'pos_consulta', [postFirstName]);
 
         // Marcar como processado
         db.prepare(
