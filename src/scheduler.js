@@ -205,12 +205,21 @@ async function sendFollowup(followup) {
   console.log(`📨 Enviando "${description}" para ${followup.name} (${followup.phone})`);
 
   const firstName = followup.name.split(' ')[0];
-  
-  // Todos os follow-ups usam template followup_satisfacao do Chakra WABA
-  // Params: {{1}}=nome, {{2}}=link doctoralia
-  const templateName = 'followup_satisfacao';
-  const templateParams = [firstName, 'https://www.doctoralia.com.br/adicionar-opiniao/diego-matos#/opiniao'];
-  
+
+  // Mapeamento de follow-up type -> template dedicado do Chakra WABA
+  const followupTemplateMap = {
+    pesquisa_satisfacao: { name: 'followup_satisfacao', params: [firstName, 'https://www.doctoralia.com.br/adicionar-opiniao/diego-matos#/opiniao'] },
+    lembrete_1mes:      { name: 'revisao_1mes',        params: [firstName] },
+    lembrete_3meses:    { name: 'revisao_3meses',      params: [firstName] },
+    lembrete_6meses:    { name: 'revisao_6meses',      params: [firstName] },
+    lembrete_12meses:   { name: 'revisao_12meses',     params: [firstName] },
+  };
+
+  // Fallback para followup_satisfacao se tipo nao mapeado (ex: pos_confirmacao_d1)
+  const tmpl = followupTemplateMap[followup.type] || { name: 'followup_satisfacao', params: [firstName, 'https://www.doctoralia.com.br/adicionar-opiniao/diego-matos#/opiniao'] };
+  const templateName = tmpl.name;
+  const templateParams = tmpl.params;
+
   const ok = await smartSend(followup.phone, message, templateName, templateParams);
   if (!ok) {
     console.error(`❌ Falha ao enviar follow-up "${description}" para ${followup.name}`);
