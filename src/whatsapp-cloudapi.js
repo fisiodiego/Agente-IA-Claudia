@@ -8,7 +8,7 @@
 import express from 'express';
 import { processMessage } from './agent.js';
 import { isValidPhone } from './lidMap.js';
-import { logMessage } from './patientManager.js';
+import { logMessage, wasRecentBotOutbound } from './patientManager.js';
 
 // ─── Config via .env ────────────────────────────────────────────────────────
 const PHONE_NUMBER_ID = process.env.WA_PHONE_NUMBER_ID;   // 1045271008668555
@@ -33,6 +33,7 @@ let isConnected = false;
 const HUMAN_TAKEOVER_DURATION = 30 * 60 * 1000; // 30 minutos
 const humanTakeoverMap = new Map();   // phone -> timestamp de expiração
 const recentBotSentPhones = new Map(); // phone -> timestamp (anti-falso-positivo)
+const botSentMessageIds = new Set(); // IDs de mensagens enviadas pelo bot (limpa apos 5min)
 
 /**
  * Normaliza número BR: garante formato 55 + DDD (2 dígitos) + número (9 dígitos).
@@ -123,6 +124,21 @@ export async function sendMessage(phone, text) {
     throw new Error(`Cloud API error ${res.status}: ${err?.error?.message || 'Unknown'}`);
   }
 
+  // Rastrear ID e telefone da mensagem enviada pelo bot
+  try {
+    const resData = await res.json();
+    const msgId = resData?.messages?.[0]?.id || resData?._data?.whatsappMessageId;
+    if (msgId) {
+      botSentMessageIds.add(msgId);
+      setTimeout(() => botSentMessageIds.delete(msgId), 5 * 60 * 1000);
+      console.log('[BOT_TRACK] Msg ID rastreado: ' + msgId.slice(0, 30) + '...');
+    }
+  } catch (e) {
+    console.warn('[BOT_TRACK] Falha ao rastrear msg ID:', e.message);
+  }
+  recentBotSentPhones.set(cleanPhone, Date.now() + 60000);
+  setTimeout(() => recentBotSentPhones.delete(cleanPhone), 61000);
+
   logMessage(cleanPhone, 'outbound', text);
   console.log(`📤 [CloudAPI] Mensagem enviada para ${cleanPhone}`);
 }
@@ -178,7 +194,18 @@ export async function sendTemplateMessage(phone, templateName, parameters = []) 
       return false;
     }
 
+    // Rastrear ID e telefone do template enviado pelo bot
+    const tmplMsgId = responseData?.messages?.[0]?.id || responseData?._data?.whatsappMessageId;
+    if (tmplMsgId) {
+      botSentMessageIds.add(tmplMsgId);
+      setTimeout(() => botSentMessageIds.delete(tmplMsgId), 5 * 60 * 1000);
+      console.log('[BOT_TRACK] Template ID rastreado: ' + tmplMsgId.slice(0, 30) + '...');
+    }
+    recentBotSentPhones.set(cleanPhone, Date.now() + 60000);
+    setTimeout(() => recentBotSentPhones.delete(cleanPhone), 61000);
+
     console.log(`\U0001f4e4 [TEMPLATE] ${templateName} enviado para ${cleanPhone}`);
+    logMessage(cleanPhone, 'outbound', `[TEMPLATE] ${templateName}`, 'template');
     return true;
   } catch (err) {
     console.error(`[TEMPLATE] Erro:`, err.message);
@@ -282,6 +309,160 @@ async function processBuffered(phone) {
 
 // ─── Webhook Server ─────────────────────────────────────────────────────────
 
+// ─── Instagram Lead Capture ─────────────────────────────────────────────────
+
+const igLeadCache = new Map(); // igUserId -> timestamp (dedup: 1 lead por user a cada 24h)
+const IG_DEDUP_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Busca info do usuario Instagram via Graph API
+ */
+async function getInstagramUserInfo(igUserId) {
+  try {
+    const token = process.env.IG_PAGE_ACCESS_TOKEN || process.env.META_SYSTEM_TOKEN;
+    if (!token) return { username: null, name: null };
+    const res = await fetch(`https://graph.instagram.com/v21.0/${igUserId}?fields=username,name&access_token=${token}`);
+    if (!res.ok) return { username: null, name: null };
+    return await res.json();
+  } catch {
+    return { username: null, name: null };
+  }
+}
+
+/**
+ * Cria lead no CRM a partir de interacao no Instagram
+ */
+async function createInstagramLeadInCRM(igUserId, username, displayName, type, detail) {
+  // Dedup: 1 lead por user a cada 24h
+  const lastCreated = igLeadCache.get(igUserId);
+  if (lastCreated && Date.now() - lastCreated < IG_DEDUP_MS) {
+    console.log(`[Instagram] Lead de @${username || igUserId} ja criado nas ultimas 24h - ignorando`);
+    return;
+  }
+
+  try {
+    const id = `ig-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    const name = displayName || username || `Instagram ${igUserId}`;
+    const notes = type === 'dm'
+      ? `DM via Instagram: "${(detail || '').substring(0, 200)}"`
+      : type === 'mention'
+        ? `Mencionou @institutoholiz no Instagram (media: ${detail || 'N/A'})`
+        : `Comentou no Instagram: "${(detail || '').substring(0, 200)}"`;
+
+    const body = {
+      id,
+      patientName: name,
+      phone: null,
+      type: 'lead',
+      status: 'pendente',
+      source: 'instagram',
+      interest: null,
+      notes: notes + (username ? ` | @${username}` : ''),
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+
+    const CRM_URL = process.env.CRM_API_URL || 'https://crm.holiz.com.br/api/integration';
+    const API_KEY = process.env.CRM_API_KEY || '';
+
+    const res = await fetch(CRM_URL + '/follow-ups', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-API-Key': API_KEY },
+      body: JSON.stringify(body),
+    });
+
+    if (res.ok) {
+      igLeadCache.set(igUserId, Date.now());
+      console.log(`[Instagram] Lead criado no CRM: ${name} (@${username || 'N/A'}) - ${type}`);
+    } else {
+      console.warn(`[Instagram] CRM respondeu ${res.status}`);
+    }
+  } catch (err) {
+    console.error('[Instagram] Erro ao criar lead:', err.message);
+  }
+}
+
+/**
+ * Processa eventos de webhook do Instagram
+ */
+async function handleInstagramWebhook(body) {
+  const entries = body.entry || [];
+
+  for (const entry of entries) {
+    // ── DMs (Instagram Messaging) ──
+    const messaging = entry.messaging || [];
+    for (const event of messaging) {
+      if (!event.message) continue; // Ignorar delivery/read receipts
+      const senderId = event.sender?.id;
+      const recipientId = event.recipient?.id;
+      if (!senderId || senderId === recipientId) continue; // Ignorar msgs enviadas por nos
+
+      const text = event.message?.text || '';
+      console.log(`[Instagram DM] De ${senderId}: "${text.substring(0, 80)}"`);
+
+      const userInfo = await getInstagramUserInfo(senderId);
+      await createInstagramLeadInCRM(
+        senderId,
+        userInfo.username,
+        userInfo.name,
+        'dm',
+        text
+      );
+    }
+
+    // ── Mentions e Comments (via changes) ──
+    const changes = entry.changes || [];
+    for (const change of changes) {
+      const value = change.value || {};
+
+      if (change.field === 'mentions') {
+        const mediaId = value.media_id || 'N/A';
+        const commentId = value.comment_id;
+        console.log(`[Instagram Mention] Media: ${mediaId}, Comment: ${commentId}`);
+
+        // Buscar info do comentario para pegar o user
+        let userId = null;
+        let username = null;
+        try {
+          const token = process.env.IG_PAGE_ACCESS_TOKEN || process.env.META_SYSTEM_TOKEN;
+          if (commentId && token) {
+            const res = await fetch(`https://graph.facebook.com/v21.0/${commentId}?fields=from{id,username}&access_token=${token}`);
+            if (res.ok) {
+              const data = await res.json();
+              userId = data.from?.id;
+              username = data.from?.username;
+            }
+          }
+        } catch {}
+
+        if (userId) {
+          await createInstagramLeadInCRM(userId, username, null, 'mention', mediaId);
+        } else {
+          await createInstagramLeadInCRM(
+            `mention-${commentId || Date.now()}`,
+            null,
+            'Mencao Instagram',
+            'mention',
+            mediaId
+          );
+        }
+      }
+
+      if (change.field === 'comments') {
+        const commentText = value.text || '';
+        const fromUser = value.from || {};
+        const userId = fromUser.id;
+        const username = fromUser.username;
+
+        console.log(`[Instagram Comment] De @${username || userId}: "${commentText.substring(0, 80)}"`);
+
+        if (userId) {
+          await createInstagramLeadInCRM(userId, username, null, 'comment', commentText);
+        }
+      }
+    }
+  }
+}
 function createWebhookServer() {
   const app = express();
   app.use(express.json());
@@ -316,6 +497,11 @@ function createWebhookServer() {
       console.log("[WEBHOOK DEBUG]", JSON.stringify(req.body).substring(0, 800));
       const body = req.body;
 
+      // Instagram webhook handler
+      if (body.object === 'instagram') {
+        handleInstagramWebhook(body).catch(err => console.error('[Instagram] Erro:', err.message));
+        return;
+      }
       if (body.object !== 'whatsapp_business_account') return;
 
       const entries = body.entry || [];
@@ -351,14 +537,24 @@ function createWebhookServer() {
             // ── Mensagens recebidas (field === 'messages') ──
             const messages = value.messages || [];
             for (const msg of messages) {
-              // Só processar mensagens de texto por enquanto
+              // Extrair texto da mensagem (suporta text, button e interactive)
+              let msgText = null;
               if (msg.type === 'text' && msg.text?.body) {
+                msgText = msg.text.body;
+              } else if (msg.type === 'button' && msg.button?.text) {
+                msgText = msg.button.text;
+                console.log('[BUTTON] Paciente clicou botão: "' + msgText + '"');
+              } else if (msg.type === 'interactive' && msg.interactive?.button_reply?.title) {
+                msgText = msg.interactive.button_reply.title;
+                console.log('[INTERACTIVE] Paciente clicou: "' + msgText + '"');
+              }
+
+              if (msgText) {
                 const from = msg.from;
-                const text = msg.text.body;
                 const contact = (value.contacts || []).find(c => c.wa_id === from);
                 const pushName = contact?.profile?.name || null;
 
-                handleIncomingMessage(from, text, pushName);
+                handleIncomingMessage(from, msgText, pushName);
               }
               // TODO: suportar mensagens de imagem, áudio, etc.
             }
@@ -368,6 +564,34 @@ function createWebhookServer() {
             for (const status of statuses) {
               if (status.status === 'read') {
                 console.log(`👁️ Mensagem lida por ${status.recipient_id}`);
+              }
+              // Detectar mensagem enviada pelo Dr. Diego (status sent/delivered com ID NAO rastreado pelo bot)
+              if ((status.status === 'sent' || status.status === 'delivered') && status.id && status.recipient_id) {
+                const recipientPhone = normalizeBRPhone(status.recipient_id);
+
+                if (botSentMessageIds.has(status.id)) {
+                  // Status da propria msg do bot (ID rastreado) — ignorar silenciosamente
+                } else {
+                  // ID NAO esta no rastreamento do bot — pode ser msg do Dr. Diego
+                  // Grace period curto (5s): cobre caso raro de falha no rastreio de ID do bot
+                  const last8 = recipientPhone.replace(/\D/g, '').slice(-8);
+                  let justSentByBot = false;
+                  for (const [ph, expiry] of recentBotSentPhones.entries()) {
+                    if (ph.endsWith(last8) && expiry > Date.now() && (expiry - Date.now()) > 55000) {
+                      // recentBotSentPhones armazena Date.now() + 60000
+                      // Se faltam >55s, foi setado ha menos de 5s — grace period curto
+                      justSentByBot = true;
+                      break;
+                    }
+                  }
+
+                  if (justSentByBot) {
+                    console.log('[BOT_TRACK] Status ' + status.status + ' para ' + recipientPhone + ' ignorado (grace 5s)');
+                  } else {
+                    console.log('\ud83d\udc68\u200d\u2695\ufe0f Dr. Diego enviou msg para ' + recipientPhone + ' (status ' + status.status + ', wamid: ' + (status.id || '').slice(0, 30) + ')');
+                    activateHumanTakeover(recipientPhone);
+                  }
+                }
               }
             }
           }
