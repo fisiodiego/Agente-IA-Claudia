@@ -706,7 +706,7 @@ async function checkNoShows() {
         const nsFirstName = ns.patientName.split(' ')[0];
         const [ny, nm, nd] = ns.date.split('-');
         const nsDateBR = `${nd}/${nm}/${ny}`;
-        await smartSend(ns.patientPhone, message, 'falta_reagendamento', [nsFirstName, nsDateBR, ns.time, ns.professionalName]);
+        await smartSend(ns.patientPhone, message, 'falta_reagendamento_a', [nsFirstName, nsDateBR, ns.time, ns.professionalName]);
 
         // Marcar como processado
         db.prepare(
