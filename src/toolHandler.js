@@ -11,12 +11,19 @@ import {
   getPatientAppointments,
   getPatientPackages,
   addToWaitlist,
+  getFollowUpsByPhone,
+  updateFollowUp,
 } from './crmApi.js';
+
+// ─── Rastreamento de última check_availability por paciente (phone) ─────────
+// Usado para detectar divergência de data entre check_availability e create_appointment.
+const lastAvailabilityCheck = new Map(); // phone -> { professionalId, date, ts }
+const AVAILABILITY_TTL_MS = 5 * 60 * 1000; // 5 min
 
 /**
  * Executa uma tool e retorna o resultado formatado para tool_result.
  */
-export async function handleToolCall(toolName, toolInput) {
+export async function handleToolCall(toolName, toolInput, phone = null) {
   console.log(`🔧 Tool call: ${toolName}`, JSON.stringify(toolInput));
 
   try {
@@ -55,7 +62,19 @@ export async function handleToolCall(toolName, toolInput) {
         const result = await checkAvailability(professionalId, date, duration);
         if (!result.ok) return JSON.stringify({ error: result.error });
 
-        const { professionalName, dayOfWeek, slots } = result.data;
+        const { professionalName, dayOfWeek, slots, holidayName } = result.data;
+
+        // Feriado: clínica fechada, retornar mensagem específica.
+        // Backend já zera os slots quando é feriado ativo na tabela holidays.
+        if (holidayName) {
+          return JSON.stringify({
+            message: `${formatDateBR(date)} é feriado (${holidayName}) e a clínica não funciona. Sugira outra data ao paciente.`,
+            isHoliday: true,
+            holidayName,
+            dayOfWeek,
+            slots: [],
+          });
+        }
 
         // Filtrar slots com mínimo 12h de antecedência
         const nowBRT = new Date(Date.now() - 3 * 3600000); // UTC-3
@@ -70,6 +89,15 @@ export async function handleToolCall(toolName, toolInput) {
             message: `Não há horários disponíveis para ${professionalName} em ${formatDateBR(date)} (${dayOfWeek}). Agendamentos precisam de no mínimo 12h de antecedência.`,
             dayOfWeek,
             slots: [],
+          });
+        }
+
+        // Registrar último check para validação cruzada em create_appointment
+        if (phone) {
+          lastAvailabilityCheck.set(phone, {
+            professionalId,
+            date,
+            ts: Date.now(),
           });
         }
 
@@ -98,6 +126,22 @@ export async function handleToolCall(toolName, toolInput) {
       }
 
       case 'create_appointment': {
+        // ⚠️ Validar consistência com último check_availability (defense-in-depth)
+        if (phone) {
+          const last = lastAvailabilityCheck.get(phone);
+          if (last && (Date.now() - last.ts) < AVAILABILITY_TTL_MS) {
+            const sameProf = last.professionalId === toolInput.professionalId;
+            const sameDate = last.date === toolInput.date;
+            if (sameProf && !sameDate) {
+              console.warn(`⚠️ Date mismatch bloqueado — paciente ${phone}: check=${last.date}, create=${toolInput.date}`);
+              return JSON.stringify({
+                error: 'DATE_MISMATCH',
+                message: `Inconsistência detectada: você verificou disponibilidade para ${last.date} mas tentou agendar ${toolInput.date}. Chame check_availability novamente com a data correta antes de agendar.`,
+              });
+            }
+          }
+        }
+
         // Validar mínimo 12h de antecedência
         const aptDate = new Date(`${toolInput.date}T${toolInput.time}:00`);
         const nowBRT2 = new Date(Date.now() - 3 * 3600000);
@@ -162,6 +206,32 @@ export async function handleToolCall(toolName, toolInput) {
         }
 
         const apt = result.data;
+
+        // Fechar follow-up "reagendar_pendente" (se existir) → status 'agendou'
+        try {
+          const phoneToCheck = apt.patientPhone || apt.phone;
+          if (phoneToCheck) {
+            const fuResult = await getFollowUpsByPhone(phoneToCheck);
+            const fuArr = Array.isArray(fuResult?.data) ? fuResult.data : [];
+            const pending = fuArr.find(f =>
+              f.source === 'reagendar_pendente' &&
+              f.status !== 'agendou' &&
+              f.status !== 'perdido' &&
+              typeof f.notes === 'string' &&
+              f.notes.includes(`[apt_id:${appointmentId}]`)
+            );
+            if (pending) {
+              const [y, m, d] = String(apt.date || '').split('-');
+              const dateBR = y && m && d ? `${d}/${m}` : (apt.date || '?');
+              const newNotes = `${pending.notes || ''} | Reagendado para ${dateBR} ${apt.time || ''}`.trim();
+              await updateFollowUp(pending.id, { status: 'agendou', notes: newNotes });
+              console.log(`✅ Follow-up reagendar_pendente ${pending.id} → 'agendou' (apt ${appointmentId})`);
+            }
+          }
+        } catch (err) {
+          console.warn('⚠️ Erro ao fechar follow-up reagendar_pendente:', err.message);
+        }
+
         return JSON.stringify({
           message: `Agendamento reagendado com sucesso!`,
           appointmentId: apt.id,
