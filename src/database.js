@@ -203,7 +203,7 @@ export const queries = {
 
   // Follow-ups
   getPendingFollowups: db.prepare(`
-    SELECT f.*, p.name, p.phone
+    SELECT f.*, p.name, p.phone, p.contact_phone
     FROM followups f
     JOIN patients p ON f.patient_id = p.id
     WHERE f.status = 'pendente'
@@ -272,6 +272,16 @@ export const queries = {
     WHERE direction = 'outbound'
       AND created_at >= datetime('now', 'localtime', '-5 minutes')
     ORDER BY created_at DESC
+  `),
+
+  // Verifica se bot enviou msg para telefone (ultimos 8 digitos) nos ultimos 3 minutos
+  // Usa LIKE com sufixo para resolver 9o digito BR (bot envia com 9, status:sent vem sem 9)
+  wasRecentBotOutbound: db.prepare(`
+    SELECT 1 FROM message_log
+    WHERE direction = 'outbound'
+      AND phone LIKE '%' || ?
+      AND created_at >= datetime('now', 'localtime', '-3 minutes')
+    LIMIT 1
   `),
 };
 
