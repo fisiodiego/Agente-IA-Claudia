@@ -1,4 +1,4 @@
-import { queries } from './database.js';
+import db, { queries } from './database.js';
 
 // ─── Gerenciamento de Pacientes ────────────────────────────────────────────────
 
@@ -151,8 +151,8 @@ function scheduleFollowups(patientId, dischargeDate) {
     satisfactionDate.setTime(Date.now() + 5 * 60 * 1000); // 5 min a partir de agora
   }
 
+  // pesquisa_satisfacao removida — agora e enviada como texto apos template pos_consulta na alta
   const followups = [
-    { type: 'pesquisa_satisfacao', date: satisfactionDate },
     { type: 'lembrete_1mes',       date: addMonths(base, 1) },
     { type: 'lembrete_3meses',     date: addMonths(base, 3) },
     { type: 'lembrete_6meses',     date: addMonths(base, 6) },
@@ -173,15 +173,48 @@ function scheduleFollowups(patientId, dischargeDate) {
 }
 
 /**
- * Agenda um check-in para o dia seguinte após o paciente confirmar o agendamento.
- * Enviado às 10h do dia seguinte à confirmação.
+ * Agenda um check-in pós-consulta para o dia SEGUINTE À CONSULTA.
+ *
+ * Se `appointmentDateStr` (YYYY-MM-DD) é passado → agenda para data_consulta + 1 dia às 10h.
+ * Caso contrário (fallback) → agenda para amanhã às 10h (comportamento legado).
+ *
+ * Evita o bug histórico em que pacientes confirmavam ANTES do dia da consulta
+ * e recebiam "Como foi seu atendimento?" ANTES da consulta acontecer.
  */
-export function schedulePostConfirmationFollowup(patientId) {
-  const tomorrow = new Date();
-  tomorrow.setDate(tomorrow.getDate() + 1);
-  tomorrow.setHours(10, 0, 0, 0); // Envia às 10h do dia seguinte
+export function schedulePostConfirmationFollowup(patientId, appointmentDateStr) {
+  // ⚠️ DESATIVADO (2026-04-20): o fluxo pos_confirmacao_d1 estava causando DUPLA pesquisa:
+  //   1) este followup disparava `followup_satisfacao` (Doctoralia) via fallback do scheduler
+  //   2) sendPostConsultationMessages (cron 10h BRT) enviava `pos_consulta` no mesmo dia
+  // O cron sendPostConsultationMessages JÁ cobre o caso: varre consultas concluídas de ontem
+  // e envia check-in único. A pesquisa Doctoralia só deve sair APÓS alta (confirmDischarge).
+  //
+  // Sub-bug corrigido de bônus: o cálculo `new Date('YYYY-MM-DDT10:00:00')` no VPS UTC
+  // resultava em 10h UTC = 07h BRT (pesquisa saindo às 7h da manhã).
+  //
+  // Para restaurar, descomentar o bloco abaixo.
+  const src = appointmentDateStr ? `consulta ${appointmentDateStr}` : 'fallback (confirmação)';
+  console.log(`ℹ️ schedulePostConfirmationFollowup desativado — paciente #${patientId} [base: ${src}] (check-in via cron sendPostConsultationMessages)`);
+  return;
 
-  const scheduledDate = tomorrow.toISOString().replace('T', ' ').slice(0, 19);
+  /* DESATIVADO — mantido para referência histórica
+  let scheduledAt;
+
+  if (appointmentDateStr && /^\d{4}-\d{2}-\d{2}$/.test(appointmentDateStr)) {
+    scheduledAt = new Date(`${appointmentDateStr}T10:00:00`);
+    scheduledAt.setDate(scheduledAt.getDate() + 1);
+  } else {
+    scheduledAt = new Date();
+    scheduledAt.setDate(scheduledAt.getDate() + 1);
+    scheduledAt.setHours(10, 0, 0, 0);
+  }
+
+  if (scheduledAt.getTime() < Date.now()) {
+    scheduledAt = new Date();
+    scheduledAt.setDate(scheduledAt.getDate() + 1);
+    scheduledAt.setHours(10, 0, 0, 0);
+  }
+
+  const scheduledDate = scheduledAt.toISOString().replace('T', ' ').slice(0, 19);
 
   queries.insertFollowup.run({
     patient_id:     patientId,
@@ -189,7 +222,8 @@ export function schedulePostConfirmationFollowup(patientId) {
     scheduled_date: scheduledDate,
   });
 
-  console.log(`📅 Check-in pós-consulta agendado para ${tomorrow.toLocaleString('pt-BR')} — paciente #${patientId}`);
+  console.log(`📅 Check-in pós-consulta agendado para ${scheduledAt.toLocaleString('pt-BR')} — paciente #${patientId} [base: ${src}]`);
+  */
 }
 
 /**
@@ -213,6 +247,12 @@ export function saveMessage(patientId, role, content) {
  */
 export function logMessage(phone, direction, content, type = 'text') {
   queries.logMessage.run(phone, direction, content, type);
+}
+
+export function wasRecentBotOutbound(phone) {
+  const digits = String(phone).replace(/\D/g, '');
+  const last8 = digits.slice(-8);
+  return !!queries.wasRecentBotOutbound.get(last8);
 }
 
 /**
@@ -255,6 +295,92 @@ export function listDischargedPatients() {
  */
 export function getPatientFollowups(patientId) {
   return queries.getFollowupsByPatient.all(patientId);
+}
+
+// ─── Gerenciamento de Data de Nascimento ──────────────────────────────────────
+
+/**
+ * Normaliza qualquer formato conhecido de data para ISO "YYYY-MM-DD".
+ * Aceita: YYYY-MM-DD, YYYY/MM/DD, DD/MM/AAAA (e variantes com - ou .),
+ *         DDMMYYYY (8 dígitos), DMMYYYY (7 dígitos, typo), DDMMYY (6 dígitos).
+ * Retorna null se inválido ou vazio.
+ */
+export function normalizeBirthDate(input) {
+  if (input === null || input === undefined) return null;
+  const raw = String(input).trim();
+  if (raw === '') return null;
+
+  let year = 0, month = 0, day = 0;
+  const iso = raw.match(/^(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})$/);
+  if (iso) {
+    year = parseInt(iso[1], 10); month = parseInt(iso[2], 10); day = parseInt(iso[3], 10);
+  } else {
+    const br = raw.match(/^(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{4})$/);
+    if (br) {
+      day = parseInt(br[1], 10); month = parseInt(br[2], 10); year = parseInt(br[3], 10);
+    } else {
+      const d = raw.replace(/\D/g, '');
+      if (d.length === 8) {
+        day = parseInt(d.slice(0, 2), 10); month = parseInt(d.slice(2, 4), 10); year = parseInt(d.slice(4, 8), 10);
+      } else if (d.length === 7) {
+        day = parseInt(d.slice(0, 1), 10); month = parseInt(d.slice(1, 3), 10); year = parseInt(d.slice(3, 7), 10);
+      } else if (d.length === 6) {
+        day = parseInt(d.slice(0, 2), 10); month = parseInt(d.slice(2, 4), 10);
+        const yy = parseInt(d.slice(4, 6), 10);
+        const currentYear = new Date().getFullYear();
+        const candidate2000 = 2000 + yy;
+        year = candidate2000 <= currentYear - 1 ? candidate2000 : 1900 + yy;
+      } else {
+        return null;
+      }
+    }
+  }
+
+  if (month < 1 || month > 12) return null;
+  if (day < 1 || day > 31) return null;
+  if (year < 1900 || year > 2100) return null;
+
+  const dt = new Date(Date.UTC(year, month - 1, day));
+  if (dt.getUTCFullYear() !== year || dt.getUTCMonth() !== month - 1 || dt.getUTCDate() !== day) {
+    return null;
+  }
+
+  return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+}
+
+/**
+ * Atualiza birth_date do paciente com guard contra sobreposição:
+ * - Se existente vazio/null → seta o novo valor (normalizado)
+ * - Se existente igual ao novo (após normalização) → não faz nada
+ * - Se existente diferente do novo → loga warning e MANTÉM o existente
+ *
+ * Retorna: 'set' | 'kept' | 'conflict' | 'invalid' | 'skip'
+ */
+export function tryUpdatePatientBirthDate(patientId, newValue, source = 'unknown') {
+  if (newValue === null || newValue === undefined || String(newValue).trim() === '') {
+    return 'skip';
+  }
+  const normalized = normalizeBirthDate(newValue);
+  if (!normalized) {
+    console.warn(`⚠️ birth_date inválido (patient #${patientId}, source=${source}): "${newValue}" — ignorando`);
+    return 'invalid';
+  }
+  const row = queries.getPatientById.get(patientId);
+  const current = row?.birth_date;
+  const currentNormalized = current ? normalizeBirthDate(current) : null;
+
+  if (!currentNormalized) {
+    db.prepare("UPDATE patients SET birth_date = ?, updated_at = datetime('now','localtime') WHERE id = ?").run(normalized, patientId);
+    console.log(`✅ birth_date definido para paciente #${patientId} = ${normalized} (source=${source})`);
+    return 'set';
+  }
+
+  if (currentNormalized === normalized) {
+    return 'kept';
+  }
+
+  console.warn(`⚠️ CONFLITO birth_date paciente #${patientId}: existente=${currentNormalized}, novo=${normalized} (source=${source}) — mantendo existente`);
+  return 'conflict';
 }
 
 // ─── Utilitários ──────────────────────────────────────────────────────────────
