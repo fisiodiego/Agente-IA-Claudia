@@ -12,6 +12,7 @@ import {
   getPatientFollowups,
   schedulePostConfirmationFollowup,
   setLgpdConsent,
+  tryUpdatePatientBirthDate,
 } from './patientManager.js';
 import {
   thanksSurveyResponse,
@@ -33,6 +34,52 @@ const CONFIRM_COOLDOWN = 60 * 60 * 1000; // 1 hora
 export const recentReminderPhones = new Map(); // phone -> timestamp
 export const recentReminderNames = new Map(); // phone -> patientName (set pelo scheduler)
 const REMINDER_WINDOW = 24 * 60 * 60 * 1000; // 24h
+// Pacientes que acabaram de agendar (evita interpretar 'Ok' como novo pedido)
+const recentlyScheduled = new Map(); // phone -> timestamp
+const SCHEDULE_COOLDOWN = 10 * 60 * 1000; // 10 minutos
+// ── Criar lead no CRM Kanban para contatos novos ──
+async function createLeadInCRM(name, phone, interest) {
+  try {
+    // Dedup: verificar se já existe follow-up com esse telefone
+    const { getFollowUpsByPhone } = await import('./crmApi.js');
+    const existing = await getFollowUpsByPhone(phone);
+    if (existing && existing.ok && existing.data && existing.data.length > 0) {
+      console.log('[Agent] Lead já existe no Kanban para ' + phone + ' (' + existing.data.length + ' registro(s)), pulando criação');
+      return;
+    }
+    const id = 'lead-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6);
+    const body = {
+      id,
+      patientName: name || 'Contato WhatsApp',
+      phone,
+      type: 'lead',
+      status: interest === 'agendamento_whatsapp' ? 'agendou' : 'pendente',
+      source: 'whatsapp',
+      interest: interest || null,
+      notes: interest === 'agendamento_whatsapp' ? 'Agendou consulta via WhatsApp' : 'Contato via WhatsApp - nao agendou',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+
+    const CRM_URL = process.env.CRM_API_URL || 'https://crm.holiz.com.br/api/integration';
+    const API_KEY = process.env.CRM_API_KEY || '';
+
+    const res = await fetch(CRM_URL + '/follow-ups', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-API-Key': API_KEY },
+      body: JSON.stringify(body),
+    });
+
+    if (res.ok) {
+      console.log('[Agent] Lead criado no CRM:', name || phone);
+    } else {
+      console.warn('[Agent] Lead CRM respondeu', res.status);
+    }
+  } catch (err) {
+    console.error('[Agent] Erro ao criar lead:', err.message);
+  }
+}
+
 
 
 // ─── Gerador dinâmico de seção de datas ───────────────────────────────────────
@@ -63,30 +110,101 @@ function getDateSection(professionalsInfo) {
   const hojeDia = diasNomes[now.getDay()];
   const ano = now.getFullYear();
   const amanha = new Date(now.getTime() + 86400000).toISOString().slice(0,10);
-  
+
   const proxDias = [];
-  for (let i = 1; i <= 7; i++) {
+  for (let i = 1; i <= 30; i++) {
     const d = new Date(now.getTime() + i * 86400000);
     const nome = diasNomes[d.getDay()].toLowerCase();
     const data = d.toISOString().slice(0,10);
-    proxDias.push('- "' + nome + '" = ' + data);
+    const [y, m, day] = data.split('-');
+    const br = `${day}/${m}`;
+    proxDias.push(`- ${br} (${data}) = ${nome}`);
   }
-  
+
   return `⚠️ IMPORTANTE: A data de HOJE é ${hoje} (${hojeDia}). O ano atual é ${ano}.
 Quando o paciente mencionar datas, SEMPRE use o ano ${ano}.
 - "amanhã" = ${amanha}
 - "27/03" = ${ano}-03-27
 
-📅 TABELA DE REFERÊNCIA — próximos 7 dias (USE ESTA TABELA, não calcule datas):
+📅 TABELA DE REFERÊNCIA — próximos 30 dias (USE ESTA TABELA, não calcule datas):
 ${proxDias.join('\n')}
 
+- 🚨 NUNCA mencione o dia da semana (segunda, terça, domingo, etc.) de uma data SEM ANTES consultar a tabela acima OU o bloco "DATAS DETECTADAS NA MENSAGEM" (se houver). Se a data estiver fora da tabela, NÃO afirme o dia da semana — chame check_availability primeiro e use o campo dayOfWeek retornado.
 - NUNCA use anos anteriores nas tools
 - NUNCA calcule datas mentalmente. SEMPRE consulte a tabela acima.
 - Quando a tool check_availability retornar o campo dayOfWeek, USE ESSE VALOR na resposta ao paciente. Não substitua pelo dia que o paciente pediu.
+- ⚠️ CONSISTÊNCIA DE DATA ENTRE TOOLS: Após chamar check_availability com date=X, a PRÓXIMA chamada create_appointment DEVE usar EXATAMENTE date=X. NUNCA altere a data entre as duas tool calls. Se o paciente pediu outra data, chame check_availability de novo PRIMEIRO com a nova data. Violar isso causa agendamento em dia errado.
 
 ━━━ PROFISSIONAIS DA CLÍNICA (CACHE) ━━━
 ${professionalsInfo}
 ⚠️ Use estes IDs diretamente. SÓ use list_professionals se precisar de dados atualizados ou se o profissional não estiver listado aqui.`;
+}
+
+/**
+ * Detecta datas escritas pelo paciente (DD/MM, DD/MM/YYYY, DD-MM, "dia N")
+ * e retorna um bloco com o dia da semana resolvido — para o LLM não alucinar.
+ */
+function resolveDatesInMessage(message) {
+  if (!message || typeof message !== 'string') return '';
+  const DIAS = ['domingo','segunda-feira','terça-feira','quarta-feira','quinta-feira','sexta-feira','sábado'];
+  const nowBRT = new Date(Date.now() - 3*3600000);
+  const anoAtual = nowBRT.getFullYear();
+  const mesAtual = nowBRT.getMonth() + 1;
+  const diaAtual = nowBRT.getDate();
+  const resolved = new Map();
+
+  const normalized = message.replace(/[\u00A0\u2000-\u200F\u2028\u2029]/g, ' ');
+
+  // Padrão 1: DD/MM ou DD/MM/YYYY (também aceita hífen ou ponto como separador)
+  const reDM = /\b(\d{1,2})[\/\-.](\d{1,2})(?:[\/\-.](\d{2,4}))?\b/g;
+  let m;
+  while ((m = reDM.exec(normalized)) !== null) {
+    const dia = parseInt(m[1], 10);
+    const mes = parseInt(m[2], 10);
+    let ano = m[3] ? parseInt(m[3], 10) : null;
+    if (ano === null) {
+      // Se a data já passou este ano, assumir próximo ano
+      const thisYear = new Date(Date.UTC(anoAtual, mes - 1, dia));
+      if (thisYear.getUTCMonth() !== mes - 1) continue;
+      const candidateUTC = Date.UTC(anoAtual, mes - 1, dia);
+      const todayUTC = Date.UTC(anoAtual, mesAtual - 1, diaAtual);
+      ano = candidateUTC < todayUTC - 86400000 ? anoAtual + 1 : anoAtual;
+    } else if (ano < 100) {
+      ano += 2000;
+    }
+    if (dia < 1 || dia > 31 || mes < 1 || mes > 12) continue;
+    const d = new Date(Date.UTC(ano, mes - 1, dia));
+    if (d.getUTCMonth() !== mes - 1 || d.getUTCFullYear() !== ano) continue;
+    const weekday = DIAS[d.getUTCDay()];
+    const iso = `${ano}-${String(mes).padStart(2,'0')}-${String(dia).padStart(2,'0')}`;
+    const br = `${String(dia).padStart(2,'0')}/${String(mes).padStart(2,'0')}`;
+    resolved.set(iso, `${br}/${ano} (${iso}) = ${weekday}`);
+  }
+
+  // Padrão 2: "dia N" (ex: "dia 27") — assume mês atual, ou próximo se já passou
+  const reDia = /\bdia\s+(\d{1,2})\b/gi;
+  while ((m = reDia.exec(normalized)) !== null) {
+    const dia = parseInt(m[1], 10);
+    if (dia < 1 || dia > 31) continue;
+    let mes = mesAtual;
+    let ano = anoAtual;
+    if (dia < diaAtual) {
+      mes += 1;
+      if (mes > 12) { mes = 1; ano += 1; }
+    }
+    const d = new Date(Date.UTC(ano, mes - 1, dia));
+    if (d.getUTCMonth() !== mes - 1) continue;
+    const weekday = DIAS[d.getUTCDay()];
+    const iso = `${ano}-${String(mes).padStart(2,'0')}-${String(dia).padStart(2,'0')}`;
+    const br = `${String(dia).padStart(2,'0')}/${String(mes).padStart(2,'0')}`;
+    if (!resolved.has(iso)) {
+      resolved.set(iso, `dia ${dia} → ${br}/${ano} (${iso}) = ${weekday}`);
+    }
+  }
+
+  if (resolved.size === 0) return '';
+
+  return `\n\n━━━ 📅 DATAS DETECTADAS NA MENSAGEM DO PACIENTE ━━━\n${[...resolved.values()].map(v => '- ' + v).join('\n')}\n⚠️ Use EXATAMENTE estes dias da semana ao responder e nas tools. NUNCA invente outro dia.`;
 }
 
 // ─── Prompt do Sistema ────────────────────────────────────────────────────────
@@ -157,6 +275,21 @@ __DATE_BLOCK__
 - Se o paciente mencionar que está "de alta", "recebeu alta", "terminou o tratamento" ou similar,
   confirme com entusiasmo e inclua a tag: [ALTA_CONFIRMADA]
 - Mantenha respostas CURTAS (máximo 4-5 linhas). Isso é WhatsApp, não e-mail!
+- ⚠️ DESPEDIDA / REFERÊNCIA À CONSULTA — regra OBRIGATÓRIA:
+  Consulte a "DATA ATUAL" acima E o bloco "Proximos agendamentos" do contexto. Regras de 4 casos:
+  • Se NÃO HÁ agendamento futuro (lista vazia OU paciente já teve consulta hoje e ela foi concluída) →
+    NUNCA diga "te esperamos amanhã" nem "te esperamos hoje" nem invente data futura.
+    Use frases neutras: "obrigada pela consulta de hoje", "se precisar de algo é só chamar",
+    "qualquer coisa estamos por aqui", "tenha uma ótima semana".
+  • Se a consulta é HOJE (marcador *** HOJE *** no contexto, AINDA NÃO ACONTECEU) → use "até logo",
+    "até daqui a pouco" ou "nos vemos hoje". NUNCA diga "amanhã".
+  • Se a consulta é AMANHÃ (marcador *** AMANHA *** no contexto) → pode dizer "te esperamos amanhã".
+  • Se a consulta é em 2+ dias → SEMPRE use dia da semana + data (ex: "te esperamos quinta, 23/04").
+    NUNCA diga "amanhã" nem "até amanhã".
+  ❌ ERRADO: paciente teve consulta hoje pela manhã (já concluída) e responder "te esperamos amanhã" (não há consulta amanhã).
+  ❌ ERRADO: marcar 23/04 em 21/04 e responder "te esperamos amanhã" (amanhã de 21/04 é 22/04, não 23/04).
+  ✅ CERTO: paciente teve consulta concluída hoje cedo → "obrigada pela consulta de hoje, qualquer coisa estamos por aqui".
+  ✅ CERTO: marcar 23/04 em 21/04 → "te esperamos quinta-feira, 23/04".
 
 ━━━ REGRA CRÍTICA: NÃO INVENTE DADOS DE AGENDAMENTO ━━━
 ⚠️ NUNCA confirme, crie ou altere um agendamento sem usar as tools.
@@ -185,6 +318,7 @@ SE A TOOL FALHAR → Diga: "Vou encaminhar para a equipe e retornamos em breve."
 Dados REAIS da clínica (os ÚNICOS que você pode fornecer):
 - Telefone/WhatsApp: (71) 98709-3555
 - PIX (CNPJ): 49.516.188/0001-14
+- Estacionamento: o prédio possui estacionamento amplo e coberto
 - NUNCA forneça outros dados além destes.
 
 ━━━ PLANOS DE TRATAMENTO E PAGAMENTO ━━━
@@ -234,6 +368,24 @@ Quando o paciente pedir para agendar:
    b) find_or_create_patient → pegar ID do paciente
    c) get_patient_packages → verificar se tem pacote ativo (IMPORTANTE!)
    d) create_appointment → criar o agendamento
+
+━━━ REGRA OBRIGATORIA: CADASTRO ANTES DE AGENDAR ━━━
+ANTES de chamar find_or_create_patient, verifique se voce tem:
+1. Nome COMPLETO (nome + sobrenome) — pushName do WhatsApp geralmente e so primeiro nome
+2. Data de NASCIMENTO
+
+Se falta QUALQUER um desses dados, PERGUNTE antes de continuar:
+- "Para prosseguir com o agendamento, preciso do seu nome completo e data de nascimento."
+- So chame find_or_create_patient DEPOIS de ter ambos os dados
+- Passe o birthDate no formato YYYY-MM-DD para a tool
+
+EXCECAO: Se no contexto do paciente ja consta que ele tem agendamentos anteriores ou e paciente existente do CRM, pule esta etapa — ele ja tem cadastro.
+
+Exemplo de fluxo CORRETO para paciente novo:
+Paciente: "Quero agendar para sabado"
+Claudia: "Otimo! Para prosseguir, preciso do seu nome completo e data de nascimento."
+Paciente: "Daniela Ramos Silva, 15/03/1990"
+Claudia: [agora sim chama check_availability → find_or_create_patient com nome e birthDate → create_appointment]
 ⚠️ OTIMIZAÇÃO: NÃO chame list_professionals se o profissional já está no cache acima. Vá direto para check_availability com o ID do cache.
 ⚠️ NUNCA chame a mesma tool 2 vezes na mesma interação com os mesmos parâmetros.
    Se o paciente TEM pacote ativo, informe: "Será descontado do seu pacote (X/Y sessões usadas)"
@@ -268,6 +420,21 @@ Exemplo ERRADO:
   Paciente: "Quero agendar para sexta-feira" → check_availability com sexta
   Paciente: "8h" → check_availability com sábado ← NUNCA FAÇA ISSO
 
+
+━━━ REGRA ABSOLUTA: VERIFICAR AGENDAMENTOS ANTES DE CRIAR ━━━
+⚠️ ANTES de usar create_appointment, SEMPRE use get_patient_appointments primeiro.
+Se o paciente JA TEM um agendamento futuro:
+1. Use reschedule_appointment para MOVER o agendamento existente (nao crie um novo)
+2. reschedule_appointment atualiza data/hora automaticamente sem criar duplicata
+3. NUNCA use create_appointment se o paciente ja tem consulta agendada — use reschedule_appointment
+
+Exemplos de reagendamento (paciente JA tem consulta marcada):
+- "Quero mudar meu horario" → get_patient_appointments → reschedule_appointment
+- "Tem horario as 17h?" → get_patient_appointments → reschedule_appointment
+- "Preciso remarcar" → get_patient_appointments → reschedule_appointment
+
+create_appointment so deve ser usado para pacientes SEM agendamento futuro.
+Se tiver duvida, use get_patient_appointments para verificar ANTES de criar.
 ━━━ REGRA CRÍTICA: CORRIGIR AGENDAMENTO ERRADO ━━━
 ⚠️ Se o paciente disser que a data/horário está ERRADO (ex: "quero na sexta", "não, era segunda", "errou o dia"):
 1. PRIMEIRO cancele o agendamento errado com cancel_appointment
@@ -317,14 +484,30 @@ export async function processMessage(phone, message, options = {}) {
     let patient = getPatientByPhone(phone);
 
     // 1b. Se não encontrou OU encontrou incompleto ("Novo Paciente"), buscar no CRM por pushName
+    // IMPORTANTE: só confiar no match por pushName se o nome retornado do CRM COMEÇA com o pushName
+    // (evita "Alice" do WhatsApp ser identificada como "Alice Dias Freitas" que é outra pessoa)
     const needsCrmLookup = !patient || (patient && !patient.registration_complete && patient.name === 'Novo Paciente');
+    const pushNameHasSurname = pushName && pushName.trim().includes(' ');
     if (needsCrmLookup && pushName && pushName.length >= 3) {
       try {
-        const { searchPatientByName } = await import('./crmApi.js');
-        const nameResult = await searchPatientByName(pushName);
+        const { searchPatientByName, searchPatientByPhone } = await import('./crmApi.js');
+        // Primeiro tentar buscar por telefone no CRM (mais confiável que nome)
+        const phoneResult = await searchPatientByPhone(phone);
+        let nameResult = { ok: false, data: null };
+        if (phoneResult.ok && phoneResult.data?.found && phoneResult.data.patient) {
+          nameResult = phoneResult;
+          console.log(`🔍 LID ${phone} identificado como ${phoneResult.data.patient.name} via telefone CRM`);
+        } else if (pushNameHasSurname) {
+          // Só buscar por nome se pushName tem sobrenome (mais confiável)
+          nameResult = await searchPatientByName(pushName);
+        }
         if (nameResult.ok && nameResult.data?.found && nameResult.data.patient) {
           const crmPatient = nameResult.data.patient;
-          console.log(`🔍 LID ${phone} identificado como ${crmPatient.name} via pushName`);
+          if (!pushNameHasSurname) {
+            console.log(`🔍 LID ${phone} identificado como ${crmPatient.name} via telefone CRM`);
+          } else {
+            console.log(`🔍 LID ${phone} identificado como ${crmPatient.name} via pushName`);
+          }
           if (patient) {
             // Atualizar registro existente com dados do CRM
             completePatientRegistration(patient.id, {
@@ -370,6 +553,25 @@ export async function processMessage(phone, message, options = {}) {
     // ⚠️ Deve vir ANTES de tudo — paciente pode confirmar sem nunca ter falado com a Cláudia
     const msgTrimmed = message.trim();
 
+    // ── GUARD: CPF como pagamento pós-atendimento ─────────────────────
+    // Padrão típico: paciente manda comprovante Pix (imagem — não processamos)
+    // e em seguida manda "CPF 12345678901" para a nota fiscal.
+    // Sem este guard, a Cláudia busca contexto e pode responder coisas fora
+    // do assunto (confirmar consulta antiga, etc.).
+    // Aceita: "CPF 12345678901", "CPF: 12345678901", "cpf.12345678901"
+    const isCpfPayment = /^\s*CPF[\s:.\-_]*\d{8,14}\s*$/i.test(msgTrimmed);
+    if (isCpfPayment) {
+      saveMessage(patient.id, 'user', message);
+      const patientFirst = (patient.name && patient.name !== 'Novo Paciente')
+        ? patient.name.split(' ')[0]
+        : (pushName ? pushName.split(' ')[0] : '');
+      const greet = patientFirst ? `, ${patientFirst}` : '';
+      const reply = `Obrigada${greet}! 🙏 Recebi seu CPF e comprovante — vou repassar para o Dr. Diego Matos registrar o pagamento. Se precisar de nota fiscal ou tiver qualquer dúvida, a clínica entra em contato em seguida.`;
+      saveMessage(patient.id, 'assistant', reply);
+      console.log(`💳 Pagamento detectado via CPF para ${patient.name || phone} — guard acionado (LLM ignorado)`);
+      return reply;
+    }
+
     // Aceita apenas mensagens curtas do paciente (não mensagens longas do sistema)
     const isShortEnough = msgTrimmed.length <= 30;
     // Palavras explícitas de confirmação (sempre tratadas como confirmação)
@@ -377,8 +579,24 @@ export async function processMessage(phone, message, options = {}) {
     // Respostas curtas genéricas (só contam como confirmação se recebeu lembrete recente)
     const hasRecentReminder = recentReminderPhones.has(phone) && (Date.now() - recentReminderPhones.get(phone)) < REMINDER_WINDOW;
     const isGenericYes = isShortEnough && hasRecentReminder && /^(sim|s|ok|certo|pode|tudo bem|beleza|perfeito|fechado|blz|show)[!\.\s]*$/i.test(msgTrimmed);
-    const isConfirming = isExplicitConfirm || isGenericYes;
+
+    // ── GUARD DE CONTEXTO DE REAGENDAMENTO ─────────────────────────────────
+    // Caso real (Rogério, 28/abr/2026): paciente pediu reagendar, Claudia ofereceu
+    // novo horário, paciente respondeu "Sim, confirmo" — shortcut interceptou e marcou
+    // confirmação de presença na consulta antiga, sem chamar reschedule_appointment.
+    //
+    // Se a última msg da Claudia foi sobre reagendamento, NÃO aplicar shortcut de
+    // confirmação — deixa o Claude (LLM) processar com contexto e chamar a tool certa.
+    const recentHistory = getConversationHistory(patient.id).slice(-4);
+    const lastAssistantMsg = recentHistory.filter(m => m.role === 'assistant').slice(-1)[0]?.content || '';
+    const isReschedulingContext = /reagendamento|reagendar|alterar.*(consulta|hor[aá]rio)|mudar.*(consulta|hor[aá]rio)|trocar.*(consulta|hor[aá]rio)|passar.*(p[ar]+a|para)\s+(\d|outr|amanh|segunda|ter[çc]a|quarta|quinta|sexta|s[áa]bado|domingo)/i.test(lastAssistantMsg);
+
+    const isConfirming = (isExplicitConfirm || isGenericYes) && !isReschedulingContext;
     const isCancelling = isShortEnough && /^(cancelar?|cancelado|cancelo|nao\s*vou|não\s*vou|nao\s*consigo|não\s*consigo)[!\.\s]*$/i.test(msgTrimmed);
+
+    if (isReschedulingContext && (isExplicitConfirm || isGenericYes)) {
+      console.log(`🔀 Confirmação em contexto de REAGENDAMENTO detectada — delegando ao Claude (não interceptar como presença)`);
+    }
 
     if (isConfirming) {
       // Anti-duplicata: não envia confirmação duas vezes em 1 hora
@@ -390,32 +608,38 @@ export async function processMessage(phone, message, options = {}) {
       recentlyConfirmed.set(patient.id, Date.now());
       saveMessage(patient.id, 'user', message);
 
+      // Data (YYYY-MM-DD) do agendamento confirmado — usada para agendar pos_confirmacao_d1
+      // no dia SEGUINTE à consulta, não 1 dia depois da confirmação.
+      let confirmedApptDate = null;
+
       // ── Confirmar no CRM ──────────────────────────────────────
       try {
         const { getPatientAppointments, confirmAppointment, searchPatientByName } = await import('./crmApi.js');
         let confirmed = false;
         // Tenta buscar agendamentos pelo telefone
         const aptsResult = await getPatientAppointments(phone);
-        if (aptsResult.ok && aptsResult.data?.appointments?.length) {
-          const pending = aptsResult.data.appointments.filter(a => a.status === 'agendado');
+        if (aptsResult.ok && aptsResult.data?.length) {
+          const pending = aptsResult.data.filter(a => a.status === 'agendado');
           if (pending.length > 0) {
             const confirmResult = await confirmAppointment(pending[0].id);
             if (confirmResult.ok) {
               console.log(`✅ Agendamento ${pending[0].id} confirmado no CRM para ${patient.name || phone}`);
               confirmed = true;
+              confirmedApptDate = pending[0].date || null;
             }
           }
         }
         // Fallback: busca por contact_phone (número real salvo do CRM para LIDs)
         if (!confirmed && patient.contact_phone) {
           const aptsResult3 = await getPatientAppointments(patient.contact_phone);
-          if (aptsResult3.ok && aptsResult3.data?.appointments?.length) {
-            const pending3 = aptsResult3.data.appointments.filter(a => a.status === 'agendado');
+          if (aptsResult3.ok && aptsResult3.data?.length) {
+            const pending3 = aptsResult3.data.filter(a => a.status === 'agendado');
             if (pending3.length > 0) {
               const confirmResult3 = await confirmAppointment(pending3[0].id);
               if (confirmResult3.ok) {
                 console.log(`✅ Agendamento ${pending3[0].id} confirmado no CRM (via contact_phone) para ${patient.name}`);
                 confirmed = true;
+                confirmedApptDate = pending3[0].date || null;
               }
             }
           }
@@ -428,13 +652,14 @@ export async function processMessage(phone, message, options = {}) {
             if (nameResult.ok && nameResult.data?.found && nameResult.data.patient?.phone) {
               const realPhone = nameResult.data.patient.phone;
               const aptsResult2 = await getPatientAppointments(realPhone);
-              if (aptsResult2.ok && aptsResult2.data?.appointments?.length) {
-                const pending2 = aptsResult2.data.appointments.filter(a => a.status === 'agendado');
+              if (aptsResult2.ok && aptsResult2.data?.length) {
+                const pending2 = aptsResult2.data.filter(a => a.status === 'agendado');
                 if (pending2.length > 0) {
                   const confirmResult2 = await confirmAppointment(pending2[0].id);
                   if (confirmResult2.ok) {
                     console.log(`✅ Agendamento ${pending2[0].id} confirmado no CRM (via nome "${searchName}") para ${patient.name}`);
                     confirmed = true;
+                    confirmedApptDate = pending2[0].date || null;
                   }
                 }
               }
@@ -445,10 +670,14 @@ export async function processMessage(phone, message, options = {}) {
         console.error(`❌ Erro ao confirmar no CRM: ${err.message}`);
       }
 
-      // Se o phone é um LID (não parece BR), tentar pegar o nome correto dos lembretes recentes
+      // Usar nome do lembrete recente (do CRM) se disponível — mais confiável que o banco local
       let confirmName = patient.name;
-      const isLidPhone = !/^55\d{10,11}$/.test(phone) && !/^\d{10,11}$/.test(phone);
-      if (isLidPhone || confirmName === 'Novo Paciente') {
+      const reminderName = recentReminderNames.get(phone);
+      const hasRecentRem = recentReminderPhones.has(phone) && (Date.now() - recentReminderPhones.get(phone)) < REMINDER_WINDOW;
+      if (hasRecentRem && reminderName && reminderName !== 'Novo Paciente') {
+        confirmName = reminderName;
+        console.log(`🔄 Confirmação: usando nome do lembrete "${confirmName}" (banco local: "${patient.name}")`);
+      } else if (confirmName === 'Novo Paciente') {
         // Verificar nos lembretes recentes quem foi lembrado
         for (const [remPhone, remName] of recentReminderNames) {
           if (remName && remName !== 'Novo Paciente') {
@@ -459,15 +688,16 @@ export async function processMessage(phone, message, options = {}) {
               try {
                 const { getPatientAppointments } = await import('./crmApi.js');
                 const crmApts = await getPatientAppointments(remPhone);
-                if (crmApts.ok && crmApts.data?.appointments?.some(a => a.status === 'agendado' || a.status === 'confirmado')) {
+                if (crmApts.ok && crmApts.data?.some(a => a.status === 'agendado' || a.status === 'confirmado')) {
                   confirmName = remName;
                   console.log(`🔄 LID confirmação: corrigido nome de "${patient.name}" para "${confirmName}" via lembrete recente (${remPhone})`);
                   // Confirmar o agendamento do paciente correto no CRM
-                  const pending = crmApts.data.appointments.filter(a => a.status === 'agendado');
+                  const pending = crmApts.data.filter(a => a.status === 'agendado');
                   if (pending.length > 0) {
                     const { confirmAppointment } = await import('./crmApi.js');
                     await confirmAppointment(pending[0].id);
                     console.log(`✅ Agendamento ${pending[0].id} confirmado no CRM para ${confirmName}`);
+                    confirmedApptDate = pending[0].date || confirmedApptDate;
                   }
                   break;
                 }
@@ -479,7 +709,7 @@ export async function processMessage(phone, message, options = {}) {
       const firstName = confirmName.split(' ')[0];
       const reply = appointmentConfirmedReminder(confirmName);
       saveMessage(patient.id, 'assistant', reply);
-      schedulePostConfirmationFollowup(patient.id);
+      schedulePostConfirmationFollowup(patient.id, confirmedApptDate);
       console.log(`📅 Agendamento confirmado por ${confirmName || phone}`);
       return reply;
     }
@@ -492,8 +722,8 @@ export async function processMessage(phone, message, options = {}) {
         let cancelled = false;
         // Tenta buscar agendamentos pelo telefone
         const aptsResult = await getPatientAppointments(phone);
-        if (aptsResult.ok && aptsResult.data?.appointments?.length) {
-          const pending = aptsResult.data.appointments.filter(a => a.status === 'agendado' || a.status === 'confirmado');
+        if (aptsResult.ok && aptsResult.data?.length) {
+          const pending = aptsResult.data.filter(a => a.status === 'agendado' || a.status === 'confirmado');
           if (pending.length > 0) {
             const cancelResult = await cancelAppointment(pending[0].id, 'Cancelado pelo paciente via WhatsApp');
             if (cancelResult.ok) {
@@ -508,8 +738,8 @@ export async function processMessage(phone, message, options = {}) {
           if (nameResult.ok && nameResult.data?.found && nameResult.data.patient?.phone) {
             const realPhone = nameResult.data.patient.phone;
             const aptsResult2 = await getPatientAppointments(realPhone);
-            if (aptsResult2.ok && aptsResult2.data?.appointments?.length) {
-              const pending2 = aptsResult2.data.appointments.filter(a => a.status === 'agendado' || a.status === 'confirmado');
+            if (aptsResult2.ok && aptsResult2.data?.length) {
+              const pending2 = aptsResult2.data.filter(a => a.status === 'agendado' || a.status === 'confirmado');
               if (pending2.length > 0) {
                 const cancelResult2 = await cancelAppointment(pending2[0].id, 'Cancelado pelo paciente via WhatsApp');
                 if (cancelResult2.ok) {
@@ -529,6 +759,94 @@ export async function processMessage(phone, message, options = {}) {
       return reply;
     }
 
+    // 2a. Se paciente acabou de agendar e manda msg curta tipo 'Ok', ignorar (não reprocessar)
+    const recentSchedule = recentlyScheduled.get(phone);
+    if (recentSchedule && Date.now() - recentSchedule < SCHEDULE_COOLDOWN) {
+      const isShortAck = msgTrimmed.length <= 20 && /^(ok|certo|beleza|blz|perfeito|show|fechado|obrigad[oa]|valeu|brigad[oa]|muito obrigad[oa]|combinado|ate la|até lá|tudo bem|ta bom|tá bom)[!\.\ ]*$/i.test(msgTrimmed);
+      if (isShortAck) {
+        console.log(`⏭️ Msg curta pós-agendamento ignorada: \"${msgTrimmed}\" de ${patient.name || phone}`);
+        saveMessage(patient.id, 'user', message);
+        return null;
+      }
+    }
+
+        // 2b. Auto-detectar resposta a follow-up (atualizar status no Kanban)
+    if (!isNewPatient) {
+      try {
+        const { getFollowUpsByPhone, updateFollowUpStatus } = await import('./crmApi.js');
+        const phoneToCheck = patient.contact_phone || phone;
+        const fuResult = await getFollowUpsByPhone(phoneToCheck);
+        if (fuResult.ok && Array.isArray(fuResult.data)) {
+          const pendingFUs = fuResult.data.filter(f => f.status === 'enviado' || f.status === 'pendente');
+          for (const fu of pendingFUs) {
+            await updateFollowUpStatus(fu.id, 'respondeu');
+            console.log(`✅ Follow-up ${fu.id} atualizado para 'respondeu' — ${fu.patientName}`);
+          }
+        }
+      } catch (err) {
+        console.warn('⚠️ Erro ao atualizar follow-up:', err.message);
+      }
+    }
+
+    // 2c. Detectar clique no botão "Reagendar" → criar follow-up pendente no Kanban
+    // (impede que scheduler envie lembrete_dia enquanto o paciente ainda não confirmou nova data)
+    if (!isNewPatient && msgTrimmed.toLowerCase() === 'reagendar') {
+      try {
+        const { getPatientAppointments, getFollowUpsByPhone, createFollowUp } = await import('./crmApi.js');
+        const phoneToCheck = patient.contact_phone || phone;
+
+        // Buscar próximo agendamento do paciente
+        const aptsResult = await getPatientAppointments(phoneToCheck);
+        const aptsArr = Array.isArray(aptsResult?.data) ? aptsResult.data : [];
+        const now = new Date();
+        const futureApts = aptsArr
+          .filter(a => a.status !== 'cancelado' && new Date(`${a.date}T${a.time || '00:00'}`) >= now)
+          .sort((a, b) => new Date(`${a.date}T${a.time}`) - new Date(`${b.date}T${b.time}`));
+        const nextApt = futureApts[0];
+
+        if (nextApt) {
+          // Dedupe: verificar se já existe follow-up reagendar_pendente aberto para esse apt
+          const existingResult = await getFollowUpsByPhone(phoneToCheck);
+          const existingArr = Array.isArray(existingResult?.data) ? existingResult.data : [];
+          const alreadyPending = existingArr.some(f =>
+            f.source === 'reagendar_pendente' &&
+            f.status !== 'agendou' &&
+            f.status !== 'perdido' &&
+            typeof f.notes === 'string' &&
+            f.notes.includes(`[apt_id:${nextApt.id}]`)
+          );
+
+          if (!alreadyPending) {
+            // Formatar data/hora para notas
+            const [y, m, d] = String(nextApt.date || '').split('-');
+            const dateBR = y && m && d ? `${d}/${m}` : (nextApt.date || '?');
+            const timeStr = nextApt.time || '?';
+
+            const id = 'reag-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6);
+            await createFollowUp({
+              id,
+              patientId: patient.crm_patient_id || null,
+              patientName: patient.name || nextApt.patientName || 'Paciente',
+              phone: phoneToCheck,
+              type: 'reagendamento',
+              status: 'respondeu',
+              source: 'reagendar_pendente',
+              notes: `Pediu reagendar consulta de ${dateBR} às ${timeStr}\n[apt_id:${nextApt.id}]`,
+              createdAt: new Date().toISOString(),
+              updatedAt: new Date().toISOString(),
+            });
+            console.log(`🔄 Follow-up reagendar_pendente criado para ${patient.name || phoneToCheck} (apt ${nextApt.id})`);
+          } else {
+            console.log(`⏭️ Follow-up reagendar_pendente já existe para apt ${nextApt.id} — pulando criação`);
+          }
+        } else {
+          console.log(`⚠️ "Reagendar" recebido mas paciente ${phoneToCheck} não tem agendamento futuro`);
+        }
+      } catch (err) {
+        console.warn('⚠️ Erro ao registrar reagendar_pendente:', err.message);
+      }
+    }
+
     // 3. Se é novo paciente → verificar se já existe no CRM antes de pedir dados
     if (isNewPatient) {
       saveMessage(patient.id, 'user', message);
@@ -546,12 +864,18 @@ export async function processMessage(phone, message, options = {}) {
         }
         
         // Se não encontrou por telefone (qualquer tipo), tenta buscar por pushName no CRM
+        // CUIDADO: só associa se pushName tem nome+sobrenome (evita confusão entre "Cláudia Tedesco" e "Cláudia Erdens")
         if (!crmResult?.found && pushName && pushName.length >= 3) {
           try {
-            const nameResult = await searchPatientByName(pushName);
-            if (nameResult?.ok && nameResult.data?.found && nameResult.data.patient) {
-              crmResult = { found: true, patient: nameResult.data.patient };
-              console.log("✅ Paciente encontrado no CRM por pushName " + pushName + ": " + nameResult.data.patient.name);
+            const hasLastName = pushName.trim().includes(' ') && pushName.trim().split(' ').length >= 2;
+            if (hasLastName) {
+              const nameResult = await searchPatientByName(pushName);
+              if (nameResult?.ok && nameResult.data?.found && nameResult.data.patient) {
+                crmResult = { found: true, patient: nameResult.data.patient };
+                console.log("✅ Paciente encontrado no CRM por pushName " + pushName + ": " + nameResult.data.patient.name);
+              }
+            } else {
+              console.log("⏭️ pushName '" + pushName + "' é só primeiro nome — pulando busca por nome (risco de confusão)");
             }
           } catch (e) {
             console.log("⚠️ Erro ao buscar por pushName: " + e.message);
@@ -606,23 +930,30 @@ export async function processMessage(phone, message, options = {}) {
           });
           const db = (await import('./database.js')).default;
           db.prepare(`UPDATE patients SET
-            birth_date = COALESCE(@birth_date, birth_date),
             contact_phone = COALESCE(@contact_phone, contact_phone),
             registration_complete = 1, lgpd_consent = 1,
             updated_at = datetime('now','localtime')
             WHERE id = @id`).run({
             id: patient.id,
-            birth_date: crmPat.birthDate || null,
             contact_phone: phone,
           });
+          // birth_date com guard de sobreposição — não sobrescreve valor existente
+          tryUpdatePatientBirthDate(patient.id, crmPat.birthDate, 'crm-sync-by-name');
           const firstName = crmPat.name.split(' ')[0];
           const reply = `Ol\u00e1, *${firstName}*! 😊 Que bom falar com voc\u00ea!\n\nSou a *Cl\u00e1udia*, assistente virtual do Instituto Holiz. Como posso te ajudar hoje?`;
+          // Criar lead no Kanban para paciente existente que entrou em contato
+          createLeadInCRM(crmPat.name, phone, null).catch(() => {});
+
           saveMessage(patient.id, 'assistant', reply);
           return reply;
         }
       } catch (err) {
         console.log(`⚠️ Erro ao buscar paciente no CRM: ${err.message}`);
       }
+      // Novo contato nao encontrado no CRM — criar lead no Kanban
+      const leadName = (pushName && pushName !== 'Novo Paciente' && pushName.length >= 2) ? pushName : null;
+      createLeadInCRM(leadName, phone, null).catch(() => {});
+
       const welcome = welcomeMessage();
       saveMessage(patient.id, 'assistant', welcome);
       return welcome;
@@ -671,10 +1002,14 @@ export async function processMessage(phone, message, options = {}) {
               const { queries } = await import('./database.js');
               const db = (await import('./database.js')).default;
               queries.updatePatient.run({ id: patient.id, name: crmPat.name, email: crmPat.email || '', specialty: crmPat.specialty || 'osteopatia', notes: '' });
-              db.prepare(`UPDATE patients SET registration_complete = 1, lgpd_consent = 1, contact_phone = COALESCE(@contact_phone, contact_phone), birth_date = COALESCE(@birth_date, birth_date), updated_at = datetime('now','localtime') WHERE id = @id`).run({ id: patient.id, contact_phone: crmPat.phone || phone, birth_date: crmPat.birthDate || null });
+              db.prepare(`UPDATE patients SET registration_complete = 1, lgpd_consent = 1, contact_phone = COALESCE(@contact_phone, contact_phone), updated_at = datetime('now','localtime') WHERE id = @id`).run({ id: patient.id, contact_phone: crmPat.phone || phone });
+              tryUpdatePatientBirthDate(patient.id, crmPat.birthDate, 'lgpd-consent');
               const firstName = crmPat.name.split(' ')[0];
               saveMessage(patient.id, 'user', message);
               const reply = `Olá, *${firstName}*! 😊 Te identifiquei!\n\nSou a *Cláudia*, assistente virtual do Instituto Holiz. Como posso te ajudar?`;
+              // Criar lead no Kanban para paciente existente que entrou em contato
+              createLeadInCRM(crmPat.name, phone, null).catch(() => {});
+
               saveMessage(patient.id, 'assistant', reply);
               return reply;
             }
@@ -725,8 +1060,10 @@ export async function processMessage(phone, message, options = {}) {
     saveMessage(patient.id, 'user', message);
 
     // 5. Chamar Claude API
+    // Trunca histórico para últimas 40 mensagens (20 pares user/assistant) — evita crescimento indefinido
+    const truncatedHistory = history.slice(-40);
     const messages = [
-      ...history,
+      ...truncatedHistory,
       { role: 'user', content: message },
     ];
 
@@ -734,22 +1071,80 @@ export async function processMessage(phone, message, options = {}) {
     let assistantReply = "";
     
     // Inject patient context into system prompt so Claude uses the correct phone
-    const patientPhone = patient.contact_phone || phone;
-    const patientContext = `\n\n\u2501\u2501\u2501 CONTEXTO DO PACIENTE ATUAL \u2501\u2501\u2501\nNome: ${patient.name || "Desconhecido"}\nTelefone para tools: ${patientPhone}\n\u26a0\ufe0f Ao usar tools (get_patient_appointments, find_or_create_patient, etc), SEMPRE use este telefone: ${patientPhone}`;
+    // Validação: só usa contact_phone se tiver formato BR válido (10-13 dígitos com/sem DDI 55).
+    // Blinda contra bug histórico em que LIDs/wa_ids do WhatsApp (15+ dígitos) vazavam
+    // como telefone no system prompt e acabavam criando pacientes duplicados no CRM.
+    const isValidBRPhone = (p) => {
+      if (!p) return false;
+      const d = String(p).replace(/\D/g, '');
+      return (d.length === 10 || d.length === 11) ||
+             ((d.length === 12 || d.length === 13) && d.startsWith('55'));
+    };
+    const patientPhone = isValidBRPhone(patient.contact_phone) ? patient.contact_phone : phone;
+    // Buscar agendamentos do paciente para injetar no contexto
+    let appointmentInfo = '';
+    try {
+      const { getPatientAppointments } = await import('./crmApi.js');
+      const aptsCtx = await getPatientAppointments(patientPhone);
+      if (aptsCtx.ok && aptsCtx.data?.length) {
+        const upcoming = aptsCtx.data.slice(0, 3);
+        const DIAS_SEMANA = ['domingo','segunda-feira','terca-feira','quarta-feira','quinta-feira','sexta-feira','sabado'];
+        const nowBRT = new Date(Date.now() - 3*3600000);
+        const todayStr = nowBRT.toISOString().slice(0,10);
+        const [ty, tm, td] = todayStr.split('-').map(Number);
+        const todayUTC = Date.UTC(ty, tm - 1, td);
+        appointmentInfo = '\n\nProximos agendamentos:\n' + upcoming.map(a => {
+          const [y, mo, d] = a.date.split('-').map(Number);
+          const aptUTC = Date.UTC(y, mo - 1, d);
+          const diffDays = Math.round((aptUTC - todayUTC) / 86400000);
+          const weekday = DIAS_SEMANA[new Date(aptUTC).getUTCDay()];
+          const dateBR = `${String(d).padStart(2,'0')}/${String(mo).padStart(2,'0')}/${y}`;
+          let marker;
+          if (diffDays === 0) marker = '*** HOJE ***';
+          else if (diffDays === 1) marker = '*** AMANHA ***';
+          else if (diffDays < 0) marker = `(consulta passada, ${Math.abs(diffDays)} dia(s) atras)`;
+          else marker = `(daqui a ${diffDays} dias)`;
+          return `- ${weekday.toUpperCase()} ${dateBR} as ${a.time} ${marker} [status: ${a.status}] - ${a.professionalName || 'Dr. Diego'}`;
+        }).join('\n');
+        appointmentInfo += '\n\nATENCAO: Ao se referir a um agendamento na resposta ao paciente, USE o dia da semana e a data (ex: "sabado 25/04"). So diga "hoje" ou "amanha" se o marcador acima explicitar HOJE ou AMANHA. NUNCA calcule por conta propria.';
+      }
+    } catch(e) { /* ignora */ }
+    const isCadastrado = patient.registration_complete === 1 || (appointmentInfo && appointmentInfo.length > 0);
+    const cadastroInfo = isCadastrado ? '\nStatus: Paciente cadastrado no CRM (NAO precisa pedir nome/nascimento)' : '\nStatus: PACIENTE NOVO — ainda SEM cadastro. OBRIGATORIO pedir nome completo e data de nascimento ANTES de agendar.';
+    const resolvedDatesInfo = resolveDatesInMessage(message);
+    const patientContext = `\n\n\u2501\u2501\u2501 CONTEXTO DO PACIENTE ATUAL \u2501\u2501\u2501\nNome: ${patient.name || "Desconhecido"}\nTelefone para tools: ${patientPhone}${cadastroInfo}\n\u26a0\ufe0f Ao usar tools (get_patient_appointments, find_or_create_patient, etc), SEMPRE use este telefone: ${patientPhone}${appointmentInfo}${resolvedDatesInfo}`;
     
     // Load professionals cache
     const profs = await getProfessionalsCache();
     const professionalsInfo = profs.map(p => `- ${p.name} | ID: ${p.id} | Especialidade(s): ${p.specialty}`).join('\n') || 'Nenhum profissional cacheado. Use list_professionals.';
 
+    // System prompt dividido em 2 blocos:
+    //   [0] estável (SYSTEM_PROMPT + __DATE_BLOCK__) → cacheado via ephemeral cache_control
+    //   [1] volátil (patientContext) → fresco a cada request, sem invalidar o cache do bloco [0]
+    // Ordem de cache na API: tools → system → messages. Marcar o fim do system[0] cacheia tools+system[0].
+    const stableSystem = SYSTEM_PROMPT.replace("__DATE_BLOCK__", getDateSection(professionalsInfo));
+    const systemBlocks = [
+      { type: 'text', text: stableSystem, cache_control: { type: 'ephemeral' } },
+      { type: 'text', text: patientContext },
+    ];
+
     // Tool use loop - keep calling until we get a text response
     while (true) {
       const response = await anthropic.messages.create({
-        model: 'claude-sonnet-4-20250514',
+        model: 'claude-sonnet-4-6',
         max_tokens: 2048,
-        system: SYSTEM_PROMPT.replace("__DATE_BLOCK__", getDateSection(professionalsInfo)) + patientContext,
+        thinking: { type: 'adaptive' },
+        system: systemBlocks,
         messages: currentMessages,
         tools: CRM_TOOLS,
       });
+      // Log de cache para medir economia (cache_read_input_tokens indica hit)
+      if (response.usage) {
+        const u = response.usage;
+        if (u.cache_read_input_tokens || u.cache_creation_input_tokens) {
+          console.log(`💰 Cache: read=${u.cache_read_input_tokens||0} write=${u.cache_creation_input_tokens||0} input=${u.input_tokens} output=${u.output_tokens}`);
+        }
+      }
 
       // Check if response has tool_use blocks
       const toolUseBlocks = response.content.filter(b => b.type === 'tool_use');
@@ -767,7 +1162,26 @@ export async function processMessage(phone, message, options = {}) {
       const toolResults = [];
       for (const toolBlock of toolUseBlocks) {
         console.log("Tool call: " + toolBlock.name + " " + JSON.stringify(toolBlock.input));
-        const result = await handleToolCall(toolBlock.name, toolBlock.input);
+        // Marcar paciente como recém-agendado quando create_appointment sucede
+        if (toolBlock.name === 'create_appointment') {
+          const toolResult = await handleToolCall(toolBlock.name, toolBlock.input, phone);
+          try {
+            const parsed = JSON.parse(toolResult);
+            if (parsed.appointmentId) {
+              recentlyScheduled.set(phone, Date.now());
+              console.log(`📌 Paciente ${phone} marcado como recém-agendado`);
+              // Criar lead no Kanban para quem agendou via WhatsApp
+              try {
+                const leadName = patient.name || pushName || 'Novo Paciente';
+                await createLeadInCRM(leadName, phone, 'agendamento_whatsapp');
+                console.log(`✅ Lead criado no Kanban para ${leadName} (agendou via WhatsApp)`);
+              } catch (e) { console.warn('⚠️ Erro ao criar lead pós-agendamento:', e.message); }
+            }
+          } catch {}
+          toolResults.push({ type: 'tool_result', tool_use_id: toolBlock.id, content: toolResult });
+          continue;
+        }
+        const result = await handleToolCall(toolBlock.name, toolBlock.input, phone);
         toolResults.push({
           type: 'tool_result',
           tool_use_id: toolBlock.id,
@@ -869,13 +1283,16 @@ Não inclua explicações, apenas o JSON.`,
             // DDMMYYYY
             extracted.birth_date = `${d.slice(0,2)}/${d.slice(2,4)}/${d.slice(4,8)}`;
           } else if (d.length === 6) {
-            // DDMMYY → assume 1900s ou 2000s
+            // DDMMYY — pivot dinâmico: se 20yy for futuro ou bebê <1 ano, assume 19yy
             const yy = parseInt(d.slice(4,6));
-            const yyyy = yy > 30 ? `19${d.slice(4,6)}` : `20${d.slice(4,6)}`;
+            const currentYear = new Date().getFullYear();
+            const candidate2000 = 2000 + yy;
+            const yyyy = candidate2000 <= currentYear - 1 ? candidate2000 : 1900 + yy;
             extracted.birth_date = `${d.slice(0,2)}/${d.slice(2,4)}/${yyyy}`;
           } else if (d.length === 7) {
-            // Typo comum: DMMYYYY ou DDMMYYY — tenta DDMMYYYY inserindo dígito
-            extracted.birth_date = `${d.slice(0,2)}/${d.slice(2,4)}/19${d.slice(4,7)}`;
+            // Typo comum: DMMYYYY — assume que o primeiro dígito é o dia sem zero à esquerda
+            // e os 4 últimos são o ano completo (ex: 1091983 → 1/09/1983)
+            extracted.birth_date = `0${d.slice(0,1)}/${d.slice(1,3)}/${d.slice(3,7)}`;
           }
           break;
         }
@@ -939,11 +1356,14 @@ Não inclua explicações, apenas o JSON.`,
     });
     // Salvar campos novos diretamente
     if (extracted.birth_date || extracted.contact_phone) {
-      const db = (await import('./database.js')).default;
-      db.prepare(`UPDATE patients SET birth_date = COALESCE(@birth_date, birth_date),
-                  contact_phone = COALESCE(@contact_phone, contact_phone),
-                  updated_at = datetime('now','localtime') WHERE id = @id`)
-        .run({ id: patient.id, birth_date: extracted.birth_date, contact_phone: extracted.contact_phone });
+      if (extracted.contact_phone) {
+        const db = (await import('./database.js')).default;
+        db.prepare(`UPDATE patients SET contact_phone = COALESCE(@contact_phone, contact_phone), updated_at = datetime('now','localtime') WHERE id = @id`)
+          .run({ id: patient.id, contact_phone: extracted.contact_phone });
+      }
+      if (extracted.birth_date) {
+        tryUpdatePatientBirthDate(patient.id, extracted.birth_date, 'handle-registration');
+      }
     }
   }
 
@@ -961,8 +1381,9 @@ Não inclua explicações, apenas o JSON.`,
         const crmPat = crmResult.patient;
         console.log("CRM match by name: " + crmPat.name + " (id: " + crmPat.id + ")");
         const db = (await import("./database.js")).default;
-        db.prepare("UPDATE patients SET birth_date = COALESCE(@bd, birth_date), contact_phone = COALESCE(@cp, contact_phone), registration_complete = 1, lgpd_consent = 1, updated_at = datetime(now,localtime) WHERE id = @id")
-          .run({ id: patient.id, bd: crmPat.birthDate || null, cp: crmPat.phone ? crmPat.phone.replace(/\D/g, "") : null });
+        db.prepare("UPDATE patients SET contact_phone = COALESCE(@cp, contact_phone), registration_complete = 1, lgpd_consent = 1, updated_at = datetime('now','localtime') WHERE id = @id")
+          .run({ id: patient.id, cp: crmPat.phone ? crmPat.phone.replace(/\D/g, "") : null });
+        tryUpdatePatientBirthDate(patient.id, crmPat.birthDate, 'post-confirm-crm-name');
         const firstName = updatedName.split(" ")[0];
         const reply = "Ola, *" + firstName + "*! Te encontrei no nosso sistema. Como posso te ajudar? \u{1F60A}";
         saveMessage(patient.id, "assistant", reply);
@@ -1022,13 +1443,22 @@ function isAvailabilityQuestion(message) {
 
 /**
  * Verifica se a mensagem é um score de pesquisa de satisfação (1-5).
+ *
+ * IMPORTANTE: regex precisa ser ANCORADO (^...$) e mensagem precisa ser CURTA,
+ * senão qualquer dígito 1-5 dentro de outras frases vira "score" indevido —
+ * ex: "04 de maio, às 10h" capturava "4" e disparava resposta de pesquisa,
+ * marcando a pesquisa como respondida e ignorando a real intenção do paciente.
  */
 function extractSurveyScore(message) {
   const trimmed = message.trim();
+  // Mensagem só com o número: "4", "5"
   if (/^[1-5]$/.test(trimmed)) return trimmed;
 
-  // Também aceita formatos como "4/5", "nota 4", "nota: 4"
-  const match = trimmed.match(/(?:nota[:\s]+)?([1-5])(?:\s*\/\s*5)?/i);
+  // Proteção: mensagens longas nunca são score (mesmo que contenham dígito 1-5)
+  if (trimmed.length > 12) return null;
+
+  // Formatos dedicados a score: "nota 4", "4/5", "nota: 5/5" — agora ancorados
+  const match = trimmed.match(/^(?:nota[:\s]+)?([1-5])(?:\s*\/\s*5)?$/i);
   return match ? match[1] : null;
 }
 

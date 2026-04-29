@@ -250,3 +250,32 @@ export async function searchPatientByName(name) {
   const params = new URLSearchParams({ name });
   return crmFetch(`/patients/search?${params}`);
 }
+
+// ── Follow-ups: buscar por telefone e atualizar status ─────────────────────
+
+export async function getFollowUpsByPhone(phone) {
+  return crmFetch(`/follow-ups/by-phone/${encodeURIComponent(phone)}`);
+}
+
+export async function updateFollowUpStatus(id, status) {
+  return crmFetch(`/follow-ups/${id}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ status, respondedAt: new Date().toISOString(), updatedAt: new Date().toISOString() }),
+  });
+}
+
+// Atualiza campos arbitrários de um follow-up (status, notes, etc.)
+export async function updateFollowUp(id, patch) {
+  return crmFetch(`/follow-ups/${id}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ ...patch, updatedAt: new Date().toISOString() }),
+  });
+}
+
+// Cria um follow-up no Kanban do CRM
+export async function createFollowUp(body) {
+  return crmFetch('/follow-ups', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+}

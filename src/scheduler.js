@@ -1,15 +1,106 @@
 import cron from 'node-cron';
 import { getPendingFollowups, markFollowupSent, getPatientByPhone, confirmDischarge } from './patientManager.js';
 import { followupTemplates, followupDescriptions, appointmentReminder24h, getGreeting, packageReminderLevel1, packageReminderLevel2, packageReminderLevel3, noShowRescheduling, waitlistNotification, postConsultationCheckIn, birthdayMessage, reactivationMessage, weeklyReportMessage, packageCompletedMessage, referralMessage, sameDayReminder } from './messageTemplates.js';
-import { getUpcomingAppointments, getRecentDischarges, getStalePackages, getRecentNoShows, getWaitlistMatches, removeFromWaitlist, getCompletedAppointments, getBirthdays, getInactivePatients, getWeeklyReport, getCompletedPackages, logClaudiaActivity } from './crmApi.js';
+import { getUpcomingAppointments, getRecentDischarges, getStalePackages, getRecentNoShows, getWaitlistMatches, removeFromWaitlist, getCompletedAppointments, getBirthdays, getInactivePatients, getWeeklyReport, getCompletedPackages, logClaudiaActivity, getFollowUpsByPhone } from './crmApi.js';
 import db from './database.js';
 import { recentReminderPhones, recentReminderNames } from './agent.js';
 
 let sendMessageFn = null;
 let sendTemplateFn = null;
 
+/**
+ * Valida formato de telefone BR (10-13 dígitos, com/sem DDI 55).
+ * Bloqueia wa_ids/LIDs do WhatsApp (tipicamente 14-15+ dígitos).
+ */
+function isValidBRPhone(p) {
+  if (!p) return false;
+  const d = String(p).replace(/\D/g, '');
+  return (d.length === 10 || d.length === 11) ||
+         ((d.length === 12 || d.length === 13) && d.startsWith('55'));
+}
+
+/**
+ * Resolve o telefone de um paciente priorizando contact_phone quando phone inválido.
+ * Fix do bug: pacientes LID tinham phone=wa_id (14+ dígitos), causando falha no envio
+ * de follow-ups agendados. contact_phone guarda o telefone BR real resolvido pelo agent.
+ */
+function resolvePatientPhone(patient) {
+  const phone = patient.phone || patient.Phone;
+  const contactPhone = patient.contact_phone || patient.contactPhone;
+  if (isValidBRPhone(phone)) return phone;
+  if (isValidBRPhone(contactPhone)) return contactPhone;
+  return phone; // devolve o original mesmo inválido (função chamadora decide o que fazer)
+}
+
 // Controle para não enviar lembrete duplicado
 const sentReminders = new Set();
+
+// ── Criar registro de follow-up no CRM Kanban ──
+async function createFollowUpInCRM(followup) {
+  try {
+    const typeMap = {
+      lembrete_1mes: 'retorno_1m',
+      lembrete_3meses: 'retorno_3m',
+      lembrete_6meses: 'retorno_6m',
+      lembrete_12meses: 'retorno_12m',
+      pesquisa_satisfacao: 'retorno_1m',
+    };
+
+    // Buscar patient_id E patient_name do CRM pelo telefone.
+    // O followup.name vem do banco local da Claudia, que pode estar como "Novo Paciente"
+    // se a paciente nunca conversou com a Claudia (ex: paciente cadastrado direto no CRM
+    // com alta, recebe retorno_1m sem ter trocado msg antes). Caso Alana Castro 29/abr/2026.
+    let crmPatientId = null;
+    let crmPatientName = null;
+    if (followup.phone) {
+      try {
+        const { searchPatientByPhone } = await import('./crmApi.js');
+        const result = await searchPatientByPhone(followup.phone);
+        if (result?.found && result.patient?.id) {
+          crmPatientId = result.patient.id;
+          crmPatientName = result.patient.name;
+        }
+      } catch (e) { console.warn('⚠️ Erro ao buscar patient_id CRM:', e.message); }
+    }
+
+    // Prioriza nome do CRM (real) sobre o do banco local da Claudia (pode ser "Novo Paciente")
+    const finalName = crmPatientName || followup.name;
+
+    const id = 'fu-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6);
+    const body = {
+      id,
+      patientId: crmPatientId,
+      patientName: finalName,
+      phone: followup.phone,
+      type: typeMap[followup.type] || 'retorno_1m',
+      status: 'enviado',
+      source: 'claudia',
+      lastAppointmentDate: null,
+      dueDate: new Date().toISOString().split('T')[0],
+      messageSentAt: new Date().toISOString(),
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+
+    const CRM_URL = process.env.CRM_API_URL || 'https://crm.holiz.com.br/api/integration';
+    const API_KEY = process.env.CRM_API_KEY || '';
+
+    const res = await fetch(CRM_URL + '/follow-ups', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-API-Key': API_KEY },
+      body: JSON.stringify(body),
+    });
+
+    if (res.ok) {
+      console.log('[Scheduler] Follow-up criado no CRM:', finalName, '(' + (typeMap[followup.type] || 'retorno_1m') + ')');
+    } else {
+      console.warn('[Scheduler] Follow-up CRM respondeu', res.status);
+    }
+  } catch (err) {
+    console.error('[Scheduler] Erro ao criar follow-up no CRM:', err.message);
+  }
+}
+
 
 // Helper: check if reminder was already sent (persisted in DB)
 function wasReminderSent(db, appointmentId, type, date) {
@@ -98,8 +189,18 @@ export function startScheduler() {
   // Executar follow-ups imediatamente ao iniciar
   setTimeout(() => checkAndSendFollowups(), 3000);
 
-  // Executar checagem de lembretes 10s após iniciar
-  setTimeout(() => checkAndSendReminders(), 10000);
+  // Executar checagem de lembretes 10s após iniciar (APENAS se horario BRT entre 19:30-23:59)
+  setTimeout(() => {
+    const nowBRT = new Date(Date.now() - 3 * 3600000);
+    const hourBRT = nowBRT.getUTCHours();
+    const minBRT = nowBRT.getUTCMinutes();
+    if (hourBRT >= 20 || (hourBRT === 19 && minBRT >= 30)) {
+      console.log("⏰ Horario BRT (" + hourBRT + ":" + String(minBRT).padStart(2, "0") + ") dentro da janela — executando lembretes noturno");
+      checkAndSendReminders();
+    } else {
+      console.log("⏰ Horario BRT (" + hourBRT + ":" + String(minBRT).padStart(2, "0") + ") fora da janela de lembretes (19:30-23:59) — pulando");
+    }
+  }, 10000);
 
   // Altas do CRM: verificar a cada 10 minutos
   cron.schedule('*/10 * * * *', async () => {
@@ -202,17 +303,46 @@ async function sendFollowup(followup) {
   const message = templateFn(followup.name);
   const description = followupDescriptions[followup.type] || followup.type;
 
-  console.log(`📨 Enviando "${description}" para ${followup.name} (${followup.phone})`);
+  // Resolver telefone válido (fallback para contact_phone se phone=wa_id/LID inválido)
+  const targetPhone = resolvePatientPhone(followup);
+  if (!isValidBRPhone(targetPhone)) {
+    console.error(`⛔ Follow-up #${followup.id} ${description} para ${followup.name}: telefone inválido (phone=${followup.phone}, contact_phone=${followup.contact_phone || 'n/a'}). Pulando e marcando como enviado para não reagendar.`);
+    markFollowupSent(followup.id);
+    return;
+  }
+  if (targetPhone !== followup.phone) {
+    console.log(`🔧 Follow-up ${description} para ${followup.name}: phone=${followup.phone} inválido, usando contact_phone=${targetPhone}`);
+  }
+
+  // Skip: não enviar retorno se paciente já tem consulta agendada/confirmada
+  if (followup.type.startsWith('lembrete_') && followup.type !== 'lembrete_consulta') {
+    try {
+      const { getPatientAppointments } = await import('./crmApi.js');
+      const aptsResult = await getPatientAppointments(targetPhone);
+      if (aptsResult.ok && aptsResult.data?.length) {
+        const hasUpcoming = aptsResult.data.some(a =>
+          (a.status === 'agendado' || a.status === 'confirmado')
+        );
+        if (hasUpcoming) {
+          console.log(`⏭️ Skip follow-up ${description} para ${followup.name} — já tem consulta agendada`);
+          markFollowupSent(followup.id);
+          return;
+        }
+      }
+    } catch (e) { console.warn('⚠️ Erro ao verificar agendamentos:', e.message); }
+  }
+
+  console.log(`📨 Enviando ${description} para ${followup.name} (${targetPhone})`);
 
   const firstName = followup.name.split(' ')[0];
 
   // Mapeamento de follow-up type -> template dedicado do Chakra WABA
   const followupTemplateMap = {
     pesquisa_satisfacao: { name: 'followup_satisfacao', params: [firstName, 'https://www.doctoralia.com.br/adicionar-opiniao/diego-matos#/opiniao'] },
-    lembrete_1mes:      { name: 'revisao_1mes',        params: [firstName] },
-    lembrete_3meses:    { name: 'revisao_3meses',      params: [firstName] },
-    lembrete_6meses:    { name: 'revisao_6meses',      params: [firstName] },
-    lembrete_12meses:   { name: 'revisao_12meses',     params: [firstName] },
+    lembrete_1mes:      { name: 'retorno_1mes_a',      params: [firstName] },
+    lembrete_3meses:    { name: 'retorno_3meses_a',    params: [firstName] },
+    lembrete_6meses:    { name: 'retorno_6meses_a',    params: [firstName] },
+    lembrete_12meses:   { name: 'retorno_12meses_a',   params: [firstName] },
   };
 
   // Fallback para followup_satisfacao se tipo nao mapeado (ex: pos_confirmacao_d1)
@@ -220,16 +350,21 @@ async function sendFollowup(followup) {
   const templateName = tmpl.name;
   const templateParams = tmpl.params;
 
-  const ok = await smartSend(followup.phone, message, templateName, templateParams);
+  const ok = await smartSend(targetPhone, message, templateName, templateParams);
   if (!ok) {
     console.error(`❌ Falha ao enviar follow-up "${description}" para ${followup.name}`);
     return;
   }
   markFollowupSent(followup.id);
 
+  // Criar registro no Kanban do CRM (exceto pesquisa de satisfação e pos-confirmação)
+  if (followup.type !== "pesquisa_satisfacao" && followup.type !== "pos_confirmacao_d1") {
+    await createFollowUpInCRM({ ...followup, phone: targetPhone });
+  }
+
   await logClaudiaActivity('follow_up', {
     patientName: followup.name,
-    phone: followup.phone,
+    phone: targetPhone,
     details: { type: followup.type, followupId: followup.id }
   });
 
@@ -289,6 +424,25 @@ async function checkAndSendReminders() {
       if (!apt.patientPhone) {
         console.warn(`⚠️ Paciente ${apt.patientName} sem telefone, lembrete não enviado`);
         continue;
+      }
+
+      // ⏸️ Pular lembrete_consulta (véspera) se há reagendamento pendente no Kanban
+      try {
+        const fuResult = await getFollowUpsByPhone(apt.patientPhone);
+        const fuArr = Array.isArray(fuResult?.data) ? fuResult.data : [];
+        const hasPendingReschedule = fuArr.some(f =>
+          f.source === 'reagendar_pendente' &&
+          f.status !== 'agendou' &&
+          f.status !== 'perdido' &&
+          typeof f.notes === 'string' &&
+          f.notes.includes(`[apt_id:${apt.id}]`)
+        );
+        if (hasPendingReschedule) {
+          console.log(`⏸️ Lembrete_consulta pulado — reagendamento pendente para ${apt.patientName} (apt ${apt.id})`);
+          continue;
+        }
+      } catch (err) {
+        console.warn(`⚠️ Erro ao verificar reagendamento pendente para ${apt.patientName}:`, err.message);
       }
 
       try {
@@ -374,6 +528,25 @@ async function checkCrmDischarges() {
           continue;
         }
 
+        // Verificar se a alta foi dada HOJE — se sim, adiar pos_consulta para amanha
+        const nowBRT = new Date(Date.now() - 3 * 3600000);
+        const todayBRT = nowBRT.toISOString().slice(0, 10);
+        const dischargeDay = (discharge.dischargeDate || '').slice(0, 10);
+        if (dischargeDay === todayBRT) {
+          console.log('⏳ Alta de ' + discharge.name + ' foi HOJE — pos_consulta sera enviado amanha pelo cron das 10h');
+          // Marcar como processada para nao reprocessar, mas NAO envia pos_consulta agora
+          // O cron sendPostConsultationMessages (10h BRT) enviara amanha
+          db.prepare(
+            'INSERT OR IGNORE INTO processed_discharges (patient_id, discharge_date, processed_at) VALUES (?, ?, ?)'
+          ).run(discharge.phone, discharge.dischargeDate, new Date().toISOString());
+          // Agendar follow-ups (retornos) normalmente — so adia o pos_consulta
+          const claudiaPatientToday = getPatientByPhone(discharge.phone);
+          if (claudiaPatientToday) {
+            confirmDischarge(claudiaPatientToday.id, discharge.dischargeDate.split('T')[0]);
+          }
+          continue;
+        }
+
         // Buscar paciente na Claudia pelo telefone
         const claudiaPatient = getPatientByPhone(discharge.phone);
 
@@ -382,7 +555,7 @@ async function checkCrmDischarges() {
           continue;
         }
 
-        // Agendar follow-ups
+        // Agendar follow-ups (retornos 1m, 3m, 6m, 12m)
         confirmDischarge(claudiaPatient.id, discharge.dischargeDate.split('T')[0]);
 
         // Marcar como processado
@@ -390,7 +563,59 @@ async function checkCrmDischarges() {
           'INSERT OR IGNORE INTO processed_discharges (patient_id, discharge_date, processed_at) VALUES (?, ?, ?)'
         ).run(discharge.phone, discharge.dischargeDate, new Date().toISOString());
 
-        console.log(`✅ Follow-ups agendados para ${discharge.name} (alta: ${discharge.dischargeDate})`);
+        // Enviar pesquisa de satisfacao na alta
+        // Se pos_consulta ja foi enviado nas ultimas 24h → envia texto direto (janela aberta)
+        // Se nao → envia template pos_consulta primeiro, espera 3min, depois texto
+        try {
+          const dischargeFirstName = discharge.name.split(' ')[0];
+          const doctoraliaUrl = 'https://www.doctoralia.com.br/adicionar-opiniao/diego-matos#/opiniao';
+          const surveyMsg = 'Ola, ' + dischargeFirstName + '! Sua opiniao e muito importante para nos.\n\nPoderia dedicar 2 minutinhos para avaliar seu atendimento no Instituto Holiz?\n\n' + doctoraliaUrl + '\n\nSeu feedback nos ajuda a continuar melhorando. Agradecemos de coracao!';
+
+          // Verificar se pos_consulta ja foi enviado para esse telefone nas ultimas 24h
+          const hasSentRecently = db.prepare(
+            "SELECT 1 FROM pos_consulta_log WHERE phone = ? AND sent_at > datetime('now', '-24 hours')"
+          ).get(discharge.phone);
+
+          if (hasSentRecently) {
+            // Janela 24h ja aberta pelo pos_consulta anterior → envia texto direto
+            console.log('📨 Janela 24h aberta para ' + discharge.name + ' — enviando pesquisa como texto');
+            await sendMessageFn(discharge.phone, surveyMsg);
+            console.log('✅ Pesquisa de satisfacao enviada para ' + discharge.name + ' (janela pos_consulta)');
+          } else {
+            // Sem janela aberta → envia template pos_consulta primeiro
+            const { sendTemplateMessage } = await import('./whatsapp-cloudapi.js');
+            const tmplOk = await sendTemplateMessage(discharge.phone, 'pos_consulta', [dischargeFirstName]);
+            if (tmplOk) {
+              console.log('✅ Template pos_consulta enviado para ' + discharge.name + ' (alta)');
+              // Registrar envio para anti-duplicata
+              db.prepare(
+                "INSERT INTO pos_consulta_log (phone, sent_at) VALUES (?, datetime('now','localtime'))"
+              ).run(discharge.phone);
+              // Aguardar 3 minutos e enviar pesquisa como texto
+              setTimeout(async () => {
+                try {
+                  await sendMessageFn(discharge.phone, surveyMsg);
+                  console.log('✅ Pesquisa de satisfacao enviada para ' + discharge.name + ' (pos-alta)');
+                } catch (e) {
+                  console.warn('⚠️ Erro ao enviar pesquisa para ' + discharge.name + ':', e.message);
+                }
+              }, 3 * 60 * 1000);
+            } else {
+              // Template falhou → tenta texto direto como fallback
+              console.warn('⚠️ Template pos_consulta falhou, tentando texto direto...');
+              await sendMessageFn(discharge.phone, surveyMsg);
+            }
+          }
+          await logClaudiaActivity('satisfaction_survey', {
+            patientName: discharge.name,
+            phone: discharge.phone,
+            details: { trigger: 'discharge' }
+          });
+        } catch (e) {
+          console.warn('⚠️ Erro ao enviar pesquisa de satisfacao para ' + discharge.name + ':', e.message);
+        }
+
+        console.log(`\u2705 Follow-ups agendados para ${discharge.name} (alta: ${discharge.dischargeDate})`);
       } catch (err) {
         console.error(`❌ Erro ao processar alta de ${discharge.name}:`, err.message);
       }
@@ -543,7 +768,7 @@ async function checkNoShows() {
         const nsFirstName = ns.patientName.split(' ')[0];
         const [ny, nm, nd] = ns.date.split('-');
         const nsDateBR = `${nd}/${nm}/${ny}`;
-        await smartSend(ns.patientPhone, message, 'falta_reagendamento', [nsFirstName, nsDateBR, ns.time, ns.professionalName]);
+        await smartSend(ns.patientPhone, message, 'falta_reagendamento_a', [nsFirstName, nsDateBR, ns.time, ns.professionalName]);
 
         // Marcar como processado
         db.prepare(
@@ -700,6 +925,11 @@ async function sendPostConsultationMessages() {
         const [py, pm, pd] = (apt.date || yesterdayStr).split('-');
         const postDateBR = pd + '/' + pm + '/' + py;
         await smartSend(apt.patientPhone, message, 'pos_consulta', [postFirstName]);
+
+        // Registrar envio do pos_consulta (usado pela alta para saber se janela 24h esta aberta)
+        db.prepare(
+          "INSERT INTO pos_consulta_log (phone, sent_at) VALUES (?, datetime('now','localtime'))"
+        ).run(apt.patientPhone);
 
         // Marcar como processado
         db.prepare(
@@ -896,7 +1126,56 @@ async function sendWeeklyReport() {
 
     const message = weeklyReportMessage(result.data);
 
-    await sendMessageFn(DIEGO_PHONE, message);
+    // Datas formatadas (DD/MM) — usadas tanto no template antigo (2 vars)
+    // quanto na primeira variável do template _dados (período).
+    const startDD = startStr.slice(8,10) + '/' + startStr.slice(5,7);
+    const endDD = endStr.slice(8,10) + '/' + endStr.slice(5,7);
+
+    // ── Tentativa 1: relatorio_semanal_dados (template único com 10 variáveis)
+    // Estrutura aprovada pelo Meta:
+    //   {{1}} período "DD/MM a DD/MM"
+    //   {{2}} realizados | {{3}} faltas | {{4}} % faltas | {{5}} cancelamentos
+    //   {{6}} novos agendamentos | {{7}} novos pacientes | {{8}} altas
+    //   {{9}} receita formatada | {{10}} consultas próxima semana
+    const { sendTemplateMessage } = await import('./whatsapp-cloudapi.js');
+    const d = result.data;
+    const completed = d.completedAppointments ?? 0;
+    const noShows = d.noShows ?? 0;
+    const noShowRate = (completed + noShows) > 0
+      ? ((noShows / (completed + noShows)) * 100).toFixed(1)
+      : '0.0';
+    const revenueStr = (d.revenue ?? 0).toFixed(2).replace('.', ',');
+
+    const dadosVars = [
+      `${startDD} a ${endDD}`,           // {{1}}
+      String(completed),                 // {{2}}
+      String(noShows),                   // {{3}}
+      noShowRate,                        // {{4}}
+      String(d.cancelled ?? 0),          // {{5}}
+      String(d.newAppointments ?? 0),    // {{6}}
+      String(d.newPatients ?? 0),        // {{7}}
+      String(d.discharges ?? 0),         // {{8}}
+      revenueStr,                        // {{9}}
+      String(d.nextWeekAppointments ?? 0) // {{10}}
+    ];
+
+    const dadosOk = await sendTemplateMessage(DIEGO_PHONE, 'relatorio_semanal_dados', dadosVars);
+
+    if (dadosOk) {
+      console.log('✅ Relatório enviado via template _dados (única mensagem)');
+    } else {
+      // ── Fallback: fluxo antigo (template anúncio + texto separado) ──
+      console.warn('⚠️ Template _dados falhou, caindo no fluxo antigo (anúncio + texto)...');
+      const templateOk = await sendTemplateMessage(DIEGO_PHONE, 'relatorio_semanal', [startDD, endDD]);
+      if (templateOk) {
+        await new Promise(r => setTimeout(r, 2000));
+        await sendMessageFn(DIEGO_PHONE, message);
+      } else {
+        // Fallback final: texto direto (só funciona dentro da janela de 24h)
+        console.warn('⚠️ Template anúncio também falhou, tentando texto direto...');
+        await sendMessageFn(DIEGO_PHONE, message);
+      }
+    }
 
     await logClaudiaActivity('weekly_report', {
       phone: DIEGO_PHONE,
@@ -1094,6 +1373,26 @@ async function sendSameDayReminders() {
         if (!apt.patientPhone) {
           console.warn(`⚠️ Paciente ${apt.patientName} sem telefone, lembrete do dia não enviado`);
           continue;
+        }
+
+        // ⏸️ Pular lembrete_dia se há reagendamento pendente no Kanban para este apt
+        // (paciente clicou "Reagendar" mas ainda não confirmou nova data/hora)
+        try {
+          const fuResult = await getFollowUpsByPhone(apt.patientPhone);
+          const fuArr = Array.isArray(fuResult?.data) ? fuResult.data : [];
+          const hasPendingReschedule = fuArr.some(f =>
+            f.source === 'reagendar_pendente' &&
+            f.status !== 'agendou' &&
+            f.status !== 'perdido' &&
+            typeof f.notes === 'string' &&
+            f.notes.includes(`[apt_id:${apt.id}]`)
+          );
+          if (hasPendingReschedule) {
+            console.log(`⏸️ Lembrete_dia pulado — reagendamento pendente para ${apt.patientName} (apt ${apt.id})`);
+            continue;
+          }
+        } catch (err) {
+          console.warn(`⚠️ Erro ao verificar reagendamento pendente para ${apt.patientName}:`, err.message);
         }
 
         const message = sameDayReminder(
