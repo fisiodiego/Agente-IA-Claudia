@@ -1,5 +1,5 @@
 import cron from 'node-cron';
-import { getPendingFollowups, markFollowupSent, getPatientByPhone, confirmDischarge } from './patientManager.js';
+import { getPendingFollowups, markFollowupSent, getPatientByPhone, confirmDischarge, saveMessage } from './patientManager.js';
 import { followupTemplates, followupDescriptions, appointmentReminder24h, getGreeting, packageReminderLevel1, packageReminderLevel2, packageReminderLevel3, noShowRescheduling, waitlistNotification, postConsultationCheckIn, birthdayMessage, reactivationMessage, weeklyReportMessage, packageCompletedMessage, referralMessage, sameDayReminder } from './messageTemplates.js';
 import { getUpcomingAppointments, getRecentDischarges, getStalePackages, getRecentNoShows, getWaitlistMatches, removeFromWaitlist, getCompletedAppointments, getBirthdays, getInactivePatients, getWeeklyReport, getCompletedPackages, logClaudiaActivity, getFollowUpsByPhone } from './crmApi.js';
 import db from './database.js';
@@ -136,30 +136,59 @@ async function smartSend(phone, text, templateName, templateParams = []) {
   // Estrategia: TEMPLATE-FIRST para mensagens proativas
   // Motivo: Cloud API retorna 200 OK para texto mesmo fora da janela 24h,
   // mas o erro 131047 so chega async via webhook — nunca cai no catch.
-  
+
+  let sentOk = false;
+  let sentVia = null; // 'template' ou 'texto'
+
   if (sendTemplateFn && templateName) {
     try {
       console.log(`📋 Enviando template ${templateName} para ${phone}...`);
       const ok = await sendTemplateFn(phone, templateName, templateParams);
       if (ok) {
         console.log(`✅ Template ${templateName} enviado com sucesso para ${phone}`);
-        return true;
+        sentOk = true;
+        sentVia = 'template';
+      } else {
+        console.warn(`⚠️ Template ${templateName} retornou falso para ${phone}, tentando texto...`);
       }
-      console.warn(`⚠️ Template ${templateName} retornou falso para ${phone}, tentando texto...`);
     } catch (err) {
       console.warn(`⚠️ Template ${templateName} falhou para ${phone}: ${err.message}. Tentando texto...`);
     }
   }
 
   // Fallback: texto normal (funciona se paciente mandou msg nas ultimas 24h)
-  try {
-    await sendMessageFn(phone, text);
-    console.log(`📝 Texto enviado para ${phone} (fallback)`);
-    return true;
-  } catch (err) {
-    console.error(`❌ Falha total ao enviar para ${phone}: ${err.message}`);
-    return false;
+  if (!sentOk) {
+    try {
+      await sendMessageFn(phone, text);
+      console.log(`📝 Texto enviado para ${phone} (fallback)`);
+      sentOk = true;
+      sentVia = 'texto';
+    } catch (err) {
+      console.error(`❌ Falha total ao enviar para ${phone}: ${err.message}`);
+      return false;
+    }
   }
+
+  // Persistir em conversations para preservar contexto da Claudia.
+  // Caso real (Priscila, 30/abr/2026): cron envia template lembrete_pacote,
+  // paciente responde "Oi!" 50min depois e Claudia se reapresenta porque
+  // o template não estava no histórico de conversas. Agora qualquer envio
+  // proativo do scheduler fica registrado, e o LLM monta resposta com contexto.
+  // Falha silenciosa: se não conseguir salvar (paciente não existe no banco
+  // local, telefone inválido, etc.), apenas loga e continua — envio já ocorreu.
+  if (sentOk && text) {
+    try {
+      const localPatient = getPatientByPhone(phone);
+      if (localPatient?.id) {
+        saveMessage(localPatient.id, 'assistant', text);
+        console.log(`💾 Mensagem (via ${sentVia}) salva em conversations para paciente #${localPatient.id}`);
+      }
+    } catch (err) {
+      console.warn(`⚠️ Falha ao salvar conversation (não-bloqueante): ${err.message}`);
+    }
+  }
+
+  return true;
 }
 
 
