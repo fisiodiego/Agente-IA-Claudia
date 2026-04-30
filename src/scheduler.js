@@ -653,20 +653,29 @@ async function checkStalePackages() {
       try {
         const days = pkg.daysSinceLastActivity;
 
-        // Determinar nível de urgência
+        // Determinar nível de urgência.
+        // Limites diferentes para pacote intensivo vs manutenção:
+        // - Intensivo (1x/semana esperado): 7/14/21 dias
+        // - Manutenção (1x/mês esperado): 30/45/60 dias
+        // Detecção pelo nome do produto (mesma regra do deadline em integration.ts).
+        const isManutencao = /manuten[çc][ãa]o/i.test(pkg.productName || '');
+        const T1 = isManutencao ? 30 : 7;
+        const T2 = isManutencao ? 45 : 14;
+        const T3 = isManutencao ? 60 : 21;
+
         let level = 0;
         const deadlineDate = new Date(pkg.deadlineDate + 'T23:59:59');
         const now = new Date();
         const daysToDeadline = Math.floor((deadlineDate.getTime() - now.getTime()) / (1000 * 60 * 60 * 24));
 
-        if (days >= 21 || daysToDeadline <= 14) {
+        if (days >= T3 || daysToDeadline <= 14) {
           level = 3;
-        } else if (days >= 14) {
+        } else if (days >= T2) {
           level = 2;
-        } else if (days >= 7) {
+        } else if (days >= T1) {
           level = 1;
         } else {
-          continue; // Menos de 7 dias, ainda cedo
+          continue; // Ainda dentro do ritmo esperado do pacote
         }
 
         // Verificar se já enviou este nível
