@@ -2,10 +2,17 @@
 // Todas as mensagens enviadas pelo agente de forma automática
 
 /**
- * Gera saudação baseada no horário atual
+ * Gera saudação baseada no horário ATUAL EM BRT (UTC-3).
+ *
+ * IMPORTANTE: o VPS roda em UTC. `new Date().getHours()` retornava hora
+ * UTC, fazendo a saudação ficar 3h adiantada — caso Luise Pierote em
+ * 01/05/2026 às 11h BRT (14h UTC) recebeu "Boa tarde" sendo ainda manhã.
+ *
+ * Fix: subtrai 3h (offset BRT) antes de classificar manhã/tarde/noite.
  */
 export function getGreeting() {
-  const hour = new Date().getHours();
+  const nowBRT = new Date(Date.now() - 3 * 60 * 60 * 1000);
+  const hour = nowBRT.getUTCHours();
   if (hour >= 5 && hour < 12)  return 'Bom dia';
   if (hour >= 12 && hour < 18) return 'Boa tarde';
   return 'Boa noite';
