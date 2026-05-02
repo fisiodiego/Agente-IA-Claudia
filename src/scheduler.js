@@ -880,8 +880,26 @@ async function checkWaitlistVacancies() {
           continue; // Sem vagas
         }
 
-        // Tem vagas! Notificar o primeiro da fila
+        // Filtrar slots pelo preferred_period do PRIMEIRO da fila.
+        // Caso Maria pediu manhã, só abriu vaga 14h → não notificar.
+        // Períodos: manha (00:00-11:59), tarde (12:00-17:59), noite (18:00+).
+        // 'qualquer' aceita todos os slots.
         const match = result.data[0];
+        const period = match.preferredPeriod || 'qualquer';
+        const slotsAll = availResult.data.slots;
+        const slotsInPeriod = slotsAll.filter((slot) => {
+          const hour = parseInt(slot.split(':')[0], 10);
+          if (period === 'manha')   return hour < 12;
+          if (period === 'tarde')   return hour >= 12 && hour < 18;
+          if (period === 'noite')   return hour >= 18;
+          return true; // qualquer
+        });
+
+        if (slotsInPeriod.length === 0) {
+          console.log(`⏭️ ${match.patientName}: tem vagas em ${date} mas nenhuma no período '${period}' (queria), pulando.`);
+          continue;
+        }
+
         const profName = availResult.data.professionalName || 'Dr. Diego Matos';
 
         const message = waitlistNotification(match.patientName, date, profName);
