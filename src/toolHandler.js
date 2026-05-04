@@ -111,6 +111,26 @@ export async function handleToolCall(toolName, toolInput, phone = null) {
       }
 
       case 'find_or_create_patient': {
+        // GUARD: ao CRIAR paciente novo, birthDate é OBRIGATÓRIO.
+        // Schema da tool diz "opcional" mas o LLM precisa pedir antes de
+        // criar. Caso Lílian, Luise Pierote, Mauricio (04/05/2026) — várias
+        // pacientes nasceram no banco sem birth_date porque Claudia pulou
+        // o pedido seguindo o schema. Aqui rejeitamos a chamada quando
+        // tenta criar paciente novo sem birthDate, forçando a IA a coletar.
+        //
+        // Se paciente JÁ EXISTE no CRM (encontrado por phone), birthDate
+        // é desnecessário — tool retorna existente e pula validação.
+        const { searchPatientByPhone } = await import('./crmApi.js');
+        const existingResult = await searchPatientByPhone(toolInput.phone);
+        const exists = existingResult?.ok && existingResult?.data?.found;
+
+        if (!exists && !toolInput.birthDate) {
+          return JSON.stringify({
+            error: 'BIRTHDATE_REQUIRED',
+            message: 'Paciente não está cadastrado no CRM. Antes de criar o cadastro, peça a data de nascimento ao paciente (formato DD/MM/AAAA). Só chame find_or_create_patient novamente DEPOIS de obter a data.',
+          });
+        }
+
         const result = await findOrCreatePatient(toolInput);
         if (!result.ok) return JSON.stringify({ error: result.error });
 
