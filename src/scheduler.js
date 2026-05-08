@@ -240,8 +240,11 @@ export function startScheduler() {
   setTimeout(() => checkCrmDischarges(), 15000);
 
   // ── Feature 1: Lembretes de pacote — diário às 14h BRT (17h UTC) ──
+  // Pesquisa de satisfação também sai aqui — 4h depois do pos_consulta (10h)
+  // pra dar respiro entre as duas mensagens ao paciente recém-alta.
   cron.schedule('0 17 * * *', async () => {
     await checkStalePackages();
+    await sendPendingSurveys();
   });
 
   // ── Feature 2: Reagendamento de faltantes — a cada 15 min ──
@@ -277,12 +280,11 @@ export function startScheduler() {
     await sendReactivationMessages();
   });
 
-  // ── Pós-consulta + pesquisa de satisfação: dia seguinte às 10h BRT (13h UTC) ──
-  // pos_consulta sai primeiro pra abrir janela 24h, depois pesquisas pendentes
-  // (alta D-1 → pesquisa em D, mesmo cron, em sequência)
+  // ── Pós-consulta: dia seguinte às 10h BRT (13h UTC) ──
+  // Pesquisa de satisfação foi movida pro cron das 14h BRT (4h depois)
+  // pra dar respiro natural entre as duas mensagens ao paciente.
   cron.schedule('0 13 * * *', async () => {
     await sendPostConsultationMessages();
-    await sendPendingSurveys();
   });
 
   // ── Feature 3: Notificação de vagas (waitlist) — a cada 10 min ──
@@ -574,8 +576,9 @@ async function checkCrmDischarges() {
           'INSERT OR IGNORE INTO processed_discharges (patient_id, discharge_date, processed_at) VALUES (?, ?, ?)'
         ).run(discharge.phone, discharge.dischargeDate, new Date().toISOString());
 
-        // Enfileirar pesquisa de satisfação para envio em D+1 (cron 10h BRT roda sendPendingSurveys)
-        // A janela 24h estará aberta porque pos_consulta sai poucos segundos antes no mesmo cron.
+        // Enfileirar pesquisa de satisfação para envio em D+1 (cron 14h BRT roda sendPendingSurveys).
+        // 4h depois do pos_consulta (10h BRT) pra parecer duas iniciativas distintas.
+        // Template UTILITY entrega independente da janela 24h.
         try {
           const dischargeDay = (discharge.dischargeDate || '').slice(0, 10); // YYYY-MM-DD
           // scheduled_for = dischargeDay + 1 dia (meio-dia UTC pra evitar drift de fuso)
