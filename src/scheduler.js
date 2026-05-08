@@ -277,9 +277,12 @@ export function startScheduler() {
     await sendReactivationMessages();
   });
 
-  // ── Pós-consulta: enviar check-in no dia seguinte às 10h BRT (13h UTC) ──
+  // ── Pós-consulta + pesquisa de satisfação: dia seguinte às 10h BRT (13h UTC) ──
+  // pos_consulta sai primeiro pra abrir janela 24h, depois pesquisas pendentes
+  // (alta D-1 → pesquisa em D, mesmo cron, em sequência)
   cron.schedule('0 13 * * *', async () => {
     await sendPostConsultationMessages();
+    await sendPendingSurveys();
   });
 
   // ── Feature 3: Notificação de vagas (waitlist) — a cada 10 min ──
@@ -557,94 +560,47 @@ async function checkCrmDischarges() {
           continue;
         }
 
-        // Verificar se a alta foi dada HOJE — se sim, adiar pos_consulta para amanha
-        const nowBRT = new Date(Date.now() - 3 * 3600000);
-        const todayBRT = nowBRT.toISOString().slice(0, 10);
-        const dischargeDay = (discharge.dischargeDate || '').slice(0, 10);
-        if (dischargeDay === todayBRT) {
-          console.log('⏳ Alta de ' + discharge.name + ' foi HOJE — pos_consulta sera enviado amanha pelo cron das 10h');
-          // Marcar como processada para nao reprocessar, mas NAO envia pos_consulta agora
-          // O cron sendPostConsultationMessages (10h BRT) enviara amanha
-          db.prepare(
-            'INSERT OR IGNORE INTO processed_discharges (patient_id, discharge_date, processed_at) VALUES (?, ?, ?)'
-          ).run(discharge.phone, discharge.dischargeDate, new Date().toISOString());
-          // Agendar follow-ups (retornos) normalmente — so adia o pos_consulta
-          const claudiaPatientToday = getPatientByPhone(discharge.phone);
-          if (claudiaPatientToday) {
-            confirmDischarge(claudiaPatientToday.id, discharge.dischargeDate.split('T')[0]);
-          }
-          continue;
-        }
-
-        // Buscar paciente na Claudia pelo telefone
+        // Buscar paciente na Claudia (pra agendar retornos no banco local)
         const claudiaPatient = getPatientByPhone(discharge.phone);
 
-        if (!claudiaPatient) {
-          console.log(`⚠️ Paciente ${discharge.name} (${discharge.phone}) não encontrado na Claudia, pulando`);
-          continue;
+        if (claudiaPatient) {
+          confirmDischarge(claudiaPatient.id, discharge.dischargeDate.split('T')[0]);
+        } else {
+          console.log(`⚠️ Paciente ${discharge.name} (${discharge.phone}) não encontrado na Claudia — pesquisa será enviada mesmo assim, retornos automáticos pulados.`);
         }
 
-        // Agendar follow-ups (retornos 1m, 3m, 6m, 12m)
-        confirmDischarge(claudiaPatient.id, discharge.dischargeDate.split('T')[0]);
-
-        // Marcar como processado
+        // Marcar alta como processada (não reprocessa em ciclos seguintes)
         db.prepare(
           'INSERT OR IGNORE INTO processed_discharges (patient_id, discharge_date, processed_at) VALUES (?, ?, ?)'
         ).run(discharge.phone, discharge.dischargeDate, new Date().toISOString());
 
-        // Enviar pesquisa de satisfacao na alta
-        // Se pos_consulta ja foi enviado nas ultimas 24h → envia texto direto (janela aberta)
-        // Se nao → envia template pos_consulta primeiro, espera 3min, depois texto
+        // Enfileirar pesquisa de satisfação para envio em D+1 (cron 10h BRT roda sendPendingSurveys)
+        // A janela 24h estará aberta porque pos_consulta sai poucos segundos antes no mesmo cron.
         try {
-          const dischargeFirstName = discharge.name.split(' ')[0];
-          const doctoraliaUrl = 'https://www.doctoralia.com.br/adicionar-opiniao/diego-matos#/opiniao';
-          const surveyMsg = 'Ola, ' + dischargeFirstName + '! Sua opiniao e muito importante para nos.\n\nPoderia dedicar 2 minutinhos para avaliar seu atendimento no Instituto Holiz?\n\n' + doctoraliaUrl + '\n\nSeu feedback nos ajuda a continuar melhorando. Agradecemos de coracao!';
+          const dischargeDay = (discharge.dischargeDate || '').slice(0, 10); // YYYY-MM-DD
+          // scheduled_for = dischargeDay + 1 dia (meio-dia UTC pra evitar drift de fuso)
+          const dischargeAt = new Date(dischargeDay + 'T12:00:00Z');
+          dischargeAt.setUTCDate(dischargeAt.getUTCDate() + 1);
+          const scheduledFor = dischargeAt.toISOString().slice(0, 10);
 
-          // Verificar se pos_consulta ja foi enviado para esse telefone nas ultimas 24h
-          const hasSentRecently = db.prepare(
-            "SELECT 1 FROM pos_consulta_log WHERE phone = ? AND sent_at > datetime('now', '-24 hours')"
-          ).get(discharge.phone);
+          // Dedupe: não enfileirar a mesma alta duas vezes
+          const existing = db.prepare(
+            "SELECT 1 FROM pending_surveys WHERE phone = ? AND discharge_date = ?"
+          ).get(discharge.phone, dischargeDay);
 
-          if (hasSentRecently) {
-            // Janela 24h ja aberta pelo pos_consulta anterior → envia texto direto
-            console.log('📨 Janela 24h aberta para ' + discharge.name + ' — enviando pesquisa como texto');
-            await sendMessageFn(discharge.phone, surveyMsg);
-            console.log('✅ Pesquisa de satisfacao enviada para ' + discharge.name + ' (janela pos_consulta)');
+          if (!existing) {
+            db.prepare(
+              "INSERT INTO pending_surveys (phone, patient_name, discharge_date, scheduled_for) VALUES (?, ?, ?, ?)"
+            ).run(discharge.phone, discharge.name, dischargeDay, scheduledFor);
+            console.log(`📋 Pesquisa enfileirada para ${discharge.name} — envio em ${scheduledFor}`);
           } else {
-            // Sem janela aberta → envia template pos_consulta primeiro
-            const { sendTemplateMessage } = await import('./whatsapp-cloudapi.js');
-            const tmplOk = await sendTemplateMessage(discharge.phone, 'pos_consulta', [dischargeFirstName]);
-            if (tmplOk) {
-              console.log('✅ Template pos_consulta enviado para ' + discharge.name + ' (alta)');
-              // Registrar envio para anti-duplicata
-              db.prepare(
-                "INSERT INTO pos_consulta_log (phone, sent_at) VALUES (?, datetime('now','localtime'))"
-              ).run(discharge.phone);
-              // Aguardar 3 minutos e enviar pesquisa como texto
-              setTimeout(async () => {
-                try {
-                  await sendMessageFn(discharge.phone, surveyMsg);
-                  console.log('✅ Pesquisa de satisfacao enviada para ' + discharge.name + ' (pos-alta)');
-                } catch (e) {
-                  console.warn('⚠️ Erro ao enviar pesquisa para ' + discharge.name + ':', e.message);
-                }
-              }, 3 * 60 * 1000);
-            } else {
-              // Template falhou → tenta texto direto como fallback
-              console.warn('⚠️ Template pos_consulta falhou, tentando texto direto...');
-              await sendMessageFn(discharge.phone, surveyMsg);
-            }
+            console.log(`↩️ Pesquisa já enfileirada para ${discharge.name} (${dischargeDay}) — skip`);
           }
-          await logClaudiaActivity('satisfaction_survey', {
-            patientName: discharge.name,
-            phone: discharge.phone,
-            details: { trigger: 'discharge' }
-          });
         } catch (e) {
-          console.warn('⚠️ Erro ao enviar pesquisa de satisfacao para ' + discharge.name + ':', e.message);
+          console.warn('⚠️ Erro ao enfileirar pesquisa para ' + discharge.name + ':', e.message);
         }
 
-        console.log(`\u2705 Follow-ups agendados para ${discharge.name} (alta: ${discharge.dischargeDate})`);
+        console.log(`✅ Follow-ups agendados para ${discharge.name} (alta: ${discharge.dischargeDate})`);
       } catch (err) {
         console.error(`❌ Erro ao processar alta de ${discharge.name}:`, err.message);
       }
@@ -929,6 +885,74 @@ async function checkWaitlistVacancies() {
   }
 }
 
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Pesquisa de satisfação: envio enfileirado (1 dia após alta, no cron 10h BRT)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Lê pending_surveys com scheduled_for <= hoje + status='pending' e envia.
+ * Janela 24h já estará aberta porque pos_consulta saiu segundos antes no mesmo cron.
+ * Delay de 30s entre envios evita rate limit / spam pattern.
+ */
+async function sendPendingSurveys() {
+  if (!sendMessageFn) {
+    console.warn('⚠️ sendMessageFn não registrado — pesquisas pendentes não serão enviadas');
+    return;
+  }
+
+  // Hoje em BRT (mesma referência usada nas outras crons)
+  const nowBRT = new Date(Date.now() - 3 * 3600000);
+  const todayBRT = nowBRT.toISOString().slice(0, 10);
+
+  const pendings = db.prepare(
+    "SELECT id, phone, patient_name, discharge_date, scheduled_for, retries FROM pending_surveys " +
+    "WHERE status = 'pending' AND scheduled_for <= ? ORDER BY scheduled_for ASC, id ASC"
+  ).all(todayBRT);
+
+  if (pendings.length === 0) return;
+
+  console.log(`📋 ${pendings.length} pesquisa(s) de satisfação pendente(s) para envio`);
+
+  const doctoraliaUrl = 'https://www.doctoralia.com.br/adicionar-opiniao/diego-matos#/opiniao';
+
+  for (const p of pendings) {
+    try {
+      const firstName = (p.patient_name || '').split(' ')[0] || 'paciente';
+      const surveyMsg =
+        'Olá, ' + firstName + '! Sua opinião é muito importante para nós.\n\n' +
+        'Poderia dedicar 2 minutinhos para avaliar seu atendimento no Instituto Holiz?\n\n' +
+        doctoraliaUrl + '\n\n' +
+        'Seu feedback nos ajuda a continuar melhorando. Agradecemos de coração! 💚';
+
+      // Janela 24h: pos_consulta deveria ter sido enviado segundos antes (mesma cron).
+      // Mesmo assim, smartSend cuida do fallback automático (template se janela fechada).
+      await smartSend(p.phone, surveyMsg, 'pos_consulta', [firstName]);
+
+      db.prepare(
+        "UPDATE pending_surveys SET status = 'sent', sent_at = datetime('now','localtime'), last_error = NULL WHERE id = ?"
+      ).run(p.id);
+
+      await logClaudiaActivity('satisfaction_survey', {
+        patientName: p.patient_name,
+        phone: p.phone,
+        details: { trigger: 'discharge_d1', dischargeDate: p.discharge_date }
+      });
+
+      console.log(`✅ Pesquisa enviada para ${p.patient_name} (alta: ${p.discharge_date})`);
+    } catch (err) {
+      const newRetries = (p.retries || 0) + 1;
+      const newStatus = newRetries >= 3 ? 'failed' : 'pending';
+      db.prepare(
+        "UPDATE pending_surveys SET retries = ?, status = ?, last_error = ? WHERE id = ?"
+      ).run(newRetries, newStatus, String(err.message || err).slice(0, 200), p.id);
+      console.warn(`⚠️ Falha ao enviar pesquisa para ${p.patient_name} (tentativa ${newRetries}/3): ${err.message}`);
+    }
+
+    // 30s de delay entre envios pra evitar pattern de spam
+    if (pendings.length > 1) await sleep(30000);
+  }
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Pós-consulta: check-in no dia seguinte
