@@ -1055,6 +1055,38 @@ export async function processMessage(phone, message, options = {}) {
       }
     }
 
+    // 5b. Botão "Ja avaliei" do template pesquisa_satisfacao_a (QUICK_REPLY)
+    // Detecta antes do LLM pra (a) responder consistente, (b) economizar tokens,
+    // (c) marcar confirmed_review=1 em pending_surveys (métrica de quem clicou).
+    // Aceita "Ja avaliei", "Já avaliei", "ja avaliei!", etc — curto e ancorado.
+    if (/^j[aá]\s*avaliei[\s.,!?]*$/i.test(message.trim())) {
+      try {
+        const db = (await import('./database.js')).default;
+        const suffix8 = phone.replace(/\D/g, '').slice(-8);
+        const surveyRow = db.prepare(
+          "SELECT id FROM pending_surveys " +
+          "WHERE phone LIKE '%' || ? AND status = 'sent' AND confirmed_review = 0 " +
+          "ORDER BY sent_at DESC LIMIT 1"
+        ).get(suffix8);
+
+        if (surveyRow) {
+          db.prepare(
+            "UPDATE pending_surveys SET confirmed_review = 1, confirmed_at = datetime('now','localtime') WHERE id = ?"
+          ).run(surveyRow.id);
+          console.log(`✅ Pesquisa confirmada (Ja avaliei) — pending_surveys.id=${surveyRow.id}`);
+        } else {
+          console.log(`ℹ️ "Ja avaliei" recebido de ${phone} mas sem pending_survey ativa — só responde, não marca`);
+        }
+      } catch (err) {
+        console.warn('⚠️ Erro ao marcar confirmed_review:', err.message);
+      }
+
+      const firstName = (patient.name || '').split(' ')[0] || '';
+      return `Que alegria saber que você dedicou um tempo${firstName ? `, *${firstName}*` : ''}! ` +
+             `Sua avaliação faz toda a diferença para a gente. 💚\n\n` +
+             `Qualquer coisa, é só chamar!`;
+    }
+
     // 3. Buscar histórico de conversa
     const history = getConversationHistory(patient.id);
 

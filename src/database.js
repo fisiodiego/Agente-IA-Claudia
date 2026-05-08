@@ -145,16 +145,18 @@ db.exec(`
 
   -- Pesquisa de satisfação enfileirada (envia 1 dia após alta no cron 10h BRT)
   CREATE TABLE IF NOT EXISTS pending_surveys (
-    id             INTEGER PRIMARY KEY AUTOINCREMENT,
-    phone          TEXT NOT NULL,
-    patient_name   TEXT NOT NULL,
-    discharge_date TEXT NOT NULL,
-    scheduled_for  TEXT NOT NULL,
-    status         TEXT DEFAULT 'pending',
-    retries        INTEGER DEFAULT 0,
-    sent_at        TEXT,
-    last_error     TEXT,
-    created_at     TEXT DEFAULT (datetime('now','localtime'))
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    phone            TEXT NOT NULL,
+    patient_name     TEXT NOT NULL,
+    discharge_date   TEXT NOT NULL,
+    scheduled_for    TEXT NOT NULL,
+    status           TEXT DEFAULT 'pending',
+    retries          INTEGER DEFAULT 0,
+    sent_at          TEXT,
+    last_error       TEXT,
+    confirmed_review INTEGER DEFAULT 0,        -- 1 quando paciente clica "Já avaliei" (botão QUICK_REPLY)
+    confirmed_at     TEXT,                     -- timestamp da confirmação
+    created_at       TEXT DEFAULT (datetime('now','localtime'))
   );
   CREATE INDEX IF NOT EXISTS idx_pending_surveys_scheduled ON pending_surveys(scheduled_for, status);
   CREATE INDEX IF NOT EXISTS idx_pending_surveys_phone     ON pending_surveys(phone);
