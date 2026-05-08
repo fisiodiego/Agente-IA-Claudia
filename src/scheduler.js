@@ -914,20 +914,15 @@ async function sendPendingSurveys() {
 
   console.log(`📋 ${pendings.length} pesquisa(s) de satisfação pendente(s) para envio`);
 
-  const doctoraliaUrl = 'https://www.doctoralia.com.br/adicionar-opiniao/diego-matos#/opiniao';
-
   for (const p of pendings) {
     try {
       const firstName = (p.patient_name || '').split(' ')[0] || 'paciente';
-      const surveyMsg =
-        'Olá, ' + firstName + '! Sua opinião é muito importante para nós.\n\n' +
-        'Poderia dedicar 2 minutinhos para avaliar seu atendimento no Instituto Holiz?\n\n' +
-        doctoraliaUrl + '\n\n' +
-        'Seu feedback nos ajuda a continuar melhorando. Agradecemos de coração! 💚';
 
-      // Janela 24h: pos_consulta deveria ter sido enviado segundos antes (mesma cron).
-      // Mesmo assim, smartSend cuida do fallback automático (template se janela fechada).
-      await smartSend(p.phone, surveyMsg, 'pos_consulta', [firstName]);
+      // Envia template UTILITY pesquisa_satisfacao_a — Header + Body + Footer + botão URL
+      // (Avaliar agora → Doctoralia) + botão QUICK_REPLY (Ja avaliei).
+      // Template UTILITY entrega independente da janela 24h. ID Meta: 1642198767063313.
+      const ok = await sendTemplateFn(p.phone, 'pesquisa_satisfacao_a', [firstName]);
+      if (!ok) throw new Error('sendTemplate retornou false');
 
       db.prepare(
         "UPDATE pending_surveys SET status = 'sent', sent_at = datetime('now','localtime'), last_error = NULL WHERE id = ?"
