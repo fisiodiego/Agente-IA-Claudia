@@ -26,6 +26,16 @@ import { saveLidMapping } from './lidMap.js';
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
+// ── Rate limit por paciente ────────────────────────────────────────────────
+// Protege contra abuso/loop infinito de mensagens consumindo tokens da API.
+// Se paciente passa de RATE_LIMIT_MAX msgs em RATE_LIMIT_WINDOW_MIN, Claudia
+// silencia + notifica Dr. Diego no número pessoal. Reset automático após janela.
+const RATE_LIMIT_MAX = 30;             // máximo de mensagens inbound
+const RATE_LIMIT_WINDOW_MIN = 60;      // janela em minutos
+const OWNER_PHONE = '5571993507884';   // Diego pessoal (notificações de rate limit)
+const ownerNotifiedRecently = new Map(); // phone -> timestamp (evita re-notificar repetidas vezes)
+const rateLimitedPatientNotified = new Map(); // phone -> timestamp (evita reenviar msg fixa)
+
 // Anti-duplicata: evita enviar confirmação duas vezes no mesmo período
 const recentlyConfirmed = new Map(); // patientId -> timestamp
 const CONFIRM_COOLDOWN = 60 * 60 * 1000; // 1 hora
@@ -506,6 +516,57 @@ Quando o paciente perguntar sobre localização ou como chegar, envie essas info
 export async function processMessage(phone, message, options = {}) {
   try {
     const { pushName, isLid, lidJid } = options;
+
+    // ── Rate limit check (antes de qualquer processamento custoso) ──
+    // Conta mensagens inbound do paciente nos últimos RATE_LIMIT_WINDOW_MIN min.
+    // Se passar de RATE_LIMIT_MAX, Claudia silencia e notifica owner.
+    try {
+      const db = (await import('./database.js')).default;
+      const inboundCount = db.prepare(
+        `SELECT COUNT(*) AS c FROM message_log
+         WHERE phone = ? AND direction = 'inbound'
+           AND created_at > datetime('now','localtime','-${RATE_LIMIT_WINDOW_MIN} minutes')`
+      ).get(phone)?.c || 0;
+
+      if (inboundCount > RATE_LIMIT_MAX) {
+        console.warn(`🚨 RATE LIMIT — paciente ${phone}: ${inboundCount} msgs em ${RATE_LIMIT_WINDOW_MIN}min`);
+
+        // Notifica owner uma vez por janela (mantém o tracking dentro do processo)
+        const lastOwnerNotify = ownerNotifiedRecently.get(phone) || 0;
+        const oneHourMs = RATE_LIMIT_WINDOW_MIN * 60 * 1000;
+        if (Date.now() - lastOwnerNotify > oneHourMs) {
+          ownerNotifiedRecently.set(phone, Date.now());
+          try {
+            const { sendMessage } = await import('./whatsapp-cloudapi.js');
+            const patientName = (await import('./patientManager.js')).getPatientByPhone(phone)?.name || 'desconhecido';
+            const alertMsg =
+              `🚨 *Rate limit acionado*\n\n` +
+              `Paciente: ${patientName}\n` +
+              `Telefone: ${phone}\n` +
+              `Mensagens: ${inboundCount} na última hora\n\n` +
+              `A Claudia foi silenciada para esse paciente. Se quiser intervir, responda manualmente pelo WhatsApp Web.`;
+            await sendMessage(OWNER_PHONE, alertMsg);
+            console.log(`📨 Owner notificado sobre rate limit de ${phone}`);
+          } catch (e) {
+            console.warn('⚠️ Falha ao notificar owner:', e.message);
+          }
+        }
+
+        // Avisa o paciente uma vez por janela (mensagem fixa, sem LLM)
+        const lastPatientNotify = rateLimitedPatientNotified.get(phone) || 0;
+        if (Date.now() - lastPatientNotify > oneHourMs) {
+          rateLimitedPatientNotified.set(phone, Date.now());
+          return `Recebemos suas mensagens! 🙏 ` +
+                 `Em breve nossa equipe entra em contato pra te atender melhor.`;
+        }
+
+        // Já avisou — silêncio total
+        return null;
+      }
+    } catch (err) {
+      console.warn('⚠️ Erro no rate limit check:', err.message);
+      // Falha no check não bloqueia fluxo normal
+    }
 
     // 1. Buscar ou criar paciente
     let patient = getPatientByPhone(phone);
