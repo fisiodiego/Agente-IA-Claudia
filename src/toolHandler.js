@@ -162,26 +162,40 @@ export async function handleToolCall(toolName, toolInput, phone = null) {
           }
         }
 
-        // ⚠️ GUARD: paciente já tem agendamento futuro com o mesmo profissional?
-        // Se sim, bloqueia o create e força reschedule_appointment.
-        // Caso real (Caio Santos, 08/05/2026): Claudia agendou 14h, depois Carla
-        // pediu pra mudar, e Claudia chamou create_appointment de novo (13h) em vez
-        // de reschedule_appointment — ficaram 2 agendamentos paralelos no mesmo dia.
-        if (phone && toolInput.patientId && toolInput.professionalId && toolInput.date) {
+        // ⚠️ GUARD: bloqueia create_appointment se paciente já tem agendamento
+        // ativo na MESMA DATA com o mesmo profissional. Permite consultas em
+        // datas diferentes (avaliação + retorno, sequência de pacote).
+        //
+        // Caso real (Caio Santos, 08/05/2026): Claudia agendou 14h, paciente
+        // pediu mudar pra 13h, LLM chamou create_appointment de novo em vez
+        // de reschedule_appointment → 2 agendamentos paralelos no mesmo dia.
+        //
+        // Bypass via toolInput.forceCreate=true: usado quando paciente confirma
+        // explicitamente que quer outra consulta no mesmo dia (raro: pacote
+        // intensivo, 2 consultas seguidas, etc.).
+        if (
+          !toolInput.forceCreate &&
+          phone &&
+          toolInput.patientId &&
+          toolInput.professionalId &&
+          toolInput.date
+        ) {
           try {
             const aptsResult = await getPatientAppointments(phone);
             if (aptsResult?.ok && Array.isArray(aptsResult.data)) {
-              const todayBRT = new Date(Date.now() - 3 * 3600000).toISOString().slice(0, 10);
               const conflict = aptsResult.data.find((a) =>
                 a.professionalId === toolInput.professionalId &&
-                (a.status === 'agendado' || a.status === 'confirmado') &&
-                a.date >= todayBRT
+                a.date === toolInput.date &&
+                (a.status === 'agendado' || a.status === 'confirmado')
               );
               if (conflict) {
                 console.warn(`⚠️ EXISTING_APPOINTMENT bloqueado — paciente ${phone} já tem ${conflict.id} em ${conflict.date} ${conflict.time}`);
                 return JSON.stringify({
                   error: 'EXISTING_APPOINTMENT',
-                  message: `Esse paciente já tem agendamento ativo em ${conflict.date} às ${conflict.time} (id: ${conflict.id}). NÃO crie um novo — use reschedule_appointment passando appointmentId="${conflict.id}", newDate="${toolInput.date}" e newTime="${toolInput.time}" para mover o agendamento existente. Se o paciente quer DUAS consultas distintas, peça confirmação explícita antes de tentar novamente.`,
+                  message: `Esse paciente já tem agendamento ativo em ${conflict.date} às ${conflict.time} (id: ${conflict.id}).\n\n` +
+                    `Se o paciente quer MUDAR DE HORÁRIO: use reschedule_appointment com appointmentId="${conflict.id}", newDate="${toolInput.date}", newTime="${toolInput.time}".\n\n` +
+                    `Se o paciente confirmou EXPLICITAMENTE que quer DUAS consultas no MESMO DIA (caso raro — pacote intensivo, sessões seguidas): chame create_appointment novamente passando forceCreate=true.\n\n` +
+                    `Se você não tem certeza qual cenário é: PERGUNTE ao paciente antes de tentar de novo.`,
                   existingAppointment: {
                     id: conflict.id,
                     date: conflict.date,
@@ -195,6 +209,9 @@ export async function handleToolCall(toolName, toolInput, phone = null) {
             // Falha no guard não bloqueia o fluxo principal — só loga
             console.warn('⚠️ Falha no guard EXISTING_APPOINTMENT:', e.message);
           }
+        }
+        if (toolInput.forceCreate) {
+          console.log(`🟡 forceCreate=true — bypass do guard EXISTING_APPOINTMENT pra ${phone}`);
         }
 
         // Validar mínimo 12h de antecedência

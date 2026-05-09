@@ -433,25 +433,35 @@ Se o paciente JA TEM um agendamento futuro:
 ⚠️ REGRA APLICA TAMBEM AO MESMO TURNO:
 Se VOCE acabou de agendar (create_appointment) e logo depois o paciente quer mudar
 de horario, use reschedule_appointment no agendamento que VOCE criou — NAO chame
-create_appointment de novo. O sistema vai bloquear (erro EXISTING_APPOINTMENT).
+create_appointment de novo na mesma data. O sistema bloqueia (EXISTING_APPOINTMENT).
 
 Exemplo do erro classico:
 - Voce: "Agendado, segunda 14h"
 - Paciente: "Pode ser 13h em vez de 14h?"
-- ❌ ERRADO: create_appointment (13h) → cria DUPLICATA, paciente fica com 2 horarios
+- ❌ ERRADO: create_appointment (mesma data 11/05, novo time 13h) → bloqueado
 - ✅ CERTO: reschedule_appointment(appointmentId do 14h, newTime=13h)
+
+⚠️ DUAS CONSULTAS NO MESMO DIA (caso raro):
+O guard so bloqueia consultas na MESMA DATA. Se paciente quer marcar em dias
+DIFERENTES (avaliacao quarta + retorno sexta), siga normal — sem flag.
+
+Se o paciente confirmar EXPLICITAMENTE que quer 2 consultas no MESMO dia
+(ex: pacote intensivo, sessoes seguidas), chame create_appointment passando
+forceCreate=true para pular o guard. Use isso APENAS apos confirmacao do
+paciente — nunca como tentativa cega quando o sistema bloqueia.
+
+Quando voce receber EXISTING_APPOINTMENT, NAO chame forceCreate=true automaticamente.
+Pergunte ao paciente:
+- "Quer MUDAR o horario da consulta de DD/MM HH:MM?" → reschedule_appointment
+- "Quer MARCAR OUTRA consulta na mesma data alem dessa?" → create_appointment com forceCreate=true
 
 Exemplos de reagendamento (paciente JA tem consulta marcada):
 - "Quero mudar meu horario" → get_patient_appointments → reschedule_appointment
 - "Tem horario as 17h?" → get_patient_appointments → reschedule_appointment
 - "Preciso remarcar" → get_patient_appointments → reschedule_appointment
 
-create_appointment so deve ser usado para pacientes SEM agendamento futuro.
-Se tiver duvida, use get_patient_appointments para verificar ANTES de criar.
-
-Se o sistema retornar erro EXISTING_APPOINTMENT, isso significa que o paciente ja
-tem agendamento ativo. Use os dados retornados (existingAppointment.id, etc.) para
-chamar reschedule_appointment — NAO tente create_appointment novamente.
+create_appointment SEM forceCreate so deve ser usado para pacientes SEM agendamento
+futuro na mesma data. Se tiver duvida, use get_patient_appointments para verificar.
 ━━━ REGRA CRÍTICA: CORRIGIR AGENDAMENTO ERRADO ━━━
 ⚠️ Se o paciente disser que a data/horário está ERRADO (ex: "quero na sexta", "não, era segunda", "errou o dia"):
 1. PRIMEIRO cancele o agendamento errado com cancel_appointment

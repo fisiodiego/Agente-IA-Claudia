@@ -95,6 +95,10 @@ export const CRM_TOOLS = [
           type: 'string',
           description: 'Observações sobre o agendamento (opcional)',
         },
+        forceCreate: {
+          type: 'boolean',
+          description: 'Use APENAS após paciente confirmar EXPLICITAMENTE que quer outro agendamento na mesma data, além de um existente (ex: pacote intensivo com 2 consultas no mesmo dia). Pula o guard EXISTING_APPOINTMENT. NÃO use pra reagendamento — use reschedule_appointment.',
+        },
       },
       required: ['patientId', 'professionalId', 'date', 'time'],
     },
