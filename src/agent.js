@@ -430,6 +430,17 @@ Se o paciente JA TEM um agendamento futuro:
 2. reschedule_appointment atualiza data/hora automaticamente sem criar duplicata
 3. NUNCA use create_appointment se o paciente ja tem consulta agendada — use reschedule_appointment
 
+⚠️ REGRA APLICA TAMBEM AO MESMO TURNO:
+Se VOCE acabou de agendar (create_appointment) e logo depois o paciente quer mudar
+de horario, use reschedule_appointment no agendamento que VOCE criou — NAO chame
+create_appointment de novo. O sistema vai bloquear (erro EXISTING_APPOINTMENT).
+
+Exemplo do erro classico:
+- Voce: "Agendado, segunda 14h"
+- Paciente: "Pode ser 13h em vez de 14h?"
+- ❌ ERRADO: create_appointment (13h) → cria DUPLICATA, paciente fica com 2 horarios
+- ✅ CERTO: reschedule_appointment(appointmentId do 14h, newTime=13h)
+
 Exemplos de reagendamento (paciente JA tem consulta marcada):
 - "Quero mudar meu horario" → get_patient_appointments → reschedule_appointment
 - "Tem horario as 17h?" → get_patient_appointments → reschedule_appointment
@@ -437,6 +448,10 @@ Exemplos de reagendamento (paciente JA tem consulta marcada):
 
 create_appointment so deve ser usado para pacientes SEM agendamento futuro.
 Se tiver duvida, use get_patient_appointments para verificar ANTES de criar.
+
+Se o sistema retornar erro EXISTING_APPOINTMENT, isso significa que o paciente ja
+tem agendamento ativo. Use os dados retornados (existingAppointment.id, etc.) para
+chamar reschedule_appointment — NAO tente create_appointment novamente.
 ━━━ REGRA CRÍTICA: CORRIGIR AGENDAMENTO ERRADO ━━━
 ⚠️ Se o paciente disser que a data/horário está ERRADO (ex: "quero na sexta", "não, era segunda", "errou o dia"):
 1. PRIMEIRO cancele o agendamento errado com cancel_appointment

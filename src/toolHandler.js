@@ -162,6 +162,41 @@ export async function handleToolCall(toolName, toolInput, phone = null) {
           }
         }
 
+        // ⚠️ GUARD: paciente já tem agendamento futuro com o mesmo profissional?
+        // Se sim, bloqueia o create e força reschedule_appointment.
+        // Caso real (Caio Santos, 08/05/2026): Claudia agendou 14h, depois Carla
+        // pediu pra mudar, e Claudia chamou create_appointment de novo (13h) em vez
+        // de reschedule_appointment — ficaram 2 agendamentos paralelos no mesmo dia.
+        if (phone && toolInput.patientId && toolInput.professionalId && toolInput.date) {
+          try {
+            const aptsResult = await getPatientAppointments(phone);
+            if (aptsResult?.ok && Array.isArray(aptsResult.data)) {
+              const todayBRT = new Date(Date.now() - 3 * 3600000).toISOString().slice(0, 10);
+              const conflict = aptsResult.data.find((a) =>
+                a.professionalId === toolInput.professionalId &&
+                (a.status === 'agendado' || a.status === 'confirmado') &&
+                a.date >= todayBRT
+              );
+              if (conflict) {
+                console.warn(`⚠️ EXISTING_APPOINTMENT bloqueado — paciente ${phone} já tem ${conflict.id} em ${conflict.date} ${conflict.time}`);
+                return JSON.stringify({
+                  error: 'EXISTING_APPOINTMENT',
+                  message: `Esse paciente já tem agendamento ativo em ${conflict.date} às ${conflict.time} (id: ${conflict.id}). NÃO crie um novo — use reschedule_appointment passando appointmentId="${conflict.id}", newDate="${toolInput.date}" e newTime="${toolInput.time}" para mover o agendamento existente. Se o paciente quer DUAS consultas distintas, peça confirmação explícita antes de tentar novamente.`,
+                  existingAppointment: {
+                    id: conflict.id,
+                    date: conflict.date,
+                    time: conflict.time,
+                    status: conflict.status,
+                  },
+                });
+              }
+            }
+          } catch (e) {
+            // Falha no guard não bloqueia o fluxo principal — só loga
+            console.warn('⚠️ Falha no guard EXISTING_APPOINTMENT:', e.message);
+          }
+        }
+
         // Validar mínimo 12h de antecedência
         const aptDate = new Date(`${toolInput.date}T${toolInput.time}:00`);
         const nowBRT2 = new Date(Date.now() - 3 * 3600000);
