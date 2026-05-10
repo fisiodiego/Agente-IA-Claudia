@@ -586,18 +586,29 @@ async function checkCrmDischarges() {
           dischargeAt.setUTCDate(dischargeAt.getUTCDate() + 1);
           const scheduledFor = dischargeAt.toISOString().slice(0, 10);
 
-          // Dedupe: não enfileirar a mesma alta duas vezes
+          // Dedupe 1: não enfileirar a mesma alta duas vezes
           const existing = db.prepare(
             "SELECT 1 FROM pending_surveys WHERE phone = ? AND discharge_date = ?"
           ).get(discharge.phone, dischargeDay);
 
-          if (!existing) {
+          // Cooldown: paciente que já recebeu pesquisa nos últimos 6 meses não recebe de novo.
+          // Cobre caso "paciente teve alta, voltou pra novo ciclo, recebeu alta de novo" — evita
+          // pesquisa redundante. Após 6 meses, vale pedir feedback do novo ciclo.
+          const recentSurvey = db.prepare(
+            "SELECT sent_at FROM pending_surveys " +
+            "WHERE phone = ? AND status = 'sent' AND sent_at > datetime('now','localtime','-6 months') " +
+            "ORDER BY sent_at DESC LIMIT 1"
+          ).get(discharge.phone);
+
+          if (existing) {
+            console.log(`↩️ Pesquisa já enfileirada para ${discharge.name} (${dischargeDay}) — skip`);
+          } else if (recentSurvey) {
+            console.log(`↩️ Pesquisa pulada para ${discharge.name} — já recebeu em ${recentSurvey.sent_at} (cooldown 6 meses)`);
+          } else {
             db.prepare(
               "INSERT INTO pending_surveys (phone, patient_name, discharge_date, scheduled_for) VALUES (?, ?, ?, ?)"
             ).run(discharge.phone, discharge.name, dischargeDay, scheduledFor);
             console.log(`📋 Pesquisa enfileirada para ${discharge.name} — envio em ${scheduledFor}`);
-          } else {
-            console.log(`↩️ Pesquisa já enfileirada para ${discharge.name} (${dischargeDay}) — skip`);
           }
         } catch (e) {
           console.warn('⚠️ Erro ao enfileirar pesquisa para ' + discharge.name + ':', e.message);
