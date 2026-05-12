@@ -20,6 +20,13 @@ import {
 const lastAvailabilityCheck = new Map(); // phone -> { professionalId, date, ts }
 const AVAILABILITY_TTL_MS = 5 * 60 * 1000; // 5 min
 
+// ─── Rastreamento de create_appointment bem-sucedidos por paciente (phone) ──
+// Usado para avisar o LLM quando ele chama check_availability na mesma data
+// logo após criar um agendamento — evita interpretar o próprio slot como "ocupado
+// por outro paciente". Casos Lidia/Carol (12/mai) e Dimitri/Anna (12/mai).
+const recentCreates = new Map(); // phone -> [{ professionalId, date, time, ts }, ...]
+const RECENT_CREATE_TTL_MS = 10 * 60 * 1000; // 10 min
+
 /**
  * Executa uma tool e retorna o resultado formatado para tool_result.
  */
@@ -64,6 +71,17 @@ export async function handleToolCall(toolName, toolInput, phone = null) {
 
         const { professionalName, dayOfWeek, slots, holidayName } = result.data;
 
+        // ⚠️ Detectar se essa data já teve create_appointment recente (< 10 min).
+        // Se sim, o LLM pode interpretar o slot ocupado como conflito externo
+        // quando na verdade foi ele mesmo que criou. Avisar explicitamente.
+        const ownCreates = phone
+          ? (recentCreates.get(phone) || []).filter(
+              c => c.professionalId === professionalId
+                && c.date === date
+                && (Date.now() - c.ts) < RECENT_CREATE_TTL_MS
+            )
+          : [];
+
         // Feriado: clínica fechada, retornar mensagem específica.
         // Backend já zera os slots quando é feriado ativo na tabela holidays.
         if (holidayName) {
@@ -101,13 +119,26 @@ export async function handleToolCall(toolName, toolInput, phone = null) {
           });
         }
 
-        return JSON.stringify({
+        const response = {
           message: `Horários disponíveis para ${professionalName} em ${formatDateBR(date)} (${dayOfWeek}):`,
           professionalName,
           date,
           dayOfWeek,
           slots: filteredSlots,
-        });
+        };
+
+        // Se houver creates recentes nessa data, anexar aviso explícito.
+        if (ownCreates.length > 0) {
+          const horarios = ownCreates.map(c => c.time).join(', ');
+          response.warning =
+            `⚠️ ATENÇÃO: você acabou de criar agendamento(s) nesta data nos horários: ${horarios}. ` +
+            `Esses slots NÃO aparecem na lista 'slots' acima (estão ocupados) porque VOCÊ MESMA os criou. ` +
+            `NÃO interprete como conflito ou indisponibilidade. NÃO volte atrás dizendo "não está disponível" ` +
+            `os horários que você acabou de agendar. Se o paciente confirmou, a marcação é FINAL.`;
+          response.ownRecentCreates = ownCreates.map(c => ({ time: c.time, createdAgo: `${Math.round((Date.now() - c.ts)/1000)}s` }));
+        }
+
+        return JSON.stringify(response);
       }
 
       case 'find_or_create_patient': {
@@ -230,8 +261,24 @@ export async function handleToolCall(toolName, toolInput, phone = null) {
         }
 
         const apt = result.data;
+
+        // Registrar create bem-sucedido em recentCreates pra evitar confusão se LLM
+        // chamar check_availability na mesma data logo depois.
+        if (phone) {
+          const arr = recentCreates.get(phone) || [];
+          arr.push({
+            professionalId: toolInput.professionalId,
+            date: apt.date,
+            time: apt.time,
+            ts: Date.now(),
+          });
+          // Limpar entradas expiradas pra Map não crescer indefinido
+          const cutoff = Date.now() - RECENT_CREATE_TTL_MS;
+          recentCreates.set(phone, arr.filter(c => c.ts > cutoff));
+        }
+
         const response = {
-          message: `Agendamento criado com sucesso!`,
+          message: `Agendamento criado com sucesso! IMPORTANTE: a marcação é FINAL. NÃO chame check_availability nesta data nos próximos turnos. NÃO volte atrás dizendo "não está disponível".`,
           appointmentId: apt.id,
           date: apt.date,
           time: apt.time,
@@ -242,7 +289,7 @@ export async function handleToolCall(toolName, toolInput, phone = null) {
         // Se foi vinculado a um pacote, incluir info
         if (apt.packageInfo) {
           response.packageInfo = apt.packageInfo;
-          response.message = `Agendamento criado com sucesso! Sessão vinculada ao pacote "${apt.packageInfo.packageName}" (${apt.packageInfo.usedSessions + apt.packageInfo.scheduledAfter}/${apt.packageInfo.totalSessions} usadas/agendadas, restam ${apt.packageInfo.remainingAfter}).`;
+          response.message = `Agendamento criado com sucesso! Sessão vinculada ao pacote "${apt.packageInfo.packageName}" (${apt.packageInfo.usedSessions + apt.packageInfo.scheduledAfter}/${apt.packageInfo.totalSessions} usadas/agendadas, restam ${apt.packageInfo.remainingAfter}). IMPORTANTE: marcação é FINAL.`;
         }
 
         return JSON.stringify(response);
