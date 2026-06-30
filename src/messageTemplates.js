@@ -221,6 +221,20 @@ Deseja reagendar para outro dia? Posso verificar os horários disponíveis pra v
 }
 
 /**
+ * Resposta quando o paciente clica "Cancelar" mas NÃO há agendamento ativo
+ * para cancelar — caso típico de follow-up de retorno/pós-alta (captação).
+ * Aqui "Cancelar" significa "não quero agendar agora", não desmarcar consulta.
+ */
+export function noAppointmentToCancelResponse(patientName) {
+  const name = patientName && patientName !== 'Novo Paciente' ? patientName.split(' ')[0] : '';
+  const greeting = name ? `Tudo bem, *${name}*!` : 'Tudo bem!';
+
+  return `${greeting} 😊 Sem problema.
+
+Quando quiser agendar seu retorno, é só me chamar que verifico os horários disponíveis pra você. Estamos à disposição! 💚`;
+}
+
+/**
  * Mensagem de consentimento LGPD enviada após coletar os dados do paciente.
  */
 export function lgpdConsentMessage(patientName) {
@@ -509,7 +523,7 @@ export function packageCompletedMessage(patientName, productName, totalSessions)
   const greeting = getGreeting();
   return `${greeting}${name ? `, *${name}*` : ''}! 🎉
 
-Parabéns! Você concluiu todas as *${totalSessions} sessões* do seu pacote *${productName}*! 💪🌟
+Parabéns! Você concluiu todas as *${totalSessions} sessões* do seu plano de tratamento *${productName}*! 💪🌟
 
 Esperamos que você esteja se sentindo muito melhor! O tratamento trouxe benefícios importantes para o seu corpo.
 

@@ -13,6 +13,7 @@ import {
   addToWaitlist,
   getFollowUpsByPhone,
   updateFollowUp,
+  createFollowUp,
 } from './crmApi.js';
 
 // ─── Rastreamento de última check_availability por paciente (phone) ─────────
@@ -312,6 +313,63 @@ export async function handleToolCall(toolName, toolInput, phone = null) {
         }
 
         return JSON.stringify(response);
+      }
+
+      case 'request_reschedule': {
+        // Paciente pediu para reagendar mas AINDA NÃO informou o novo horário.
+        // Cancela a consulta atual (LIBERA o slot na agenda) + cria card
+        // "reagendar_pendente" no Kanban. Quando o paciente informar o novo
+        // dia/horário, a Claudia usa create_appointment (consulta nova) e o
+        // auto-update do CRM fecha o card. Caso Jessica (16/jun/2026).
+        const rphone = toolInput.phone || phone;
+        const aptsResult = await getPatientAppointments(rphone);
+        const aptsArr = Array.isArray(aptsResult?.data) ? aptsResult.data : [];
+        const future = aptsArr
+          .filter((a) => a.status !== 'cancelado')
+          .sort((a, b) => new Date(`${a.date}T${a.time || '00:00'}`) - new Date(`${b.date}T${b.time || '00:00'}`));
+        const nextApt = future[0];
+        if (!nextApt) {
+          return JSON.stringify({ message: 'Paciente não tem consulta futura para reagendar. Ofereça agendar uma nova consulta normalmente.' });
+        }
+
+        // 1) Cancela a consulta (libera o horário)
+        const cancelRes = await cancelAppointment(nextApt.id, 'Reagendamento solicitado — aguardando novo horário');
+        if (!cancelRes.ok) {
+          return JSON.stringify({ error: cancelRes.error, message: 'Não consegui liberar o horário atual. Tente novamente.' });
+        }
+        console.log(`🗓️ request_reschedule: consulta ${nextApt.id} (${nextApt.date} ${nextApt.time}) cancelada — slot liberado`);
+
+        // 2) Cria card reagendar_pendente no Kanban (dedupe por apt_id)
+        try {
+          const fuResult = await getFollowUpsByPhone(rphone);
+          const fuArr = Array.isArray(fuResult?.data) ? fuResult.data : [];
+          const already = fuArr.some((f) =>
+            f.source === 'reagendar_pendente' && f.status !== 'agendou' && f.status !== 'perdido' &&
+            typeof f.notes === 'string' && f.notes.includes(`[apt_id:${nextApt.id}]`));
+          if (!already) {
+            const [y, m, d] = String(nextApt.date || '').split('-');
+            const dateBR = y && m && d ? `${d}/${m}` : (nextApt.date || '?');
+            await createFollowUp({
+              id: 'reag-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6),
+              patientId: null,
+              patientName: nextApt.patientName || 'Paciente',
+              phone: rphone,
+              type: 'reagendamento',
+              status: 'respondeu',
+              source: 'reagendar_pendente',
+              notes: `Pediu reagendar consulta de ${dateBR} às ${nextApt.time || '?'} (aguardando novo horário)\n[apt_id:${nextApt.id}]`,
+              createdAt: new Date().toISOString(),
+              updatedAt: new Date().toISOString(),
+            });
+            console.log(`🔄 Card reagendar_pendente criado (apt ${nextApt.id})`);
+          }
+        } catch (err) {
+          console.warn('⚠️ request_reschedule: erro ao criar card:', err.message);
+        }
+
+        return JSON.stringify({
+          message: `Consulta de ${nextApt.date} às ${nextApt.time} liberada e marcada como reagendamento pendente. Agora pergunte ao paciente qual o novo dia e turno desejados. Quando ele informar, use create_appointment (NÃO reschedule_appointment — a consulta anterior já foi cancelada).`,
+        });
       }
 
       case 'reschedule_appointment': {

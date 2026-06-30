@@ -148,6 +148,20 @@ export const CRM_TOOLS = [
     },
   },
   {
+    name: 'request_reschedule',
+    description: 'Use quando o paciente pedir para REAGENDAR/REMARCAR a consulta mas AINDA NÃO informar o novo dia/horário (ex: "preciso remarcar", "vou ter que reagendar pra outra semana", "não vou conseguir ir, quero mudar"). Cancela a consulta atual (LIBERA o horário na agenda) e registra o pedido de reagendamento. DEPOIS de chamar, pergunte ao paciente qual o novo dia e turno. Quando ele informar, use create_appointment para criar a nova consulta. IMPORTANTE: NÃO use esta tool se o paciente JÁ informou o novo dia/horário na mesma mensagem — nesse caso use reschedule_appointment diretamente.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        phone: {
+          type: 'string',
+          description: 'Telefone do paciente (apenas dígitos)',
+        },
+      },
+      required: ['phone'],
+    },
+  },
+  {
     name: 'get_patient_appointments',
     description: 'Lista os agendamentos futuros de um paciente. Use quando o paciente perguntar sobre suas próximas consultas ou quando precisar encontrar um agendamento para cancelar ou reagendar.',
     input_schema: {

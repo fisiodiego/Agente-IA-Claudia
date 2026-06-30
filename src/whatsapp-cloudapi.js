@@ -274,10 +274,34 @@ async function processBuffered(phone) {
   const combinedText = texts.join('\n');
 
   try {
-    const result = await processMessage(phone, combinedText, { pushName });
+    // Timeout de segurança: se processMessage pendurar (ex: fetch ao CRM/Anthropic/
+    // ChakraHQ sem retorno durante instabilidade), Promise.race rejeita em 45s →
+    // cai no catch → o finally LIBERA o lock. Sem isto, um await pendurado deixava
+    // a conversa morta pra sempre (caso Rafael Fonseca, 15/jun/2026: cadastro travou
+    // no nome, lock nunca liberado, paciente no silêncio até reinício manual).
+    const PROCESS_TIMEOUT_MS = 45000;
+    const result = await Promise.race([
+      processMessage(phone, combinedText, { pushName }),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error(`processMessage timeout ${PROCESS_TIMEOUT_MS}ms`)), PROCESS_TIMEOUT_MS),
+      ),
+    ]);
 
     const reply = (result && typeof result === 'object') ? result.reply : result;
     const shouldTakeover = result?.activateHumanTakeover === true;
+
+    // Re-checar takeover ANTES de enviar: o processMessage (LLM) demora, e o Dr.
+    // Diego pode ter assumido a conversa NESSE meio-tempo (o status da msg manual
+    // dele chega durante o processamento). Se assumiu, DESCARTA a resposta gerada
+    // pra não atropelar a conversa dele. Caso Rafael Fonseca (16/jun/2026): Claudia
+    // ofereceu horários de amanhã enquanto o Dr. Diego negociava adiantar pra hoje.
+    // (Não cobre latência extrema de status >tempo de processamento — aí o /pause
+    // manual resolve.) A barreira de ENTRADA (handleIncomingMessage) já filtra o
+    // que chega ANTES do processamento; esta cobre o que ativa DURANTE.
+    if (reply && isHumanActive(phone)) {
+      console.log(`👨‍⚕️ Takeover ativou durante o processamento de ${phone} — resposta da Cláudia DESCARTADA (não atropela o Dr. Diego)`);
+      return; // finally libera o lock
+    }
 
     if (reply) {
       await sendMessage(phone, reply);
@@ -572,21 +596,29 @@ function createWebhookServer() {
                 if (botSentMessageIds.has(status.id)) {
                   // Status da propria msg do bot (ID rastreado) — ignorar silenciosamente
                 } else {
-                  // ID NAO esta no rastreamento do bot — pode ser msg do Dr. Diego
-                  // Grace period curto (5s): cobre caso raro de falha no rastreio de ID do bot
+                  // ID NAO esta no rastreamento do bot — pode ser msg do Dr. Diego.
+                  // Grace period de 30s. Antes era só 5s (exigia (expiry-now)>55000),
+                  // curto demais: quando o canal está lento (instabilidade Meta/ChakraHQ),
+                  // o webhook de status "sent" da PRÓPRIA mensagem do bot chega ANTES do
+                  // [BOT_TRACK] registrar o wamid E mais de 5s após o recentBotSentPhones
+                  // ser setado → falso positivo, a Claudia se auto-pausava 30min (caso
+                  // Pierre Góes, 16/jun/2026). 30s cobre o atraso do status com folga
+                  // (atraso real ~5-15s mesmo com canal lento). Takeover REAL (Diego
+                  // responde manual) segue funcionando: nesse caso o número NÃO está na
+                  // janela de envio recente. recentBotSentPhones tem TTL 60s → grace de
+                  // 30s = exigir que falte >30s pro expiro (setado ha menos de 30s).
+                  const GRACE_MS = 30000;
                   const last8 = recipientPhone.replace(/\D/g, '').slice(-8);
                   let justSentByBot = false;
                   for (const [ph, expiry] of recentBotSentPhones.entries()) {
-                    if (ph.endsWith(last8) && expiry > Date.now() && (expiry - Date.now()) > 55000) {
-                      // recentBotSentPhones armazena Date.now() + 60000
-                      // Se faltam >55s, foi setado ha menos de 5s — grace period curto
+                    if (ph.endsWith(last8) && expiry > Date.now() && (expiry - Date.now()) > (60000 - GRACE_MS)) {
                       justSentByBot = true;
                       break;
                     }
                   }
 
                   if (justSentByBot) {
-                    console.log('[BOT_TRACK] Status ' + status.status + ' para ' + recipientPhone + ' ignorado (grace 5s)');
+                    console.log('[BOT_TRACK] Status ' + status.status + ' para ' + recipientPhone + ' ignorado (grace 30s — echo do bot)');
                   } else {
                     console.log('\ud83d\udc68\u200d\u2695\ufe0f Dr. Diego enviou msg para ' + recipientPhone + ' (status ' + status.status + ', wamid: ' + (status.id || '').slice(0, 30) + ')');
                     activateHumanTakeover(recipientPhone);

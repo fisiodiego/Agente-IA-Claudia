@@ -19,6 +19,7 @@ import {
   welcomeMessage,
   appointmentConfirmedReminder,
   appointmentCancelledResponse,
+  noAppointmentToCancelResponse,
   availabilityHoldingMessage,
   lgpdConsentMessage,
 } from './messageTemplates.js';
@@ -331,7 +332,20 @@ Dados REAIS da clínica (os ÚNICOS que você pode fornecer):
 - Telefone/WhatsApp: (71) 98709-3555
 - PIX (CNPJ): 49.516.188/0001-14
 - Estacionamento: o prédio possui estacionamento amplo e coberto
+- Atendimento: SOMENTE PARTICULAR. A clínica NÃO atende planos de saúde nem convênios.
 - NUNCA forneça outros dados além destes.
+
+━━━ CONVÊNIOS E PLANOS DE SAÚDE ━━━
+A clínica atende SOMENTE de forma PARTICULAR. NÃO trabalhamos com planos de saúde,
+convênios ou reembolso. VOCÊ JÁ TEM essa informação — NÃO mande o paciente "entrar
+em contato com a equipe" para isso (você É o canal de atendimento).
+Quando o paciente perguntar "atende plano?", "aceita convênio?", "atende pelo meu
+plano de saúde?" ou similar, responda de forma clara, direta e cordial que o
+atendimento é exclusivamente particular.
+Exemplo: "Nosso atendimento é somente particular, *não trabalhamos com convênios ou
+planos de saúde*. 😊 Quer que eu te passe o valor da consulta ou te ajude a agendar?"
+(Atenção: "plano de tratamento" é OUTRA coisa — são nossos pacotes de sessões, que
+EXISTEM e são vendidos. Não confunda plano de saúde/convênio com plano de tratamento.)
 
 ━━━ PLANOS DE TRATAMENTO E PAGAMENTO ━━━
 ⚠️ NUNCA ofereça PIX, valores ou formas de pagamento sem o paciente pedir.
@@ -400,8 +414,9 @@ Paciente: "Daniela Ramos Silva, 15/03/1990"
 Claudia: [agora sim chama check_availability → find_or_create_patient com nome e birthDate → create_appointment]
 ⚠️ OTIMIZAÇÃO: NÃO chame list_professionals se o profissional já está no cache acima. Vá direto para check_availability com o ID do cache.
 ⚠️ NUNCA chame a mesma tool 2 vezes na mesma interação com os mesmos parâmetros.
-   Se o paciente TEM pacote ativo, informe: "Será descontado do seu pacote (X/Y sessões usadas)"
-   Se NÃO tem pacote, NÃO mencione valor na confirmação. Só informe valor se o paciente PERGUNTAR.
+   Se o paciente TEM plano de tratamento ativo, informe: "Será descontado do seu plano de tratamento (X/Y sessões usadas)"
+   Se NÃO tem plano, NÃO mencione valor na confirmação. Só informe valor se o paciente PERGUNTAR.
+   ⚠️ TERMINOLOGIA: ao falar com o paciente, SEMPRE diga "plano de tratamento", NUNCA a palavra "pacote". ("pacote" é termo interno do sistema, não use com o paciente.)
 
 
 4. Resposta de confirmação: máximo 3 linhas (data, hora, profissional)
@@ -481,10 +496,20 @@ Pergunte ao paciente:
 - "Quer MUDAR o horario da consulta de DD/MM HH:MM?" → reschedule_appointment
 - "Quer MARCAR OUTRA consulta na mesma data alem dessa?" → create_appointment com forceCreate=true
 
-Exemplos de reagendamento (paciente JA tem consulta marcada):
-- "Quero mudar meu horario" → get_patient_appointments → reschedule_appointment
-- "Tem horario as 17h?" → get_patient_appointments → reschedule_appointment
-- "Preciso remarcar" → get_patient_appointments → reschedule_appointment
+Reagendamento (paciente JA tem consulta marcada) — DOIS casos:
+
+CASO A — paciente pede remarcar mas NAO informa o novo dia/horario ainda
+(ex: "preciso remarcar", "vou ter que reagendar pra outra semana", "nao vou
+conseguir ir nesse dia", "quero mudar mas nao sei quando"):
+→ Chame request_reschedule(phone). Isso LIBERA o horario atual na agenda
+  (cancela a consulta) e registra o pedido de reagendamento.
+→ DEPOIS pergunte: "Qual dia e turno voce prefere?"
+→ Quando o paciente informar o novo dia/horario, use create_appointment
+  (a consulta anterior ja foi cancelada — NAO use reschedule_appointment).
+
+CASO B — paciente pede remarcar E JA informa o novo dia/horario na mesma msg
+(ex: "quero mudar pra terca as 10h", "da pra passar pra sexta 14h?"):
+→ get_patient_appointments → reschedule_appointment (move a consulta direto).
 
 create_appointment SEM forceCreate so deve ser usado para pacientes SEM agendamento
 futuro na mesma data. Se tiver duvida, use get_patient_appointments para verificar.
@@ -587,12 +612,18 @@ export async function processMessage(phone, message, options = {}) {
     // 1. Buscar ou criar paciente
     let patient = getPatientByPhone(phone);
 
-    // 1b. Se não encontrou OU encontrou incompleto ("Novo Paciente"), buscar no CRM por pushName
-    // IMPORTANTE: só confiar no match por pushName se o nome retornado do CRM COMEÇA com o pushName
-    // (evita "Alice" do WhatsApp ser identificada como "Alice Dias Freitas" que é outra pessoa)
+    // 1b. Se não encontrou OU encontrou incompleto ("Novo Paciente"), buscar no CRM.
+    // A busca por TELEFONE roda SEMPRE que precisa de lookup (não depende do pushName):
+    // o searchPatientByPhone do CRM tem fallback de 8 dígitos e acha o paciente mesmo
+    // quando o wa_id vem SEM o 9º dígito. Antes a busca estava presa atrás de
+    // `pushName.length >= 3` — paciente conhecido que responde com nome de perfil curto
+    // (ex: "L") pulava a busca e virava "Novo Paciente" + Claudia se reapresentava
+    // (caso Larissa Pedreira, 30/jun/2026). A busca por NOME continua só com pushName útil.
+    // IMPORTANTE: só confiar no match por pushName se o nome do CRM COMEÇA com o pushName
+    // (evita "Alice" do WhatsApp ser identificada como "Alice Dias Freitas" — outra pessoa).
     const needsCrmLookup = !patient || (patient && !patient.registration_complete && patient.name === 'Novo Paciente');
     const pushNameHasSurname = pushName && pushName.trim().includes(' ');
-    if (needsCrmLookup && pushName && pushName.length >= 3) {
+    if (needsCrmLookup) {
       try {
         const { searchPatientByName, searchPatientByPhone } = await import('./crmApi.js');
         // Primeiro tentar buscar por telefone no CRM (mais confiável que nome)
@@ -782,31 +813,69 @@ export async function processMessage(phone, message, options = {}) {
         confirmName = reminderName;
         console.log(`🔄 Confirmação: usando nome do lembrete "${confirmName}" (banco local: "${patient.name}")`);
       } else if (confirmName === 'Novo Paciente') {
-        // Verificar nos lembretes recentes quem foi lembrado
-        for (const [remPhone, remName] of recentReminderNames) {
-          if (remName && remName !== 'Novo Paciente') {
-            // Verificar se esse lembrete é recente (< 24h)
+        // Número desconhecido no banco local (wa_id sem o 9º dígito, ou LID).
+        // 1º) Match DETERMINÍSTICO por sufixo de 8 dígitos: lembrete recente cujo
+        //     telefone termina igual ao do remetente é do PRÓPRIO paciente.
+        //     Caso Rodrigo (10/jun/2026): lembrete p/ 5571987883858, "Confirmar"
+        //     voltou de 557187883858 (sem o 9) — o fallback antigo varria o Map
+        //     às cegas e respondeu com o nome de OUTRA paciente (Helen) lembrada
+        //     na mesma noite.
+        const senderSuffix8 = String(phone).replace(/\D/g, '').slice(-8);
+        let matchedBySuffix = false;
+        if (senderSuffix8.length === 8) {
+          for (const [remPhone, remName] of recentReminderNames) {
             const remTs = recentReminderPhones.get(remPhone);
-            if (remTs && Date.now() - remTs < REMINDER_WINDOW) {
-              // Verificar se esse paciente tem agendamento pendente no CRM
+            const isRecent = remTs && Date.now() - remTs < REMINDER_WINDOW;
+            if (!isRecent || !remName || remName === 'Novo Paciente') continue;
+            if (String(remPhone).replace(/\D/g, '').slice(-8) === senderSuffix8) {
+              confirmName = remName;
+              matchedBySuffix = true;
+              console.log(`🔄 Confirmação (sufixo-8): nome "${confirmName}" via lembrete recente (${remPhone})`);
+              // Garantir confirmação no CRM (idempotente — se já confirmou antes, pending fica vazio)
               try {
-                const { getPatientAppointments } = await import('./crmApi.js');
+                const { getPatientAppointments, confirmAppointment } = await import('./crmApi.js');
                 const crmApts = await getPatientAppointments(remPhone);
-                if (crmApts.ok && crmApts.data?.some(a => a.status === 'agendado' || a.status === 'confirmado')) {
-                  confirmName = remName;
-                  console.log(`🔄 LID confirmação: corrigido nome de "${patient.name}" para "${confirmName}" via lembrete recente (${remPhone})`);
-                  // Confirmar o agendamento do paciente correto no CRM
-                  const pending = crmApts.data.filter(a => a.status === 'agendado');
-                  if (pending.length > 0) {
-                    const { confirmAppointment } = await import('./crmApi.js');
-                    await confirmAppointment(pending[0].id);
-                    console.log(`✅ Agendamento ${pending[0].id} confirmado no CRM para ${confirmName}`);
-                    confirmedApptDate = pending[0].date || confirmedApptDate;
-                  }
-                  break;
+                const pending = crmApts.ok ? (crmApts.data || []).filter(a => a.status === 'agendado') : [];
+                if (pending.length > 0) {
+                  await confirmAppointment(pending[0].id);
+                  console.log(`✅ Agendamento ${pending[0].id} confirmado no CRM para ${confirmName}`);
+                  confirmedApptDate = pending[0].date || confirmedApptDate;
                 }
-              } catch (e) { console.warn(`⚠️ Erro ao verificar lembrete: ${e.message}`); }
+              } catch (e) { console.warn(`⚠️ Erro ao confirmar via sufixo-8: ${e.message}`); }
+              break;
             }
+          }
+        }
+        // 2º) Fallback p/ LID verdadeiro (sufixo não casa): só quando há UM ÚNICO
+        //     lembrete recente elegível — com 2+ é ambíguo, e chutar troca o nome
+        //     do paciente (e pode confirmar consulta alheia). Sem match único,
+        //     mantém "Novo Paciente" → resposta sai sem nome ("Ótimo! Consulta confirmada!").
+        if (!matchedBySuffix) {
+          const candidates = [];
+          for (const [remPhone, remName] of recentReminderNames) {
+            const remTs = recentReminderPhones.get(remPhone);
+            if (remTs && Date.now() - remTs < REMINDER_WINDOW && remName && remName !== 'Novo Paciente') {
+              candidates.push([remPhone, remName]);
+            }
+          }
+          if (candidates.length === 1) {
+            const [remPhone, remName] = candidates[0];
+            try {
+              const { getPatientAppointments, confirmAppointment } = await import('./crmApi.js');
+              const crmApts = await getPatientAppointments(remPhone);
+              if (crmApts.ok && crmApts.data?.some(a => a.status === 'agendado' || a.status === 'confirmado')) {
+                confirmName = remName;
+                console.log(`🔄 LID confirmação (candidato único): "${confirmName}" via lembrete recente (${remPhone})`);
+                const pending = crmApts.data.filter(a => a.status === 'agendado');
+                if (pending.length > 0) {
+                  await confirmAppointment(pending[0].id);
+                  console.log(`✅ Agendamento ${pending[0].id} confirmado no CRM para ${confirmName}`);
+                  confirmedApptDate = pending[0].date || confirmedApptDate;
+                }
+              }
+            } catch (e) { console.warn(`⚠️ Erro ao verificar lembrete: ${e.message}`); }
+          } else if (candidates.length > 1) {
+            console.log(`ℹ️ Confirmação de número desconhecido com ${candidates.length} lembretes recentes — ambíguo, respondendo sem nome`);
           }
         }
       }
@@ -821,9 +890,14 @@ export async function processMessage(phone, message, options = {}) {
       saveMessage(patient.id, 'user', message);
 
       // ── Cancelar no CRM ──────────────────────────────────────
+      // `cancelled` declarado FORA do try para decidir a resposta:
+      // só afirmamos "agendamento cancelado" se REALMENTE havia um agendamento
+      // e ele foi cancelado. Caso contrário (ex: paciente de alta clicou
+      // "Cancelar" num follow-up de retorno/pós-alta), não existe consulta a
+      // cancelar — respondemos de forma adequada ao contexto de captação.
+      let cancelled = false;
       try {
         const { getPatientAppointments, cancelAppointment, searchPatientByName } = await import('./crmApi.js');
-        let cancelled = false;
         // Tenta buscar agendamentos pelo telefone
         const aptsResult = await getPatientAppointments(phone);
         if (aptsResult.ok && aptsResult.data?.length) {
@@ -848,6 +922,7 @@ export async function processMessage(phone, message, options = {}) {
                 const cancelResult2 = await cancelAppointment(pending2[0].id, 'Cancelado pelo paciente via WhatsApp');
                 if (cancelResult2.ok) {
                   console.log(`❌ Agendamento ${pending2[0].id} cancelado no CRM (via nome) para ${patient.name}`);
+                  cancelled = true;
                 }
               }
             }
@@ -857,9 +932,15 @@ export async function processMessage(phone, message, options = {}) {
         console.error(`❌ Erro ao cancelar no CRM: ${err.message}`);
       }
 
-      const reply = appointmentCancelledResponse(patient.name);
+      // Resposta condicional: confirma cancelamento só se houve; senão trata
+      // como "não quero agendar agora" (caso típico de follow-up pós-alta).
+      const reply = cancelled
+        ? appointmentCancelledResponse(patient.name)
+        : noAppointmentToCancelResponse(patient.name);
       saveMessage(patient.id, 'assistant', reply);
-      console.log(`❌ Agendamento cancelado por ${patient.name || phone}`);
+      console.log(cancelled
+        ? `❌ Agendamento cancelado por ${patient.name || phone}`
+        : `ℹ️ "Cancelar" sem agendamento ativo (follow-up/pós-alta) — ${patient.name || phone}`);
       return reply;
     }
 
@@ -896,7 +977,7 @@ export async function processMessage(phone, message, options = {}) {
     // (impede que scheduler envie lembrete_dia enquanto o paciente ainda não confirmou nova data)
     if (!isNewPatient && msgTrimmed.toLowerCase() === 'reagendar') {
       try {
-        const { getPatientAppointments, getFollowUpsByPhone, createFollowUp } = await import('./crmApi.js');
+        const { getPatientAppointments, getFollowUpsByPhone, createFollowUp, cancelAppointment } = await import('./crmApi.js');
         const phoneToCheck = patient.contact_phone || phone;
 
         // Buscar próximo agendamento do paciente
@@ -909,6 +990,16 @@ export async function processMessage(phone, message, options = {}) {
         const nextApt = futureApts[0];
 
         if (nextApt) {
+          // LIBERA o slot: cancela a consulta atual (o paciente não vem nessa data).
+          // Quando informar o novo horário, a Claudia cria nova consulta (create_appointment)
+          // e o auto-update do CRM fecha o card. Antes a consulta ficava "fantasma" no
+          // slot até o reschedule — caso Jessica (16/jun/2026).
+          try {
+            await cancelAppointment(nextApt.id, 'Reagendamento solicitado — aguardando novo horário');
+            console.log(`🗓️ Botão Reagendar: consulta ${nextApt.id} (${nextApt.date} ${nextApt.time}) cancelada — slot liberado`);
+          } catch (e) {
+            console.warn('⚠️ Botão Reagendar: erro ao cancelar consulta:', e.message);
+          }
           // Dedupe: verificar se já existe follow-up reagendar_pendente aberto para esse apt
           const existingResult = await getFollowUpsByPhone(phoneToCheck);
           const existingArr = Array.isArray(existingResult?.data) ? existingResult.data : [];
@@ -1513,8 +1604,13 @@ Não inclua explicações, apenas o JSON.`,
     try {
       const { searchPatientByName } = await import("./crmApi.js");
       const crmResult = await searchPatientByName(updatedName);
-      if (crmResult && crmResult.found && crmResult.patient) {
-        const crmPat = crmResult.patient;
+      // searchPatientByName retorna { ok, status, data: { found, patient } } —
+      // o resultado está em crmResult.DATA.found/.patient (bug 16/jun/2026: lia
+      // crmResult.found direto → sempre undefined → paciente existente caía no
+      // fluxo de cadastro novo/LGPD em vez de "Te encontrei no sistema". Caso
+      // Manuel Azevedo Rocha: clicou Reagendar, deu o nome, foi tratado como novo).
+      if (crmResult && crmResult.data?.found && crmResult.data.patient) {
+        const crmPat = crmResult.data.patient;
         console.log("CRM match by name: " + crmPat.name + " (id: " + crmPat.id + ")");
         const db = (await import("./database.js")).default;
         db.prepare("UPDATE patients SET contact_phone = COALESCE(@cp, contact_phone), registration_complete = 1, lgpd_consent = 1, updated_at = datetime('now','localtime') WHERE id = @id")
