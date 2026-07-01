@@ -725,12 +725,20 @@ export async function processMessage(phone, message, options = {}) {
     const recentHistory = getConversationHistory(patient.id).slice(-4);
     const lastAssistantMsg = recentHistory.filter(m => m.role === 'assistant').slice(-1)[0]?.content || '';
     const isReschedulingContext = /reagendamento|reagendar|alterar.*(consulta|hor[aá]rio)|mudar.*(consulta|hor[aá]rio)|trocar.*(consulta|hor[aá]rio)|passar.*(p[ar]+a|para)\s+(\d|outr|amanh|segunda|ter[çc]a|quarta|quinta|sexta|s[áa]bado|domingo)/i.test(lastAssistantMsg);
+    // Contexto de OFERTA/ESCOLHA de horário: a Claudia acabou de listar horários pra
+    // o paciente escolher. "Sim"/"Confirmado" aqui é AMBÍGUO (qual horário?) e NÃO deve
+    // disparar o atalho de confirmação de consulta — deixa o LLM perguntar qual/agendar.
+    // Caso Fabiane Melo (01/jul/2026): Claudia ofereceu "13h, 16h — algum te atende?",
+    // paciente respondeu "Confirmado", atalho disparou "consulta confirmada" p/ consulta
+    // inexistente e bagunçou. Guard anterior (isReschedulingContext) não pegava pois a
+    // oferta de horário não usa as palavras "reagendar/mudar/trocar".
+    const isSlotOfferContext = /hor[aá]rios?\s+(livres?|dispon[ií]ve)|qual\s+hor[aá]rio|algum\s+(desses|desse|deles)|prefere\s+(manh|tarde|noite)|(manh[ãa]|tarde|noite)\s+ou\s+(manh[ãa]|tarde|noite)/i.test(lastAssistantMsg);
 
-    const isConfirming = (isExplicitConfirm || isGenericYes) && !isReschedulingContext;
+    const isConfirming = (isExplicitConfirm || isGenericYes) && !isReschedulingContext && !isSlotOfferContext;
     const isCancelling = isShortEnough && /^(cancelar?|cancelado|cancelo|nao\s*vou|não\s*vou|nao\s*consigo|não\s*consigo)[!\.\s]*$/i.test(msgTrimmed);
 
-    if (isReschedulingContext && (isExplicitConfirm || isGenericYes)) {
-      console.log(`🔀 Confirmação em contexto de REAGENDAMENTO detectada — delegando ao Claude (não interceptar como presença)`);
+    if ((isReschedulingContext || isSlotOfferContext) && (isExplicitConfirm || isGenericYes)) {
+      console.log(`🔀 Confirmação em contexto de ${isSlotOfferContext ? 'ESCOLHA DE HORÁRIO' : 'REAGENDAMENTO'} detectada — delegando ao Claude (não interceptar como presença)`);
     }
 
     if (isConfirming) {
