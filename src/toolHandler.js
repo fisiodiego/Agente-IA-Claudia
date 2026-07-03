@@ -278,6 +278,24 @@ export async function handleToolCall(toolName, toolInput, phone = null) {
           recentCreates.set(phone, arr.filter(c => c.ts > cutoff));
         }
 
+        // Paciente de ALTA que agendou consulta nova → reativar status local +
+        // cancelar retornos pós-alta pendentes na hora (o CRM já reativa do lado
+        // dele no POST /appointments; aqui fecha o lado da Claudia sem esperar o
+        // cron). Nova alta futura recria o ciclo. (Caso Julia Camelier, 03/jul/2026.)
+        if (phone) {
+          try {
+            const db = (await import('./database.js')).default;
+            const lp = db.prepare("SELECT id, status FROM patients WHERE phone = ?").get(phone);
+            if (lp && (lp.status === 'alta_confirmada' || lp.status === 'alta')) {
+              db.prepare("UPDATE patients SET status='em_tratamento', discharge_date=NULL WHERE id = ?").run(lp.id);
+              const cancelled = db.prepare(
+                "UPDATE followups SET status='cancelado' WHERE patient_id = ? AND status='pendente' AND type LIKE 'lembrete_%' AND type != 'lembrete_consulta'"
+              ).run(lp.id).changes;
+              console.log(`🔄 Paciente #${lp.id} estava de alta e agendou — reativado (em_tratamento), ${cancelled} retorno(s) pós-alta cancelado(s)`);
+            }
+          } catch (e) { console.warn('⚠️ Erro ao reativar paciente pós-alta:', e.message); }
+        }
+
         const response = {
           message: `Agendamento criado com sucesso! IMPORTANTE: a marcação é FINAL. NÃO chame check_availability nesta data nos próximos turnos. NÃO volte atrás dizendo "não está disponível".`,
           appointmentId: apt.id,

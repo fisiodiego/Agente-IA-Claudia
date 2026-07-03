@@ -348,20 +348,36 @@ async function sendFollowup(followup) {
     console.log(`🔧 Follow-up ${description} para ${followup.name}: phone=${followup.phone} inválido, usando contact_phone=${targetPhone}`);
   }
 
-  // Skip: não enviar retorno se paciente já tem consulta agendada/confirmada
+  // Skip: paciente RETOMOU o cuidado após a alta → cancelar o CICLO de retornos.
+  // Antes: só pulava o retorno atual quando havia consulta futura; os seguintes
+  // (3m/6m/12m) continuavam pendentes e podiam disparar meses depois pra quem já
+  // tinha voltado (ou pra quem fez consulta avulsa concluída sem marcar outra).
+  // Agora: consulta futura OU qualquer consulta APÓS a data da alta → cancela
+  // TODOS os retornos pós-alta pendentes + reativa o status local. Nova alta
+  // futura recria o ciclo normalmente. (Caso Julia Camelier, 03/jul/2026.)
   if (followup.type.startsWith('lembrete_') && followup.type !== 'lembrete_consulta') {
     try {
       const { getPatientAppointments } = await import('./crmApi.js');
       const aptsResult = await getPatientAppointments(targetPhone);
-      if (aptsResult.ok && aptsResult.data?.length) {
-        const hasUpcoming = aptsResult.data.some(a =>
-          (a.status === 'agendado' || a.status === 'confirmado')
-        );
-        if (hasUpcoming) {
-          console.log(`⏭️ Skip follow-up ${description} para ${followup.name} — já tem consulta agendada`);
-          markFollowupSent(followup.id);
-          return;
-        }
+      const apts = (aptsResult.ok && Array.isArray(aptsResult.data)) ? aptsResult.data : [];
+      const hasUpcoming = apts.some(a => a.status === 'agendado' || a.status === 'confirmado');
+
+      const db = (await import('./database.js')).default;
+      const localPat = db.prepare('SELECT discharge_date FROM patients WHERE id = ?').get(followup.patient_id);
+      const dischargeDay = localPat?.discharge_date ? String(localPat.discharge_date).slice(0, 10) : null;
+      const cameBack = dischargeDay
+        ? apts.some(a => a.status !== 'cancelado' && String(a.date) > dischargeDay)
+        : false;
+
+      if (hasUpcoming || cameBack) {
+        const cancelled = db.prepare(
+          "UPDATE followups SET status='cancelado' WHERE patient_id = ? AND status='pendente' AND type LIKE 'lembrete_%' AND type != 'lembrete_consulta'"
+        ).run(followup.patient_id).changes;
+        db.prepare(
+          "UPDATE patients SET status='em_tratamento', discharge_date=NULL WHERE id = ? AND status IN ('alta_confirmada','alta')"
+        ).run(followup.patient_id);
+        console.log(`⏭️ ${followup.name} retomou o cuidado (${hasUpcoming ? 'consulta futura' : 'consulta após a alta'}) — ${cancelled} retorno(s) pós-alta cancelado(s), status local reativado`);
+        return;
       }
     } catch (e) { console.warn('⚠️ Erro ao verificar agendamentos:', e.message); }
   }
