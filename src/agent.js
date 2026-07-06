@@ -294,8 +294,11 @@ __DATE_BLOCK__
     NUNCA diga "te esperamos amanhã" nem "te esperamos hoje" nem invente data futura.
     Use frases neutras: "obrigada pela consulta de hoje", "se precisar de algo é só chamar",
     "qualquer coisa estamos por aqui", "tenha uma ótima semana".
-  • Se a consulta é HOJE (marcador *** HOJE *** no contexto, AINDA NÃO ACONTECEU) → use "até logo",
+  • Se a consulta é HOJE e AINDA NÃO ACONTECEU (marcador *** HOJE *** no contexto) → use "até logo",
     "até daqui a pouco" ou "nos vemos hoje". NUNCA diga "amanhã".
+  • Se a consulta é HOJE mas o HORÁRIO JÁ PASSOU (marcador "HORARIO JA PASSOU" no contexto) →
+    trate como consulta JÁ REALIZADA: "espero que a consulta tenha sido ótima", "obrigada pela
+    visita de hoje", "qualquer coisa estamos por aqui". NUNCA diga "te esperamos hoje às X".
   • Se a consulta é AMANHÃ (marcador *** AMANHA *** no contexto) → pode dizer "te esperamos amanhã".
   • Se a consulta é em 2+ dias → SEMPRE use dia da semana + data (ex: "te esperamos quinta, 23/04").
     NUNCA diga "amanhã" nem "até amanhã".
@@ -1348,7 +1351,16 @@ export async function processMessage(phone, message, options = {}) {
           const weekday = DIAS_SEMANA[new Date(aptUTC).getUTCDay()];
           const dateBR = `${String(d).padStart(2,'0')}/${String(mo).padStart(2,'0')}/${y}`;
           let marker;
-          if (diffDays === 0) marker = '*** HOJE ***';
+          if (diffDays === 0) {
+            // Consulta de HOJE: comparar com a hora atual (BRT). Sem isto, uma
+            // consulta de 15h respondida às 16h33 ainda ganhava "*** HOJE ***"
+            // e o LLM dizia "te esperamos hoje às 15h" após o horário — caso
+            // Viviane (06/jul/2026). Comparação lexicográfica funciona p/ HH:MM.
+            const nowHM = nowBRT.toISOString().slice(11, 16);
+            marker = (a.time && a.time < nowHM)
+              ? '*** HOJE — HORARIO JA PASSOU: a consulta provavelmente ja foi realizada. NAO diga "te esperamos" nem trate como futura; use frase neutra/pos-consulta ***'
+              : '*** HOJE ***';
+          }
           else if (diffDays === 1) marker = '*** AMANHA ***';
           else if (diffDays < 0) marker = `(consulta passada, ${Math.abs(diffDays)} dia(s) atras)`;
           else marker = `(daqui a ${diffDays} dias)`;
