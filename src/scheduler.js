@@ -358,7 +358,10 @@ async function sendFollowup(followup) {
   if (followup.type.startsWith('lembrete_') && followup.type !== 'lembrete_consulta') {
     try {
       const { getPatientAppointments } = await import('./crmApi.js');
-      const aptsResult = await getPatientAppointments(targetPhone);
+      // includeCompleted: sem isto o endpoint só retorna FUTURAS não-concluídas
+      // e o cameBack ficava cego pra quem voltou e JÁ CONCLUIU a consulta
+      // (caso Ana Clara, 09/jul/2026 — recebeu retorno de 1 mês indevido).
+      const aptsResult = await getPatientAppointments(targetPhone, { includeCompleted: true });
       const apts = (aptsResult.ok && Array.isArray(aptsResult.data)) ? aptsResult.data : [];
       const hasUpcoming = apts.some(a => a.status === 'agendado' || a.status === 'confirmado');
 

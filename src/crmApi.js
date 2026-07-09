@@ -108,9 +108,13 @@ export async function rescheduleAppointment(appointmentId, newDate, newTime, dur
 
 /**
  * Lista agendamentos futuros de um paciente (por telefone).
+ * includeCompleted: true → inclui TAMBÉM concluídas e passadas (usado pelo
+ * scheduler pra detectar "paciente voltou após a alta" — as concluídas são
+ * exatamente a prova da volta; caso Ana Clara, 09/jul/2026).
  */
-export async function getPatientAppointments(phone) {
+export async function getPatientAppointments(phone, { includeCompleted = false } = {}) {
   const params = new URLSearchParams({ phone });
+  if (includeCompleted) params.set('includeCompleted', '1');
   return crmFetch(`/appointments?${params}`);
 }
 
