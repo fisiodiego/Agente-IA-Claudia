@@ -997,12 +997,19 @@ export async function processMessage(phone, message, options = {}) {
       }
     }
 
-    // 2c. Detectar clique no botão "Reagendar" → criar follow-up pendente no Kanban
-    // (impede que scheduler envie lembrete_dia enquanto o paciente ainda não confirmou nova data)
+    // 2c. Botão "Reagendar" → fluxo DETERMINÍSTICO completo: cancela a consulta
+    // (libera o slot), cria o card no Kanban e RESPONDE DIRETO (com return).
+    // Antes, após cancelar, o texto "Reagendar" seguia pro LLM — que consultava a
+    // agenda JÁ VAZIA (o handler tinha acabado de cancelar) e respondia "não
+    // encontrei nenhuma consulta... é possível que já tenha sido cancelada".
+    // Caso Fabiane (09/jul/2026): 2 cliques = 2 respostas confusas. O fluxo por
+    // TEXTO ("preciso remarcar") continua com o LLM via tool request_reschedule.
     if (!isNewPatient && msgTrimmed.toLowerCase() === 'reagendar') {
       try {
         const { getPatientAppointments, getFollowUpsByPhone, createFollowUp, cancelAppointment } = await import('./crmApi.js');
         const phoneToCheck = patient.contact_phone || phone;
+        const firstName = (patient.name && patient.name !== 'Novo Paciente') ? patient.name.split(' ')[0] : '';
+        const greet = firstName ? `, *${firstName}*` : '';
 
         // Buscar próximo agendamento do paciente
         const aptsResult = await getPatientAppointments(phoneToCheck);
@@ -1014,10 +1021,13 @@ export async function processMessage(phone, message, options = {}) {
         const nextApt = futureApts[0];
 
         if (nextApt) {
+          const [y, m, d] = String(nextApt.date || '').split('-');
+          const dateBR = y && m && d ? `${d}/${m}` : (nextApt.date || '?');
+          const timeStr = nextApt.time || '?';
+
           // LIBERA o slot: cancela a consulta atual (o paciente não vem nessa data).
           // Quando informar o novo horário, a Claudia cria nova consulta (create_appointment)
-          // e o auto-update do CRM fecha o card. Antes a consulta ficava "fantasma" no
-          // slot até o reschedule — caso Jessica (16/jun/2026).
+          // e o auto-update do CRM fecha o card. Caso Jessica (16/jun/2026).
           try {
             await cancelAppointment(nextApt.id, 'Reagendamento solicitado — aguardando novo horário');
             console.log(`🗓️ Botão Reagendar: consulta ${nextApt.id} (${nextApt.date} ${nextApt.time}) cancelada — slot liberado`);
@@ -1036,11 +1046,6 @@ export async function processMessage(phone, message, options = {}) {
           );
 
           if (!alreadyPending) {
-            // Formatar data/hora para notas
-            const [y, m, d] = String(nextApt.date || '').split('-');
-            const dateBR = y && m && d ? `${d}/${m}` : (nextApt.date || '?');
-            const timeStr = nextApt.time || '?';
-
             const id = 'reag-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6);
             await createFollowUp({
               id,
@@ -1058,9 +1063,27 @@ export async function processMessage(phone, message, options = {}) {
           } else {
             console.log(`⏭️ Follow-up reagendar_pendente já existe para apt ${nextApt.id} — pulando criação`);
           }
-        } else {
-          console.log(`⚠️ "Reagendar" recebido mas paciente ${phoneToCheck} não tem agendamento futuro`);
+
+          // Resposta DIRETA — o "Reagendar" NÃO segue pro LLM (evita "não encontrei consulta")
+          saveMessage(patient.id, 'user', message);
+          const reply = `Entendido${greet}! Liberei o horário de ${dateBR} às ${timeStr}. 😊\n\nQual dia e turno (manhã ou tarde) ficam melhor pra você?`;
+          saveMessage(patient.id, 'assistant', reply);
+          return reply;
         }
+
+        // Sem consulta futura: se há card de reagendamento aberto (ex.: 2º clique
+        // no mesmo botão), confirma o registro em vez de "não encontrei consulta".
+        const cardResult = await getFollowUpsByPhone(phoneToCheck);
+        const cardArr = Array.isArray(cardResult?.data) ? cardResult.data : [];
+        const hasOpenCard = cardArr.some(f =>
+          f.source === 'reagendar_pendente' && f.status !== 'agendou' && f.status !== 'perdido');
+        if (hasOpenCard) {
+          saveMessage(patient.id, 'user', message);
+          const reply = `Seu pedido de reagendamento já está registrado${greet}! 😊\n\nMe diga o dia e turno (manhã ou tarde) de preferência que eu verifico os horários disponíveis.`;
+          saveMessage(patient.id, 'assistant', reply);
+          return reply;
+        }
+        console.log(`⚠️ "Reagendar" sem agendamento futuro nem card aberto (${phoneToCheck}) — segue pro LLM`);
       } catch (err) {
         console.warn('⚠️ Erro ao registrar reagendar_pendente:', err.message);
       }
