@@ -605,19 +605,25 @@ async function checkCrmDischarges() {
           dischargeAt.setUTCDate(dischargeAt.getUTCDate() + 1);
           const scheduledFor = dischargeAt.toISOString().slice(0, 10);
 
+          // Comparação de telefone por sufixo-8: registros históricos de pending_surveys
+          // têm formatos mistos ("5571996429140" vs "(71) 99642-9140") e a igualdade
+          // exata furou o cooldown (caso Larissa Sobral, 2 pesquisas em 41 dias).
+          const phoneSuffix8 = String(discharge.phone || '').replace(/\D/g, '').slice(-8);
+          const PHONE_S8 = "substr(replace(replace(replace(replace(replace(phone,' ',''),'-',''),'(',''),')',''),'+',''), -8)";
+
           // Dedupe 1: não enfileirar a mesma alta duas vezes
           const existing = db.prepare(
-            "SELECT 1 FROM pending_surveys WHERE phone = ? AND discharge_date = ?"
-          ).get(discharge.phone, dischargeDay);
+            `SELECT 1 FROM pending_surveys WHERE ${PHONE_S8} = ? AND discharge_date = ?`
+          ).get(phoneSuffix8, dischargeDay);
 
           // Cooldown: paciente que já recebeu pesquisa nos últimos 6 meses não recebe de novo.
           // Cobre caso "paciente teve alta, voltou pra novo ciclo, recebeu alta de novo" — evita
           // pesquisa redundante. Após 6 meses, vale pedir feedback do novo ciclo.
           const recentSurvey = db.prepare(
-            "SELECT sent_at FROM pending_surveys " +
-            "WHERE phone = ? AND status = 'sent' AND sent_at > datetime('now','localtime','-6 months') " +
-            "ORDER BY sent_at DESC LIMIT 1"
-          ).get(discharge.phone);
+            `SELECT sent_at FROM pending_surveys ` +
+            `WHERE ${PHONE_S8} = ? AND status = 'sent' AND sent_at > datetime('now','localtime','-6 months') ` +
+            `ORDER BY sent_at DESC LIMIT 1`
+          ).get(phoneSuffix8);
 
           if (existing) {
             console.log(`↩️ Pesquisa já enfileirada para ${discharge.name} (${dischargeDay}) — skip`);
