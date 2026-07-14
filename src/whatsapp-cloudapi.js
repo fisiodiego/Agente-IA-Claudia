@@ -597,17 +597,17 @@ function createWebhookServer() {
                   // Status da propria msg do bot (ID rastreado) — ignorar silenciosamente
                 } else {
                   // ID NAO esta no rastreamento do bot — pode ser msg do Dr. Diego.
-                  // Grace period de 30s. Antes era só 5s (exigia (expiry-now)>55000),
-                  // curto demais: quando o canal está lento (instabilidade Meta/ChakraHQ),
-                  // o webhook de status "sent" da PRÓPRIA mensagem do bot chega ANTES do
-                  // [BOT_TRACK] registrar o wamid E mais de 5s após o recentBotSentPhones
-                  // ser setado → falso positivo, a Claudia se auto-pausava 30min (caso
-                  // Pierre Góes, 16/jun/2026). 30s cobre o atraso do status com folga
-                  // (atraso real ~5-15s mesmo com canal lento). Takeover REAL (Diego
-                  // responde manual) segue funcionando: nesse caso o número NÃO está na
-                  // janela de envio recente. recentBotSentPhones tem TTL 60s → grace de
-                  // 30s = exigir que falte >30s pro expiro (setado ha menos de 30s).
-                  const GRACE_MS = 30000;
+                  // Grace period de 15s. Histórico: 5s era curto demais — com canal
+                  // lento o status "sent" da PRÓPRIA msg do bot chegava depois da
+                  // janela → falso positivo, Claudia se auto-pausava 30min (caso
+                  // Pierre Góes, 16/jun/2026); subiu pra 30s, mas aí mensagens MANUAIS
+                  // do Diego durante uma rajada do bot caíam na janela e o takeover
+                  // ativava com atraso (caso Bruno Cardoso, 14/jul/2026: 2 msgs manuais
+                  // engolidas como echo, Claudia mandou 1 msg sobreposta). 15s cobre o
+                  // atraso real do status (~5-15s) e encurta a janela cega pela metade.
+                  // recentBotSentPhones tem TTL 60s → grace = exigir que falte
+                  // >(60s - GRACE_MS) pro expiro (= setado há menos de GRACE_MS).
+                  const GRACE_MS = 15000;
                   const last8 = recipientPhone.replace(/\D/g, '').slice(-8);
                   let justSentByBot = false;
                   for (const [ph, expiry] of recentBotSentPhones.entries()) {
@@ -618,7 +618,7 @@ function createWebhookServer() {
                   }
 
                   if (justSentByBot) {
-                    console.log('[BOT_TRACK] Status ' + status.status + ' para ' + recipientPhone + ' ignorado (grace 30s — echo do bot)');
+                    console.log('[BOT_TRACK] Status ' + status.status + ' para ' + recipientPhone + ' ignorado (grace 15s — echo do bot)');
                   } else {
                     console.log('\ud83d\udc68\u200d\u2695\ufe0f Dr. Diego enviou msg para ' + recipientPhone + ' (status ' + status.status + ', wamid: ' + (status.id || '').slice(0, 30) + ')');
                     activateHumanTakeover(recipientPhone);
