@@ -283,3 +283,10 @@ export async function createFollowUp(body) {
     body: JSON.stringify(body),
   });
 }
+
+// Lista follow-ups por tipo/status (usado pelo reengajamento de leads).
+// statuses: array de status do Kanban (ex.: ['pendente','enviado','respondeu']).
+export async function listFollowUps(type = 'lead', statuses = ['pendente', 'enviado', 'respondeu']) {
+  const params = new URLSearchParams({ type, statuses: statuses.join(',') });
+  return crmFetch(`/follow-ups?${params}`);
+}

@@ -24,6 +24,7 @@ import {
   lgpdConsentMessage,
 } from './messageTemplates.js';
 import { saveLidMapping } from './lidMap.js';
+import db from './database.js';
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
@@ -1010,6 +1011,38 @@ export async function processMessage(phone, message, options = {}) {
         ? `❌ Agendamento cancelado por ${patient.name || phone}`
         : `ℹ️ "Cancelar" sem agendamento ativo (follow-up/pós-alta) — ${patient.name || phone}`);
       return reply;
+    }
+
+    // Botões de recusa do template de reengajamento de leads (lead_agendamento_*):
+    // "Nao tenho interesse" / "Encerrar solicitacao" → resposta fixa de encerramento
+    // + card do Kanban movido para "perdido" (sem passar pelo LLM). Guard: só ativa
+    // se este telefone RECEBEU o template (registro em lead_reengagement) — evita
+    // falso positivo em conversas normais com frases parecidas.
+    const isLeadOptOut = isShortEnough &&
+      /^(n(a|ã)o\s*tenho\s*interesse|encerrar\s*solicita(c|ç)(a|ã)o)[!\.\s]*$/i.test(msgTrimmed);
+    if (isLeadOptOut) {
+      const optSuffix8 = String(phone).replace(/\D/g, '').slice(-8);
+      const gotTemplate = db.prepare('SELECT 1 FROM lead_reengagement WHERE phone_suffix8 = ?').get(optSuffix8);
+      if (gotTemplate) {
+        saveMessage(patient.id, 'user', message);
+        try {
+          const { getFollowUpsByPhone, updateFollowUp } = await import('./crmApi.js');
+          const fuRes = await getFollowUpsByPhone(patient.contact_phone || phone);
+          const cards = Array.isArray(fuRes?.data) ? fuRes.data : [];
+          for (const card of cards) {
+            if (card.type === 'lead' && ['pendente', 'enviado', 'respondeu'].includes(card.status)) {
+              await updateFollowUp(card.id, { status: 'perdido', lostReason: 'sem_interesse' });
+              console.log(`🚫 Lead opt-out: card ${card.id} movido para perdido (${patient.name || phone})`);
+            }
+          }
+        } catch (err) {
+          console.warn('⚠️ Lead opt-out: erro ao mover card:', err.message);
+        }
+        const optOutFirstName = (patient.name || '').split(' ')[0];
+        const reply = `Entendido${optOutFirstName ? ', ' + optOutFirstName : ''}! Encerrei sua solicitação aqui. Se mudar de ideia ou precisar de algo no futuro, é só mandar uma mensagem. 😊`;
+        saveMessage(patient.id, 'assistant', reply);
+        return reply;
+      }
     }
 
     // 2a. Se paciente acabou de agendar e manda msg curta tipo 'Ok', ignorar (não reprocessar)

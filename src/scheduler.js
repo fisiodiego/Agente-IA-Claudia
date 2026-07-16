@@ -296,6 +296,117 @@ export function startScheduler() {
   cron.schedule('0 11 * * *', async () => {
     await sendSameDayReminders();
   });
+
+  // ── Reengajamento de leads sem agendamento: 11:30 BRT (14:30 UTC) ──
+  cron.schedule('30 14 * * *', async () => {
+    await checkStaleLeads();
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Reengajamento de leads sem agendamento (template lead_agendamento_*)
+// Cards da coluna Leads do Kanban parados 7+ dias, sem consulta futura, que
+// nunca receberam o template (dedupe PERMANENTE por sufixo-8). Máx 10/dia.
+// Só dispara quando um dos templates estiver APROVADO na Meta (checa via API
+// pass-through da Chakra) — até lá o cron roda e sai quieto.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const LEAD_REENGAGE_TEMPLATES = ['lead_agendamento_a', 'lead_agendamento_b'];
+const LEAD_REENGAGE_MIN_DAYS = 7;
+const LEAD_REENGAGE_DAILY_CAP = 10;
+const WABA_CHAKRA_ID = '122098688444003982';
+let approvedLeadTemplateCache = { name: null, checkedAt: 0 };
+
+async function getApprovedLeadTemplate() {
+  // Depois de aprovado não muda mais — cacheia; enquanto não aprova, re-checa a cada rodada
+  if (approvedLeadTemplateCache.name) return approvedLeadTemplateCache.name;
+  try {
+    const url = `https://api.chakrahq.com/v1/ext/plugin/whatsapp/api/v22.0/${WABA_CHAKRA_ID}/message_templates?name=lead_agendamento`;
+    const res = await fetch(url, { headers: { Authorization: `Bearer ${process.env.WA_ACCESS_TOKEN}` } });
+    const json = await res.json();
+    const list = Array.isArray(json?.data) ? json.data : [];
+    for (const name of LEAD_REENGAGE_TEMPLATES) {
+      const t = list.find((x) => x.name === name && x.status === 'APPROVED');
+      if (t) {
+        approvedLeadTemplateCache = { name, checkedAt: Date.now() };
+        console.log(`✅ Template de reengajamento aprovado: ${name} (categoria ${t.category})`);
+        return name;
+      }
+    }
+    console.log('⏳ Reengajamento de leads: nenhum template lead_agendamento_* aprovado ainda — pulando rodada');
+  } catch (err) {
+    console.warn('⚠️ Erro ao checar aprovação dos templates de lead:', err.message);
+  }
+  return null;
+}
+
+async function checkStaleLeads() {
+  if (!sendTemplateFn) return;
+  try {
+    const templateName = await getApprovedLeadTemplate();
+    if (!templateName) return;
+
+    const { listFollowUps, updateFollowUp, getPatientAppointments } = await import('./crmApi.js');
+    const leadsRes = await listFollowUps('lead', ['pendente', 'enviado', 'respondeu']);
+    if (!leadsRes.ok || !Array.isArray(leadsRes.data)) {
+      console.warn('⚠️ Reengajamento: falha ao listar leads do CRM:', leadsRes.error || 'resposta inesperada');
+      return;
+    }
+
+    const cutoffMs = LEAD_REENGAGE_MIN_DAYS * 24 * 3600 * 1000;
+    let sent = 0;
+    let skipped = 0;
+
+    for (const lead of leadsRes.data) {
+      if (sent >= LEAD_REENGAGE_DAILY_CAP) {
+        console.log(`📣 Reengajamento: teto diário de ${LEAD_REENGAGE_DAILY_CAP} atingido — restantes ficam pra próxima rodada`);
+        break;
+      }
+      const digits = String(lead.phone || '').replace(/\D/g, '');
+      const suffix8 = digits.slice(-8);
+      // Telefone BR válido (mesma régua dos follow-ups) e não-fake (11111111 etc.)
+      if (!isValidBRPhone(digits) || /^(\d)\1{7}$/.test(suffix8)) { skipped++; continue; }
+      // Dedupe PERMANENTE: cada lead recebe o template no máximo 1 vez na vida
+      if (db.prepare('SELECT 1 FROM lead_reengagement WHERE phone_suffix8 = ?').get(suffix8)) { skipped++; continue; }
+      // Parado 7+ dias: sem conversa local recente E sem mexida recente no card
+      const recentMsg = db.prepare(
+        "SELECT 1 FROM message_log WHERE substr(replace(replace(replace(replace(replace(phone,' ',''),'-',''),'(',''),')',''),'+',''), -8) = ? AND created_at > datetime('now','localtime', ?)"
+      ).get(suffix8, `-${LEAD_REENGAGE_MIN_DAYS} days`);
+      if (recentMsg) { skipped++; continue; }
+      const lastCardTouch = new Date(lead.updatedAt || lead.createdAt || 0).getTime();
+      if (lastCardTouch && Date.now() - lastCardTouch < cutoffMs) { skipped++; continue; }
+      // Sem consulta futura no CRM (se agendou nesse meio tempo, fica de fora)
+      try {
+        const apts = await getPatientAppointments(digits);
+        if (apts.ok && Array.isArray(apts.data) &&
+            apts.data.some((a) => a.status === 'agendado' || a.status === 'confirmado')) { skipped++; continue; }
+      } catch { skipped++; continue; /* na dúvida, não envia */ }
+
+      const rawName = String(lead.patientName || '').trim();
+      const firstNameRaw = (!rawName || /^contato/i.test(rawName)) ? '' : rawName.split(/\s+/)[0];
+      // pushName sem letra (só emoji/símbolo) → saudação neutra "Ola, tudo bem."
+      const firstName = /[a-zà-ú]/i.test(firstNameRaw) ? firstNameRaw : 'tudo bem';
+
+      const ok = await sendTemplateFn(digits, templateName, [firstName]);
+      if (ok) {
+        db.prepare('INSERT INTO lead_reengagement (phone, phone_suffix8, template, card_id) VALUES (?, ?, ?, ?)')
+          .run(digits, suffix8, templateName, lead.id || null);
+        try {
+          await updateFollowUp(lead.id, {
+            notes: `${lead.notes || ''}\nTemplate de reativacao (${templateName}) enviado em ${new Date().toLocaleDateString('pt-BR')}`.trim(),
+          });
+        } catch { /* nota no card é cosmética — envio já registrado no dedupe local */ }
+        sent++;
+        console.log(`📣 Reengajamento enviado para ${rawName || digits} (${suffix8})`);
+        await new Promise((r) => setTimeout(r, 2000));
+      } else {
+        console.warn(`⚠️ Reengajamento: falha no envio para ${digits}`);
+      }
+    }
+    console.log(`📣 Reengajamento de leads: ${sent} enviado(s), ${skipped} pulado(s) de ${leadsRes.data.length} card(s)`);
+  } catch (err) {
+    console.error('❌ Erro no reengajamento de leads:', err.message);
+  }
 }
 
 /**

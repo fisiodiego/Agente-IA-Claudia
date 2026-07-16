@@ -173,6 +173,20 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_lid_map_phone ON phone_lid_map(phone);
 `);;
 
+// Reengajamento de leads (template lead_agendamento_*): dedupe PERMANENTE —
+// cada lead recebe o template no máximo 1 vez na vida (sufixo-8).
+db.exec(`
+  CREATE TABLE IF NOT EXISTS lead_reengagement (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    phone         TEXT NOT NULL,
+    phone_suffix8 TEXT NOT NULL,
+    template      TEXT NOT NULL,
+    card_id       TEXT,
+    sent_at       TEXT DEFAULT (datetime('now','localtime'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_lead_reeng_suffix ON lead_reengagement(phone_suffix8);
+`);
+
 // ─── Queries preparadas ────────────────────────────────────────────────────────
 
 export const queries = {
