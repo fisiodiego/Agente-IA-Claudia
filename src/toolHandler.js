@@ -316,8 +316,50 @@ export async function handleToolCall(toolName, toolInput, phone = null) {
 
       case 'cancel_appointment': {
         const { appointmentId, reason } = toolInput;
+        const cphone = toolInput.phone || phone;
+        // Captura os dados da consulta ANTES de cancelar (pro card do Kanban;
+        // depois do cancelamento ela some da lista de pendentes)
+        let cancelledApt = null;
+        try {
+          const aptsRes = await getPatientAppointments(cphone);
+          const arr = Array.isArray(aptsRes?.data) ? aptsRes.data : [];
+          cancelledApt = arr.find((a) => a.id === appointmentId) || null;
+        } catch { /* sem card, cancelamento segue normal */ }
+
         const result = await cancelAppointment(appointmentId, reason);
         if (!result.ok) return JSON.stringify({ error: result.error });
+
+        // Card "cancelou" no Kanban — paciente que desmarca sem reagendar não
+        // some do radar (espelha o card do request_reschedule; se ele remarcar,
+        // o auto-update do CRM move o card para "agendou"). Dedupe por apt_id.
+        try {
+          if (cancelledApt) {
+            const fuRes = await getFollowUpsByPhone(cphone);
+            const fuArr = Array.isArray(fuRes?.data) ? fuRes.data : [];
+            const already = fuArr.some((f) =>
+              f.source === 'cancelou' && f.status !== 'agendou' && f.status !== 'perdido' &&
+              typeof f.notes === 'string' && f.notes.includes(`[apt_id:${appointmentId}]`));
+            if (!already) {
+              const [y, m, d] = String(cancelledApt.date || '').split('-');
+              const dateBR = y && m && d ? `${d}/${m}` : (cancelledApt.date || '?');
+              await createFollowUp({
+                id: 'canc-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6),
+                patientId: null,
+                patientName: cancelledApt.patientName || 'Paciente',
+                phone: cphone,
+                type: 'cancelamento',
+                status: 'respondeu',
+                source: 'cancelou',
+                notes: `Cancelou consulta de ${dateBR} às ${cancelledApt.time || '?'} via WhatsApp (sem reagendar)\n[apt_id:${appointmentId}]`,
+                createdAt: new Date().toISOString(),
+                updatedAt: new Date().toISOString(),
+              });
+              console.log(`🚫 Card "cancelou" criado no Kanban (apt ${appointmentId})`);
+            }
+          }
+        } catch (err) {
+          console.warn('⚠️ cancel_appointment: erro ao criar card:', err.message);
+        }
 
         const response = {
           message: 'Agendamento cancelado com sucesso.',

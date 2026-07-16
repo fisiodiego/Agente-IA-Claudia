@@ -927,6 +927,7 @@ export async function processMessage(phone, message, options = {}) {
       // "Cancelar" num follow-up de retorno/pós-alta), não existe consulta a
       // cancelar — respondemos de forma adequada ao contexto de captação.
       let cancelled = false;
+      let cancelledApt = null;
       try {
         const { getPatientAppointments, cancelAppointment, searchPatientByName } = await import('./crmApi.js');
         // Tenta buscar agendamentos pelo telefone
@@ -938,6 +939,7 @@ export async function processMessage(phone, message, options = {}) {
             if (cancelResult.ok) {
               console.log(`❌ Agendamento ${pending[0].id} cancelado no CRM para ${patient.name || phone}`);
               cancelled = true;
+              cancelledApt = pending[0];
             }
           }
         }
@@ -954,6 +956,7 @@ export async function processMessage(phone, message, options = {}) {
                 if (cancelResult2.ok) {
                   console.log(`❌ Agendamento ${pending2[0].id} cancelado no CRM (via nome) para ${patient.name}`);
                   cancelled = true;
+                  cancelledApt = pending2[0];
                 }
               }
             }
@@ -961,6 +964,40 @@ export async function processMessage(phone, message, options = {}) {
         }
       } catch (err) {
         console.error(`❌ Erro ao cancelar no CRM: ${err.message}`);
+      }
+
+      // Card "cancelou" no Kanban — paciente que desmarca sem reagendar não
+      // some do radar (espelha o card do request_reschedule; se ele remarcar,
+      // o auto-update do CRM move o card para "agendou"). Dedupe por apt_id.
+      if (cancelled && cancelledApt) {
+        try {
+          const { createFollowUp, getFollowUpsByPhone } = await import('./crmApi.js');
+          const cardPhone = patient.contact_phone || phone;
+          const fuRes = await getFollowUpsByPhone(cardPhone);
+          const fuArr = Array.isArray(fuRes?.data) ? fuRes.data : [];
+          const already = fuArr.some((f) =>
+            f.source === 'cancelou' && f.status !== 'agendou' && f.status !== 'perdido' &&
+            typeof f.notes === 'string' && f.notes.includes(`[apt_id:${cancelledApt.id}]`));
+          if (!already) {
+            const [y, m, d] = String(cancelledApt.date || '').split('-');
+            const dateBR = y && m && d ? `${d}/${m}` : (cancelledApt.date || '?');
+            await createFollowUp({
+              id: 'canc-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6),
+              patientId: null,
+              patientName: cancelledApt.patientName || patient.name || 'Paciente',
+              phone: cardPhone,
+              type: 'cancelamento',
+              status: 'respondeu',
+              source: 'cancelou',
+              notes: `Cancelou consulta de ${dateBR} às ${cancelledApt.time || '?'} via WhatsApp (sem reagendar)\n[apt_id:${cancelledApt.id}]`,
+              createdAt: new Date().toISOString(),
+              updatedAt: new Date().toISOString(),
+            });
+            console.log(`🚫 Card "cancelou" criado no Kanban (apt ${cancelledApt.id})`);
+          }
+        } catch (err) {
+          console.warn('⚠️ isCancelling: erro ao criar card:', err.message);
+        }
       }
 
       // Resposta condicional: confirma cancelamento só se houve; senão trata
