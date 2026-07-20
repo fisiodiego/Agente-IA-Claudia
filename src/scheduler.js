@@ -300,6 +300,7 @@ export function startScheduler() {
   // ── Reengajamento de leads sem agendamento: 11:30 BRT (14:30 UTC) ──
   cron.schedule('30 14 * * *', async () => {
     await checkStaleLeads();
+    await expireUnansweredLeadReengagements();
   });
 }
 
@@ -406,6 +407,69 @@ async function checkStaleLeads() {
     console.log(`📣 Reengajamento de leads: ${sent} enviado(s), ${skipped} pulado(s) de ${leadsRes.data.length} card(s)`);
   } catch (err) {
     console.error('❌ Erro no reengajamento de leads:', err.message);
+  }
+}
+
+// Expiração do reengajamento: lead que recebeu o template há 5+ dias e não
+// respondeu nem agendou → card vai pra "perdido" (lost_reason
+// sem_resposta_reativacao). Sem 2ª mensagem — decisão anti-spam do Diego
+// (proteger o rating do número). resolved_at/resolution encerram o
+// monitoramento de cada registro (idempotente entre rodadas).
+const LEAD_REENGAGE_EXPIRE_DAYS = 5;
+
+async function expireUnansweredLeadReengagements() {
+  try {
+    const due = db.prepare(
+      "SELECT * FROM lead_reengagement WHERE resolved_at IS NULL AND sent_at <= datetime('now','localtime', ?)"
+    ).all(`-${LEAD_REENGAGE_EXPIRE_DAYS} days`);
+    if (!due.length) return;
+
+    const { getFollowUpsByPhone, updateFollowUp, getPatientAppointments } = await import('./crmApi.js');
+    const resolve = db.prepare(
+      "UPDATE lead_reengagement SET resolved_at = datetime('now','localtime'), resolution = ? WHERE id = ?"
+    );
+
+    for (const r of due) {
+      // Respondeu depois do envio? O fluxo normal (Claudia/auto-update) cuida do card.
+      const replied = db.prepare(
+        "SELECT 1 FROM message_log WHERE direction = 'inbound' AND substr(replace(replace(replace(replace(replace(phone,' ',''),'-',''),'(',''),')',''),'+',''), -8) = ? AND created_at > ?"
+      ).get(r.phone_suffix8, r.sent_at);
+      if (replied) { resolve.run('respondeu', r.id); continue; }
+
+      // Agendou sem responder (ex.: ligou pra clínica)? Também não expira.
+      try {
+        const apts = await getPatientAppointments(r.phone);
+        if (apts.ok && Array.isArray(apts.data) &&
+            apts.data.some((a) => a.status === 'agendado' || a.status === 'confirmado')) {
+          resolve.run('agendou', r.id);
+          continue;
+        }
+      } catch { continue; /* CRM fora do ar — tenta na próxima rodada */ }
+
+      // Expira: move os cards de lead ativos deste telefone pra "perdido"
+      let moved = 0;
+      try {
+        const fuRes = await getFollowUpsByPhone(r.phone);
+        const cards = Array.isArray(fuRes?.data) ? fuRes.data : [];
+        for (const card of cards) {
+          if (card.type === 'lead' && ['pendente', 'enviado', 'respondeu'].includes(card.status)) {
+            await updateFollowUp(card.id, {
+              status: 'perdido',
+              lostReason: 'sem_resposta_reativacao',
+              notes: `${card.notes || ''}\nSem resposta a reativacao em ${LEAD_REENGAGE_EXPIRE_DAYS} dias — encerrado automaticamente em ${new Date().toLocaleDateString('pt-BR')}`.trim(),
+            });
+            moved++;
+          }
+        }
+      } catch (err) {
+        console.warn('⚠️ Expiração de reativação: erro ao mover card de ' + r.phone + ':', err.message);
+        continue; // não marca resolved — tenta na próxima rodada
+      }
+      resolve.run('expirado', r.id);
+      console.log(`🗂️ Reativação sem resposta expirada: ${r.phone} — ${moved} card(s) → perdido`);
+    }
+  } catch (err) {
+    console.error('❌ Erro na expiração de reativações:', err.message);
   }
 }
 

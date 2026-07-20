@@ -187,6 +187,12 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_lead_reeng_suffix ON lead_reengagement(phone_suffix8);
 `);
 
+// Migração: desfecho do reengajamento (expiração em 5 dias sem resposta).
+// resolved_at marca quando o monitoramento encerrou; resolution = 'respondeu' |
+// 'agendou' | 'expirado'. try/catch: colunas já existem em bancos migrados.
+try { db.exec("ALTER TABLE lead_reengagement ADD COLUMN resolved_at TEXT"); } catch { /* já existe */ }
+try { db.exec("ALTER TABLE lead_reengagement ADD COLUMN resolution TEXT"); } catch { /* já existe */ }
+
 // ─── Queries preparadas ────────────────────────────────────────────────────────
 
 export const queries = {
