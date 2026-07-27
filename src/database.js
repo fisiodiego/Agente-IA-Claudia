@@ -187,6 +187,21 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_lead_reeng_suffix ON lead_reengagement(phone_suffix8);
 `);
 
+// Contexto pendente: mensagem proativa (lembrete/retorno) enviada pelo cron a quem
+// AINDA NÃO tem cadastro no banco local — o smartSend não teve onde gravar. Quando
+// a pessoa responder, o agent cria o cadastro e injeta isto no histórico, para o LLM
+// responder com contexto em vez de se reapresentar (caso Lomanto 27/jul/2026: lembrete
+// às 08:00, "Ok" às 08:57 → "Olá, como posso te ajudar?").
+db.exec(`
+  CREATE TABLE IF NOT EXISTS pending_context (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    phone_suffix8 TEXT NOT NULL,
+    content       TEXT NOT NULL,
+    created_at    TEXT DEFAULT (datetime('now','localtime'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_pending_context_suffix ON pending_context(phone_suffix8);
+`);
+
 // Migração: desfecho do reengajamento (expiração em 5 dias sem resposta).
 // resolved_at marca quando o monitoramento encerrou; resolution = 'respondeu' |
 // 'agendou' | 'expirado'. try/catch: colunas já existem em bancos migrados.

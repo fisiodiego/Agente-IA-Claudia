@@ -182,6 +182,17 @@ async function smartSend(phone, text, templateName, templateParams = []) {
       if (localPatient?.id) {
         saveMessage(localPatient.id, 'assistant', text);
         console.log(`💾 Mensagem (via ${sentVia}) salva em conversations para paciente #${localPatient.id}`);
+      } else {
+        // Sem cadastro local (paciente que nunca falou com a Claudia — agendado
+        // direto no CRM). Guarda o texto em pending_context: quando ele responder,
+        // o agent cria o cadastro e injeta isto no histórico. Caso Lomanto 27/jul.
+        const s8 = String(phone).replace(/\D/g, '').slice(-8);
+        if (s8.length === 8) {
+          // Higiene: quem nunca respondeu não acumula contexto pendente pra sempre
+          db.prepare("DELETE FROM pending_context WHERE created_at < datetime('now','localtime','-7 days')").run();
+          db.prepare('INSERT INTO pending_context (phone_suffix8, content) VALUES (?, ?)').run(s8, text);
+          console.log(`💾 Sem cadastro local — contexto pendente guardado para ...${s8}`);
+        }
       }
     } catch (err) {
       console.warn(`⚠️ Falha ao salvar conversation (não-bloqueante): ${err.message}`);

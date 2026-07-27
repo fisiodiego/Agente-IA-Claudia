@@ -708,6 +708,28 @@ export async function processMessage(phone, message, options = {}) {
       console.log(`👤 Novo contato iniciado: ${phone} (nome: ${initialName})`);
     }
 
+    // Injeta contexto pendente: lembrete/retorno que o cron enviou quando o paciente
+    // ainda não tinha cadastro local (smartSend guardou em pending_context). Entra no
+    // histórico ANTES da mensagem dele, para o LLM responder com contexto em vez de se
+    // reapresentar (caso Lomanto 27/jul/2026). Janela de 48h — mais velho é descartado.
+    try {
+      const pcSuffix8 = String(phone).replace(/\D/g, '').slice(-8);
+      if (pcSuffix8.length === 8) {
+        const pending = db.prepare(
+          "SELECT id, content FROM pending_context WHERE phone_suffix8 = ? AND created_at > datetime('now','localtime','-48 hours') ORDER BY id"
+        ).all(pcSuffix8);
+        for (const p of pending) {
+          saveMessage(patient.id, 'assistant', p.content);
+        }
+        if (pending.length) {
+          console.log(`🔗 ${pending.length} mensagem(ns) proativa(s) injetada(s) no histórico de ${patient.name || phone}`);
+        }
+        db.prepare('DELETE FROM pending_context WHERE phone_suffix8 = ?').run(pcSuffix8);
+      }
+    } catch (err) {
+      console.warn('⚠️ Falha ao injetar contexto pendente (não-bloqueante):', err.message);
+    }
+
     // 2. Detectar resposta ao lembrete do Simples Agenda (CONFIRMAR / CANCELAR)
     // ⚠️ Deve vir ANTES de tudo — paciente pode confirmar sem nunca ter falado com a Cláudia
     const msgTrimmed = message.trim();

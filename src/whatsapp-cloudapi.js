@@ -33,7 +33,28 @@ let isConnected = false;
 const HUMAN_TAKEOVER_DURATION = 30 * 60 * 1000; // 30 minutos
 const humanTakeoverMap = new Map();   // phone -> timestamp de expiração
 const recentBotSentPhones = new Map(); // phone -> timestamp (anti-falso-positivo)
-const botSentMessageIds = new Set(); // IDs de mensagens enviadas pelo bot (limpa apos 5min)
+const botSentMessageIds = new Set(); // IDs de mensagens enviadas pelo bot (TTL 24h — ver trackBotMessageId)
+
+// TTL de 24h: o webhook de status ("entregue"/"lido") de uma mensagem NOSSA pode
+// demorar horas quando o celular do paciente está desligado/sem sinal. Com o TTL
+// antigo de 5min o ID já tinha sido esquecido quando o status chegava, e a Claudia
+// lia o eco da própria mensagem como "Dr. Diego assumiu" → takeover fantasma de
+// 30min (caso Lomanto 27/jul/2026: lembrete às 08:00, entregue às 08:10).
+// Guardar por mais tempo NÃO atrapalha o takeover real: as mensagens que o Diego
+// manda pelo app têm wamid próprio, que nunca entra neste Set.
+const BOT_MSG_ID_TTL = 24 * 60 * 60 * 1000;
+const BOT_MSG_ID_MAX = 5000; // teto de segurança (~1 dia de volume cabe folgado)
+
+function trackBotMessageId(msgId, label = 'Msg') {
+  if (!msgId) return;
+  if (botSentMessageIds.size >= BOT_MSG_ID_MAX) {
+    // Descarta o mais antigo (Set preserva ordem de inserção)
+    botSentMessageIds.delete(botSentMessageIds.values().next().value);
+  }
+  botSentMessageIds.add(msgId);
+  setTimeout(() => botSentMessageIds.delete(msgId), BOT_MSG_ID_TTL).unref?.();
+  console.log(`[BOT_TRACK] ${label} ID rastreado: ${msgId.slice(0, 30)}...`);
+}
 
 /**
  * Normaliza número BR: garante formato 55 + DDD (2 dígitos) + número (9 dígitos).
@@ -128,11 +149,7 @@ export async function sendMessage(phone, text) {
   try {
     const resData = await res.json();
     const msgId = resData?.messages?.[0]?.id || resData?._data?.whatsappMessageId;
-    if (msgId) {
-      botSentMessageIds.add(msgId);
-      setTimeout(() => botSentMessageIds.delete(msgId), 5 * 60 * 1000);
-      console.log('[BOT_TRACK] Msg ID rastreado: ' + msgId.slice(0, 30) + '...');
-    }
+    trackBotMessageId(msgId, 'Msg');
   } catch (e) {
     console.warn('[BOT_TRACK] Falha ao rastrear msg ID:', e.message);
   }
@@ -196,11 +213,7 @@ export async function sendTemplateMessage(phone, templateName, parameters = []) 
 
     // Rastrear ID e telefone do template enviado pelo bot
     const tmplMsgId = responseData?.messages?.[0]?.id || responseData?._data?.whatsappMessageId;
-    if (tmplMsgId) {
-      botSentMessageIds.add(tmplMsgId);
-      setTimeout(() => botSentMessageIds.delete(tmplMsgId), 5 * 60 * 1000);
-      console.log('[BOT_TRACK] Template ID rastreado: ' + tmplMsgId.slice(0, 30) + '...');
-    }
+    trackBotMessageId(tmplMsgId, 'Template');
     recentBotSentPhones.set(cleanPhone, Date.now() + 60000);
     setTimeout(() => recentBotSentPhones.delete(cleanPhone), 61000);
 
