@@ -312,6 +312,7 @@ export function startScheduler() {
   cron.schedule('30 14 * * *', async () => {
     await checkStaleLeads();
     await expireUnansweredLeadReengagements();
+    await expireStaleRetornoCards();
   });
 }
 
@@ -481,6 +482,61 @@ async function expireUnansweredLeadReengagements() {
     }
   } catch (err) {
     console.error('❌ Erro na expiração de reativações:', err.message);
+  }
+}
+
+// Expiração dos cards de RETORNO pós-alta: lembrete enviado há 30+ dias sem
+// resposta e sem agendamento → card vai pra "perdido" (lost_reason
+// sem_resposta_retorno). Mesma lógica dos leads: o ciclo tinha começo e meio
+// automáticos, mas não tinha fim — cards se acumulavam em "enviado" para sempre
+// (110 parados em 27/jul/2026, nenhum deles tinha voltado a consultar).
+// NÃO envia mensagem nenhuma: é só organização do Kanban.
+const RETORNO_EXPIRE_DAYS = 30;
+const RETORNO_CARD_TYPES = ['retorno_1m', 'retorno_3m', 'retorno_6m', 'retorno_12m'];
+
+async function expireStaleRetornoCards() {
+  try {
+    const { listFollowUps, updateFollowUp, getPatientAppointments } = await import('./crmApi.js');
+    const cutoffMs = RETORNO_EXPIRE_DAYS * 24 * 3600 * 1000;
+    let expired = 0;
+    let kept = 0;
+
+    for (const type of RETORNO_CARD_TYPES) {
+      const res = await listFollowUps(type, ['enviado']);
+      if (!res.ok || !Array.isArray(res.data)) {
+        console.warn(`⚠️ Expiração de retornos: falha ao listar ${type}:`, res.error || 'resposta inesperada');
+        continue;
+      }
+      for (const card of res.data) {
+        const touched = new Date(card.updatedAt || card.createdAt || 0).getTime();
+        if (!touched || Date.now() - touched < cutoffMs) { kept++; continue; }
+
+        // Segurança: se o paciente voltou a consultar (o auto-update do CRM pode
+        // ter falhado em mover o card), não marca como perdido.
+        try {
+          const apts = await getPatientAppointments(card.phone, { includeCompleted: true });
+          const arr = Array.isArray(apts?.data) ? apts.data : [];
+          const cardDay = String(card.updatedAt || card.createdAt || '').slice(0, 10);
+          if (arr.some((a) => String(a.date || '') > cardDay)) { kept++; continue; }
+        } catch { continue; /* CRM instável — tenta na próxima rodada */ }
+
+        try {
+          await updateFollowUp(card.id, {
+            status: 'perdido',
+            lostReason: 'sem_resposta_retorno',
+            notes: `${card.notes || ''}\nSem resposta ao retorno em ${RETORNO_EXPIRE_DAYS} dias — encerrado automaticamente em ${new Date().toLocaleDateString('pt-BR')}`.trim(),
+          });
+          expired++;
+        } catch (err) {
+          console.warn(`⚠️ Expiração de retornos: erro ao mover card ${card.id}:`, err.message);
+        }
+      }
+    }
+    if (expired || kept) {
+      console.log(`🗂️ Expiração de retornos: ${expired} card(s) → perdido, ${kept} mantido(s) em acompanhamento`);
+    }
+  } catch (err) {
+    console.error('❌ Erro na expiração de cards de retorno:', err.message);
   }
 }
 
