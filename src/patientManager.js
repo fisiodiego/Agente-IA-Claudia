@@ -136,7 +136,10 @@ export function confirmDischarge(patientId, dischargeDate = null) {
  * - 1 mês, 3 meses, 6 meses e 12 meses após a alta
  */
 function scheduleFollowups(patientId, dischargeDate) {
-  const base = new Date(dischargeDate + 'T09:00:00'); // enviar às 9h
+  // 12:00 UTC = 09:00 BRT. O servidor roda em UTC e o scheduled_date é gravado
+  // em UTC (toISOString), então 'T09:00:00' fazia os retornos chegarem às 06:00
+  // da manhã pro paciente — cedo demais (constatado no caso Rita, 27/jul/2026).
+  const base = new Date(dischargeDate + 'T12:00:00');
 
   const patient = queries.getPatientById.get(patientId);
   const firstAppointment = patient?.first_appointment_date
