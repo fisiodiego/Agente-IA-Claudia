@@ -22,6 +22,7 @@ import {
   noAppointmentToCancelResponse,
   availabilityHoldingMessage,
   lgpdConsentMessage,
+  lgpdShortReminder,
 } from './messageTemplates.js';
 import { saveLidMapping } from './lidMap.js';
 import db from './database.js';
@@ -1304,9 +1305,16 @@ export async function processMessage(phone, message, options = {}) {
     // (dados já coletados, mas paciente ainda não confirmou o consentimento)
     const hasAllData = patient.name && patient.name !== 'Novo Paciente';  // nascimento e telefone coletados no agendamento
 
+    // Consentimento pendente que será COBRADO NO FIM da resposta do LLM, em vez
+    // de substituí-la. Preenchido aqui (paciente já recebeu o pedido antes) ou
+    // pelo handleRegistration (primeiro pedido). Caso Alfredo Neto / Rebecca
+    // Wicks (28/jul/2026): perguntas reais eram engolidas pelo portão.
+    let pendingLgpdAsk = null;
+    let userMsgAlreadySaved = false;
+
     if (!patient.registration_complete && hasAllData && !patient.lgpd_consent) {
-      saveMessage(patient.id, 'user', message);
       if (isLgpdConfirmation(message)) {
+        saveMessage(patient.id, 'user', message);
         setLgpdConsent(patient.id);
         completePatientRegistration(patient.id, {
           name: patient.name,
@@ -1317,8 +1325,15 @@ export async function processMessage(phone, message, options = {}) {
         const reply = `Perfeito, *${patient.name}*! Cadastro concluído com sucesso.\n\nComo posso te ajudar hoje?`;
         saveMessage(patient.id, 'assistant', reply);
         return reply;
+      } else if (hasRealQuestion(message)) {
+        // Trouxe uma dúvida real: deixa seguir pro LLM responder e cobra o
+        // consentimento no fim. NÃO salva a msg aqui — o caminho do LLM salva
+        // (linha "1. Salvar mensagem do usuário"), senão duplicaria.
+        pendingLgpdAsk = lgpdShortReminder();
+        console.log(`💬 Aguardando LGPD mas ${patient.name} perguntou algo — respondendo + cobrando consentimento`);
       } else {
-        // Reenviar mensagem LGPD se paciente não confirmou
+        // Sem pergunta: reenvia o pedido de consentimento como antes
+        saveMessage(patient.id, 'user', message);
         const reply = lgpdConsentMessage(patient.name);
         saveMessage(patient.id, 'assistant', reply);
         return reply;
@@ -1326,7 +1341,8 @@ export async function processMessage(phone, message, options = {}) {
     }
 
     // 3c. Se o cadastro ainda está incompleto, tentar coletar dados
-    if (!patient.registration_complete) {
+    // (pulado quando já decidimos responder a pergunta + cobrar o consentimento)
+    if (!patient.registration_complete && !pendingLgpdAsk) {
       // Para pacientes LID sem nome, tentar buscar no CRM antes de pedir dados
       const isLID = !/^55\d{10,11}$/.test(phone) && !/^\d{10,11}$/.test(phone);
       if (isLID && (!patient.name || patient.name === 'Novo Paciente')) {
@@ -1378,7 +1394,17 @@ export async function processMessage(phone, message, options = {}) {
           console.log(`⚠️ Erro ao buscar LID no CRM: ${err.message}`);
         }
       }
-      return await handleRegistration(patient, message);
+      const regResult = await handleRegistration(patient, message);
+      // handleRegistration devolve um marcador quando acabou de coletar os dados
+      // MAS a mensagem também trazia uma pergunta: nesse caso não retornamos o
+      // texto da LGPD puro — seguimos pro LLM responder e cobramos no fim.
+      if (regResult && typeof regResult === 'object' && regResult.lgpdAskThenAnswer) {
+        pendingLgpdAsk = regResult.lgpdAskThenAnswer;
+        userMsgAlreadySaved = true; // handleRegistration já gravou a msg do paciente
+        console.log(`💬 Cadastro coletado mas ${patient.name} perguntou algo — respondendo + pedindo consentimento`);
+      } else {
+        return regResult;
+      }
     }
 
 
@@ -1430,7 +1456,10 @@ export async function processMessage(phone, message, options = {}) {
     const history = getConversationHistory(patient.id);
 
     // 4. Salvar mensagem do usuário
-    saveMessage(patient.id, 'user', message);
+    // (o handleRegistration já salva no início dele — não duplicar quando viemos de lá)
+    if (!userMsgAlreadySaved) {
+      saveMessage(patient.id, 'user', message);
+    }
 
     // 5. Chamar Claude API
     // Trunca histórico para últimas 40 mensagens (20 pares user/assistant) — evita crescimento indefinido
@@ -1578,7 +1607,12 @@ export async function processMessage(phone, message, options = {}) {
       }
     }
 
-    // 6. Salvar resposta do assistente
+    // 6. Cobrar o consentimento pendente no FIM da resposta (em vez de substituí-la)
+    if (pendingLgpdAsk) {
+      assistantReply = `${assistantReply}\n\n${pendingLgpdAsk}`;
+    }
+
+    // 6b. Salvar resposta do assistente
     saveMessage(patient.id, 'assistant', assistantReply);
 
     // 7. Verificar se a resposta indica alta confirmada
@@ -1781,6 +1815,11 @@ Não inclua explicações, apenas o JSON.`,
     }
     console.log(`📋 Dados coletados para ${updatedName} — aguardando consentimento LGPD`);
     const reply = lgpdConsentMessage(updatedName);
+    // Se a mesma rajada trouxe uma pergunta, devolve marcador: o processMessage
+    // deixa o LLM responder e anexa este texto no fim (não salva aqui).
+    if (hasRealQuestion(message)) {
+      return { lgpdAskThenAnswer: reply };
+    }
     saveMessage(patient.id, 'assistant', reply);
     return reply;
   }
@@ -1807,6 +1846,19 @@ function isLgpdConfirmation(message) {
   const lines = normalize(message).split('\n').map((l) => l.trim()).filter(Boolean);
   if (lines.some((l) => CONFIRM.test(l))) return true;
   return /concordo|aceito|autorizo/.test(normalize(message));
+}
+
+/**
+ * Detecta se a mensagem traz uma dúvida/assunto real além do cadastro.
+ * Usado no portão do consentimento: com pergunta, a Cláudia responde e cobra o
+ * consentimento no fim; sem pergunta, só pede o consentimento (comportamento antigo).
+ * Liberal de propósito — falso positivo aqui só faz o LLM responder algo útil.
+ */
+function hasRealQuestion(message) {
+  const t = String(message).toLowerCase()
+    .normalize('NFD').replace(/[̀-ͯ]/g, '');
+  if (t.includes('?')) return true;
+  return /\b(quanto|qual|quais|quando|onde|como|porque|por que|tem|teria|voces|atende|atendem|horario|horarios|valor|valores|preco|precos|plano|planos|convenio|agendar|marcar|remarcar|consulta|sessao|funciona|endereco|fica|aceita|trabalha)\b/.test(t);
 }
 
 /**

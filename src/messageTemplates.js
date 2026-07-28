@@ -247,6 +247,16 @@ Você concorda? (Responda *Sim* para confirmar)`;
 }
 
 /**
+ * Lembrete curto do consentimento, anexado ao fim de uma resposta normal.
+ * Usado quando o paciente pergunta algo antes de consentir: a Cláudia responde
+ * a dúvida e cobra o consentimento em uma linha, em vez de repetir o texto
+ * inteiro da LGPD (que soava robótico e engolia a pergunta).
+ */
+export function lgpdShortReminder() {
+  return `_Só faltou seu *Sim* para o uso dos seus dados (LGPD), aí concluo seu cadastro._`;
+}
+
+/**
  * Mensagem enviada quando o paciente pergunta sobre horários disponíveis.
  * Cláudia sinaliza que vai verificar e passa a conversa para o Dr. Diego.
  */
