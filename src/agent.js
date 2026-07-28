@@ -1796,10 +1796,17 @@ Não inclua explicações, apenas o JSON.`,
  * Detecta se o paciente está confirmando o consentimento LGPD.
  */
 function isLgpdConfirmation(message) {
-  const text = message.trim().toLowerCase()
+  const normalize = (s) => String(s).trim().toLowerCase()
     .normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-  return /^(sim|s|ok|concordo|aceito|autorizo|de acordo|confirmo|certo|claro|pode|tudo bem)$/.test(text)
-    || /concordo|aceito|autorizo/.test(text);
+  const CONFIRM = /^(sim|s|ok|concordo|aceito|autorizo|de acordo|confirmo|certo|claro|pode|tudo bem)[!\.]*$/;
+
+  // O debounce agrupa mensagens seguidas numa s\u00f3 ("Sou irm\u00e3o de Rog\u00e9rio\nSim"),
+  // ent\u00e3o o "Sim" quase nunca \u00e9 a mensagem INTEIRA \u2014 a regex ancorada em ^...$
+  // no texto todo deixava o paciente preso repetindo o pedido de consentimento
+  // (casos Alfredo Neto 28/jul/2026 e Rebecca Wicks 25/mar/2026). Checa linha a linha.
+  const lines = normalize(message).split('\n').map((l) => l.trim()).filter(Boolean);
+  if (lines.some((l) => CONFIRM.test(l))) return true;
+  return /concordo|aceito|autorizo/.test(normalize(message));
 }
 
 /**
