@@ -660,6 +660,24 @@ export async function processMessage(phone, message, options = {}) {
         } else if (pushNameHasSurname) {
           // Só buscar por nome se pushName tem sobrenome (mais confiável)
           nameResult = await searchPatientByName(pushName);
+
+          // GUARD ANTI-HOMÔNIMO: se o wa_id É um telefone BR utilizável, a busca
+          // por TELEFONE (acima) já rodou e falhou — logo o cadastro achado por
+          // NOME tem outro número e provavelmente é OUTRA PESSOA. Nomes comuns
+          // colidem: o pushName "João Fonseca" (lead novo, DDD 73) casou com
+          // "João Lucas Pimentel Fonseca" (DDD 71) pela regra "primeiro nome +
+          // último sobrenome" da busca do CRM, e a consulta foi criada no cadastro
+          // errado (29/jul/2026). Para LID (sem telefone utilizável) o nome segue
+          // sendo o único sinal disponível e o match continua valendo.
+          const waDigits = String(phone).replace(/\D/g, '');
+          const isUsablePhone = /^(55)?\d{10,11}$/.test(waDigits);
+          if (isUsablePhone && nameResult.ok && nameResult.data?.found) {
+            const crmPhone8 = String(nameResult.data.patient?.phone || '').replace(/\D/g, '').slice(-8);
+            if (crmPhone8 !== waDigits.slice(-8)) {
+              console.log(`🚫 Match por nome DESCARTADO: pushName "${pushName}" → "${nameResult.data.patient?.name}" (CRM ...${crmPhone8} ≠ WhatsApp ...${waDigits.slice(-8)}) — tratando como contato novo`);
+              nameResult = { ok: false, data: null };
+            }
+          }
         }
         if (nameResult.ok && nameResult.data?.found && nameResult.data.patient) {
           const crmPatient = nameResult.data.patient;
