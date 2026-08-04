@@ -1539,11 +1539,78 @@ async function sendWeeklyReport() {
     });
 
     console.log('✅ Relatório semanal enviado para Dr. Diego');
+
+    // Alerta de planos vencidos, logo após o relatório (mensagem separada porque
+    // o template do relatório tem 10 variáveis fixas aprovadas na Meta e
+    // parâmetro de template não aceita quebra de linha).
+    await sendExpiredPackagesAlert();
   } catch (err) {
     console.error('❌ Erro geral no relatório semanal:', err.message);
   }
 }
 
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Alerta semanal: planos de tratamento que passaram do prazo
+// Enviado junto com o relatório semanal, SÓ quando existe algum vencido.
+// O prazo não é um campo no banco — é calculado pelo CRM (2 meses da compra;
+// pacote "manutenção" = 1 mês por sessão). Cobre o ponto cego reportado pelo
+// Diego em 30/jul/2026: a Claudia já cobrava o paciente, mas nada avisava a ELE
+// que havia sessões pagas e não entregues (4 casos, R$ 1.500, até 78 dias).
+// ═══════════════════════════════════════════════════════════════════════════════
+
+async function sendExpiredPackagesAlert() {
+  try {
+    const result = await getStalePackages();
+    if (!result.ok || !Array.isArray(result.data)) return;
+
+    const todayStr = new Date(Date.now() - 3 * 3600 * 1000).toISOString().slice(0, 10);
+    const expired = result.data
+      .filter((pkg) => pkg.deadlineDate && pkg.deadlineDate < todayStr && (pkg.freeSessions || 0) > 0)
+      .map((pkg) => ({
+        ...pkg,
+        daysExpired: Math.floor(
+          (new Date(todayStr + 'T12:00:00') - new Date(pkg.deadlineDate + 'T12:00:00')) / 86400000
+        ),
+      }))
+      .sort((a, b) => b.daysExpired - a.daysExpired);
+
+    if (expired.length === 0) {
+      console.log('📦 Nenhum plano de tratamento vencido — alerta não enviado');
+      return;
+    }
+
+    const totalSessions = expired.reduce((s, p) => s + (p.freeSessions || 0), 0);
+    const totalValue = expired.reduce((s, p) => {
+      const perSession = (p.amountTotal || 0) / (p.totalSessions || 1);
+      return s + perSession * (p.freeSessions || 0);
+    }, 0);
+
+    // Parâmetro de template não aceita quebra de linha nem 5+ espaços seguidos:
+    // lista separada por vírgula, limitada para não estourar o tamanho.
+    const MAX_NAMES = 8;
+    const names = expired.slice(0, MAX_NAMES)
+      .map((p) => `${String(p.patientName || 'Paciente').split(' ')[0]} (${p.daysExpired}d)`)
+      .join(', ')
+      + (expired.length > MAX_NAMES ? ` e mais ${expired.length - MAX_NAMES}` : '');
+
+    const { sendTemplateMessage } = await import('./whatsapp-cloudapi.js');
+    const ok = await sendTemplateMessage(DIEGO_PHONE, 'relatorio_pacotes_vencidos', [
+      String(expired.length),
+      String(totalSessions),
+      totalValue.toFixed(2).replace('.', ','),
+      names,
+    ]);
+
+    if (ok) {
+      console.log(`📦 Alerta de planos vencidos enviado: ${expired.length} plano(s), ${totalSessions} sessão(ões)`);
+    } else {
+      console.warn('⚠️ Template relatorio_pacotes_vencidos falhou (pode não estar aprovado ainda)');
+    }
+  } catch (err) {
+    console.error('❌ Erro no alerta de planos vencidos:', err.message);
+  }
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Notificação de pacote concluído
