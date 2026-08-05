@@ -1591,7 +1591,9 @@ async function runPackageExpiryCycle() {
 
   // Paciente voltou a agendar → sai da lista de parados → cancela o processo.
   // Apaga o registro pra que um sumiço futuro recomece com aviso.
-  const tracked = db.prepare('SELECT package_id FROM package_expiry WHERE closed_at IS NULL').all();
+  // skip=1 é exclusão manual (Diego trata o caso pessoalmente) — não entra na
+  // limpeza pra que a exclusão continue valendo mesmo se o paciente oscilar.
+  const tracked = db.prepare('SELECT package_id FROM package_expiry WHERE closed_at IS NULL AND COALESCE(skip,0) = 0').all();
   for (const t of tracked) {
     if (!staleIds.has(t.package_id)) {
       db.prepare('DELETE FROM package_expiry WHERE package_id = ?').run(t.package_id);
@@ -1603,8 +1605,13 @@ async function runPackageExpiryCycle() {
     if ((pkg.freeSessions || 0) <= 0) continue;
     if ((pkg.daysSinceLastActivity || 0) < PLAN_WARN_DAYS) continue;
     if (!isValidBRPhone(pkg.phone)) continue;
-    const already = db.prepare('SELECT warned_at FROM package_expiry WHERE package_id = ?').get(pkg.packageId);
-    if (already) continue;
+    const already = db.prepare('SELECT warned_at, skip FROM package_expiry WHERE package_id = ?').get(pkg.packageId);
+    if (already) {
+      if (already.skip) {
+        console.log(`⏭️ Ciclo de vencimento pulado (exclusão manual): ${pkg.patientName}`);
+      }
+      continue;
+    }
 
     const firstName = String(pkg.patientName || '').split(' ')[0] || 'tudo bem';
     const ok = await sendTemplateFn(pkg.phone, 'plano_aviso_encerramento', [firstName, String(pkg.freeSessions)]);
@@ -1621,6 +1628,7 @@ async function runPackageExpiryCycle() {
   // ── 2. Encerramento (30 dias após o aviso) ──────────────────────────────
   const toClose = db.prepare(
     `SELECT * FROM package_expiry WHERE closed_at IS NULL AND warned_at IS NOT NULL
+       AND COALESCE(skip,0) = 0
        AND warned_at <= datetime('now','localtime', ?)`
   ).all(`-${PLAN_CLOSE_AFTER_WARN} days`);
 

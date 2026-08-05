@@ -197,13 +197,18 @@ db.exec(`
     phone       TEXT NOT NULL,
     patient_name TEXT,
     warned_at   TEXT,
-    closed_at   TEXT
+    closed_at   TEXT,
+    skip        INTEGER DEFAULT 0,  -- 1 = fora do ciclo (Diego trata na mão)
+    skip_reason TEXT
   );
   CREATE TABLE IF NOT EXISTS credit_expiry_notices (
     credit_id  TEXT PRIMARY KEY,
     warned_at  TEXT DEFAULT (datetime('now','localtime'))
   );
 `);
+// Migração (tabela pode já existir sem estas colunas)
+try { db.exec("ALTER TABLE package_expiry ADD COLUMN skip INTEGER DEFAULT 0"); } catch { /* já existe */ }
+try { db.exec("ALTER TABLE package_expiry ADD COLUMN skip_reason TEXT"); } catch { /* já existe */ }
 
 // Contexto pendente: mensagem proativa (lembrete/retorno) enviada pelo cron a quem
 // AINDA NÃO tem cadastro no banco local — o smartSend não teve onde gravar. Quando
