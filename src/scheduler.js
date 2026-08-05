@@ -308,6 +308,11 @@ export function startScheduler() {
     await sendSameDayReminders();
   });
 
+  // ── Ciclo de encerramento de plano por inatividade: 12h BRT (15h UTC) ──
+  cron.schedule('0 15 * * *', async () => {
+    await runPackageExpiryCycle();
+  });
+
   // ── Reengajamento de leads sem agendamento: 11:30 BRT (14:30 UTC) ──
   cron.schedule('30 14 * * *', async () => {
     await checkStaleLeads();
@@ -1549,6 +1554,140 @@ async function sendWeeklyReport() {
   }
 }
 
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Ciclo de encerramento de plano de tratamento por inatividade
+// Política definida pelo Diego em 31/jul/2026 (Proposta B):
+//   60 dias sem vir      → avisa "encerra em 30 dias"
+//   30 dias após o aviso → encerra e converte em crédito (validade 6 meses)
+//   30 dias antes do venc. do crédito → avisa
+//   no vencimento        → expira em silêncio (avisar "você perdeu" não ajuda)
+//
+// A contagem é por tempo SEM VIR, nunca pela data da compra: paciente que usa o
+// plano num ritmo lento (1x/mês, caso Edmara) não pode ser encerrado como se
+// tivesse sumido. Se ele voltar a agendar, o processo é cancelado e a contagem
+// zera — se sumir de novo mais tarde, recebe o aviso outra vez antes de encerrar.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const PLAN_WARN_DAYS = 60;      // dias sem vir → aviso de encerramento
+const PLAN_CLOSE_AFTER_WARN = 30; // dias após o aviso → encerra
+const CREDIT_VALIDITY_MONTHS = 6;
+
+async function runPackageExpiryCycle() {
+  if (!sendTemplateFn) return;
+  const { getStalePackages, closeExpiredPackage, getExpiringCredits, expireCredit } = await import('./crmApi.js');
+
+  // ── 1. Aviso de encerramento (60 dias sem vir) ──────────────────────────
+  let stale = [];
+  try {
+    const res = await getStalePackages();
+    stale = (res.ok && Array.isArray(res.data)) ? res.data : [];
+  } catch (err) {
+    console.error('❌ Ciclo de vencimento: falha ao listar pacotes:', err.message);
+    return; // sem a lista não dá pra decidir nada com segurança
+  }
+
+  const staleIds = new Set(stale.map((p) => p.packageId));
+
+  // Paciente voltou a agendar → sai da lista de parados → cancela o processo.
+  // Apaga o registro pra que um sumiço futuro recomece com aviso.
+  const tracked = db.prepare('SELECT package_id FROM package_expiry WHERE closed_at IS NULL').all();
+  for (const t of tracked) {
+    if (!staleIds.has(t.package_id)) {
+      db.prepare('DELETE FROM package_expiry WHERE package_id = ?').run(t.package_id);
+      console.log(`↩️ Ciclo de vencimento cancelado (paciente voltou a agendar): pacote ${t.package_id}`);
+    }
+  }
+
+  for (const pkg of stale) {
+    if ((pkg.freeSessions || 0) <= 0) continue;
+    if ((pkg.daysSinceLastActivity || 0) < PLAN_WARN_DAYS) continue;
+    if (!isValidBRPhone(pkg.phone)) continue;
+    const already = db.prepare('SELECT warned_at FROM package_expiry WHERE package_id = ?').get(pkg.packageId);
+    if (already) continue;
+
+    const firstName = String(pkg.patientName || '').split(' ')[0] || 'tudo bem';
+    const ok = await sendTemplateFn(pkg.phone, 'plano_aviso_encerramento', [firstName, String(pkg.freeSessions)]);
+    if (ok) {
+      db.prepare("INSERT INTO package_expiry (package_id, phone, patient_name, warned_at) VALUES (?, ?, ?, datetime('now','localtime'))")
+        .run(pkg.packageId, pkg.phone, pkg.patientName || '');
+      console.log(`⚠️ Aviso de encerramento enviado: ${pkg.patientName} (${pkg.daysSinceLastActivity}d sem vir, ${pkg.freeSessions} sessões)`);
+      await new Promise((r) => setTimeout(r, 2000));
+    } else {
+      console.warn(`⚠️ Falha ao enviar aviso de encerramento para ${pkg.patientName}`);
+    }
+  }
+
+  // ── 2. Encerramento (30 dias após o aviso) ──────────────────────────────
+  const toClose = db.prepare(
+    `SELECT * FROM package_expiry WHERE closed_at IS NULL AND warned_at IS NOT NULL
+       AND warned_at <= datetime('now','localtime', ?)`
+  ).all(`-${PLAN_CLOSE_AFTER_WARN} days`);
+
+  for (const row of toClose) {
+    const pkg = stale.find((p) => p.packageId === row.package_id);
+    if (!pkg) continue; // não está mais parado — o bloco acima já limpou
+
+    try {
+      const res = await closeExpiredPackage(row.package_id, CREDIT_VALIDITY_MONTHS);
+      if (!res.ok) {
+        console.warn(`⚠️ Falha ao encerrar pacote ${row.package_id}:`, res.error);
+        continue;
+      }
+      const { freeSessions, creditAmount, expiresAt } = res.data;
+      db.prepare("UPDATE package_expiry SET closed_at = datetime('now','localtime') WHERE package_id = ?").run(row.package_id);
+
+      const firstName = String(row.patient_name || '').split(' ')[0] || 'tudo bem';
+      const [y, m, d] = String(expiresAt).split('-');
+      await sendTemplateFn(row.phone, 'plano_encerrado_credito', [
+        firstName,
+        String(freeSessions),
+        Number(creditAmount).toFixed(2).replace('.', ','),
+        `${d}/${m}/${y}`,
+      ]);
+      console.log(`🔒 Plano encerrado: ${row.patient_name} — crédito R$ ${creditAmount} até ${expiresAt}`);
+      await new Promise((r) => setTimeout(r, 2000));
+    } catch (err) {
+      console.error(`❌ Erro ao encerrar pacote ${row.package_id}:`, err.message);
+    }
+  }
+
+  // ── 3. Aviso de vencimento do crédito (30 dias antes) ───────────────────
+  try {
+    const res = await getExpiringCredits({ within: 30 });
+    for (const c of (res.ok && Array.isArray(res.data) ? res.data : [])) {
+      if (db.prepare('SELECT 1 FROM credit_expiry_notices WHERE credit_id = ?').get(c.creditId)) continue;
+      if (!isValidBRPhone(c.phone)) continue;
+      const firstName = String(c.patientName || '').split(' ')[0] || 'tudo bem';
+      const [y, m, d] = String(c.expiresAt).split('-');
+      const ok = await sendTemplateFn(c.phone, 'credito_aviso_vencimento', [
+        firstName,
+        Number(c.currentBalance).toFixed(2).replace('.', ','),
+        `${d}/${m}/${y}`,
+      ]);
+      if (ok) {
+        db.prepare('INSERT OR IGNORE INTO credit_expiry_notices (credit_id) VALUES (?)').run(c.creditId);
+        console.log(`⏳ Aviso de vencimento de crédito enviado: ${c.patientName} (R$ ${c.currentBalance} até ${c.expiresAt})`);
+        await new Promise((r) => setTimeout(r, 2000));
+      }
+    }
+  } catch (err) {
+    console.error('❌ Erro no aviso de vencimento de crédito:', err.message);
+  }
+
+  // ── 4. Expirar créditos vencidos (sem mensagem) ─────────────────────────
+  try {
+    const res = await getExpiringCredits({ due: true });
+    for (const c of (res.ok && Array.isArray(res.data) ? res.data : [])) {
+      const r = await expireCredit(c.creditId);
+      if (r.ok && r.data?.expired) {
+        console.log(`💤 Crédito expirado: ${c.patientName} — R$ ${r.data.expired}`);
+      }
+    }
+  } catch (err) {
+    console.error('❌ Erro ao expirar créditos:', err.message);
+  }
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Alerta semanal: planos de tratamento que passaram do prazo

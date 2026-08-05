@@ -284,6 +284,27 @@ export async function createFollowUp(body) {
   });
 }
 
+// ── Ciclo de encerramento de plano por inatividade ─────────────────────────
+
+// Encerra o plano e converte as sessões não usadas em crédito (validade em meses)
+export async function closeExpiredPackage(packageId, validityMonths = 6) {
+  return crmFetch(`/packages/${encodeURIComponent(packageId)}/close-expired`, {
+    method: 'POST',
+    body: JSON.stringify({ validityMonths }),
+  });
+}
+
+// Créditos com validade: perto de vencer (within dias) ou já vencidos (due=true)
+export async function getExpiringCredits({ within = 30, due = false } = {}) {
+  const params = due ? 'due=1' : `within=${within}`;
+  return crmFetch(`/credits/expiring?${params}`);
+}
+
+// Expira um crédito vencido (lança o débito de ajuste)
+export async function expireCredit(creditId) {
+  return crmFetch(`/credits/${encodeURIComponent(creditId)}/expire`, { method: 'POST' });
+}
+
 // Lista follow-ups por tipo/status (usado pelo reengajamento de leads).
 // statuses: array de status do Kanban (ex.: ['pendente','enviado','respondeu']).
 export async function listFollowUps(type = 'lead', statuses = ['pendente', 'enviado', 'respondeu']) {

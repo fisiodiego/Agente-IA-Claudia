@@ -187,6 +187,24 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_lead_reeng_suffix ON lead_reengagement(phone_suffix8);
 `);
 
+// Ciclo de encerramento de plano por inatividade (política de 31/jul/2026):
+// controla o que já foi avisado/encerrado pra não repetir mensagem. A linha é
+// APAGADA se o paciente voltar a agendar — assim, se ele sumir de novo no futuro,
+// o ciclo recomeça do zero (aviso antes de encerrar).
+db.exec(`
+  CREATE TABLE IF NOT EXISTS package_expiry (
+    package_id  TEXT PRIMARY KEY,
+    phone       TEXT NOT NULL,
+    patient_name TEXT,
+    warned_at   TEXT,
+    closed_at   TEXT
+  );
+  CREATE TABLE IF NOT EXISTS credit_expiry_notices (
+    credit_id  TEXT PRIMARY KEY,
+    warned_at  TEXT DEFAULT (datetime('now','localtime'))
+  );
+`);
+
 // Contexto pendente: mensagem proativa (lembrete/retorno) enviada pelo cron a quem
 // AINDA NÃO tem cadastro no banco local — o smartSend não teve onde gravar. Quando
 // a pessoa responder, o agent cria o cadastro e injeta isto no histórico, para o LLM
