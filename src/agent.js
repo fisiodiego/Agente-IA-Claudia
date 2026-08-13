@@ -804,7 +804,17 @@ export async function processMessage(phone, message, options = {}) {
     // paciente respondeu "Confirmado", atalho disparou "consulta confirmada" p/ consulta
     // inexistente e bagunçou. Guard anterior (isReschedulingContext) não pegava pois a
     // oferta de horário não usa as palavras "reagendar/mudar/trocar".
-    const isSlotOfferContext = /hor[aá]rios?\s+(livres?|dispon[ií]ve)|qual\s+hor[aá]rio|algum\s+(desses|desse|deles)|prefere\s+(manh|tarde|noite)|(manh[ãa]|tarde|noite)\s+ou\s+(manh[ãa]|tarde|noite)/i.test(lastAssistantMsg);
+    // Sinal mais confiável de OFERTA: a própria Claudia PERGUNTANDO se quer
+    // confirmar ("Quer confirmar esse horário?"). Nesse caso o "Confirmar" do
+    // paciente é a RESPOSTA à pergunta — é escolha de horário, não confirmação
+    // de presença. Antes o guard só reconhecia o plural "horários disponíveis";
+    // quando sobrava um único horário a Claudia escrevia "temos disponível: 13h"
+    // e o guard falhava → o atalho de presença interceptava, ela respondia
+    // "Consulta confirmada!" e a consulta NUNCA era criada (caso Tiala Ramos,
+    // 12/ago/2026 — ficou sem o agendamento de 13/08 13h).
+    // Os lembretes NÃO casam: eles dizem "confirme sua presença respondendo
+    // CONFIRMAR", nunca "quer/deseja confirmar".
+    const isSlotOfferContext = /hor[aá]rios?\s+(livres?|dispon[ií]ve)|qual\s+hor[aá]rio|algum\s+(desses|desse|deles)|prefere\s+(manh|tarde|noite)|(manh[ãa]|tarde|noite)\s+ou\s+(manh[ãa]|tarde|noite)|(quer|deseja|posso|gostaria\s+de)\s+confirmar|temos\s+dispon[ií]ve|confirmar\s+(esse|este)\s+hor[aá]rio/i.test(lastAssistantMsg);
 
     const isConfirming = (isExplicitConfirm || isGenericYes) && !isReschedulingContext && !isSlotOfferContext;
     const isCancelling = isShortEnough && /^(cancelar?|cancelado|cancelo|nao\s*vou|não\s*vou|nao\s*consigo|não\s*consigo)[!\.\s]*$/i.test(msgTrimmed);
