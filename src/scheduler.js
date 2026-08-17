@@ -1668,7 +1668,7 @@ async function runPackageExpiryCycle() {
       if (!isValidBRPhone(c.phone)) continue;
       const firstName = String(c.patientName || '').split(' ')[0] || 'tudo bem';
       const [y, m, d] = String(c.expiresAt).split('-');
-      const ok = await sendTemplateFn(c.phone, 'credito_aviso_vencimento', [
+      const ok = await sendTemplateFn(c.phone, 'credito_aviso_vencimento_c', [
         firstName,
         Number(c.currentBalance).toFixed(2).replace('.', ','),
         `${d}/${m}/${y}`,
