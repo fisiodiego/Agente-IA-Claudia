@@ -32,7 +32,10 @@ let isConnected = false;
 // ─── Controle de Tomada de Controle Humana ──────────────────────────────────
 const HUMAN_TAKEOVER_DURATION = 30 * 60 * 1000; // 30 minutos
 const humanTakeoverMap = new Map();   // phone -> timestamp de expiração
-const recentBotSentPhones = new Map(); // phone -> timestamp (anti-falso-positivo)
+const recentBotSentPhones = new Map();
+// Geração do processamento por telefone: usada pela ENTREGA ATRASADA para não
+// mandar uma resposta antiga depois que uma rodada mais nova já respondeu.
+const processGeneration = new Map(); // phone -> timestamp (anti-falso-positivo)
 const botSentMessageIds = new Set(); // IDs de mensagens enviadas pelo bot (TTL 24h — ver trackBotMessageId)
 
 // TTL de 24h: o webhook de status ("entregue"/"lido") de uma mensagem NOSSA pode
@@ -285,6 +288,10 @@ async function processBuffered(phone) {
   // Adquirir lock e processar
   processingLock.set(phone, true);
   const combinedText = texts.join('\n');
+  const myGeneration = (processGeneration.get(phone) ?? 0) + 1;
+  processGeneration.set(phone, myGeneration);
+  let processing = null;
+  let timedOut = false;
 
   try {
     // Timeout de segurança: se processMessage pendurar (ex: fetch ao CRM/Anthropic/
@@ -292,11 +299,17 @@ async function processBuffered(phone) {
     // cai no catch → o finally LIBERA o lock. Sem isto, um await pendurado deixava
     // a conversa morta pra sempre (caso Rafael Fonseca, 15/jun/2026: cadastro travou
     // no nome, lock nunca liberado, paciente no silêncio até reinício manual).
-    const PROCESS_TIMEOUT_MS = 45000;
+    // 90s (era 45s): pedido complexo pode exigir muitas consultas de agenda —
+    // o caso Roberto Ventura (19/ago/2026) fez 14 check_availability e estourou.
+    const PROCESS_TIMEOUT_MS = 90000;
+    processing = processMessage(phone, combinedText, { pushName });
     const result = await Promise.race([
-      processMessage(phone, combinedText, { pushName }),
+      processing,
       new Promise((_, reject) =>
-        setTimeout(() => reject(new Error(`processMessage timeout ${PROCESS_TIMEOUT_MS}ms`)), PROCESS_TIMEOUT_MS),
+        setTimeout(() => {
+          timedOut = true;
+          reject(new Error(`processMessage timeout ${PROCESS_TIMEOUT_MS}ms`));
+        }, PROCESS_TIMEOUT_MS),
       ),
     ]);
 
@@ -325,6 +338,33 @@ async function processBuffered(phone) {
     }
   } catch (error) {
     console.error('❌ Erro ao processar mensagem:', error.message);
+
+    // ENTREGA ATRASADA: o timeout só para de ESPERAR — não joga fora o trabalho.
+    // Antes, a resposta que ficasse pronta depois do limite era descartada, mas
+    // já tinha sido gravada no histórico: o paciente ficava no silêncio e a
+    // Claudia "achava" que havia respondido (caso Roberto Ventura, 19/ago/2026 —
+    // tabela de horários pronta, nunca entregue, paciente com 10 sessões
+    // prescritas sem resposta). Agora entregamos assim que ficar pronta.
+    if (timedOut && processing) {
+      processing
+        .then(async (late) => {
+          const lateReply = (late && typeof late === 'object') ? late.reply : late;
+          if (!lateReply) return;
+          // Uma rodada mais nova já assumiu a conversa → a resposta dela vale, não esta
+          if (processGeneration.get(phone) !== myGeneration) {
+            console.log(`⏭️ Resposta atrasada de ${phone} descartada — já houve processamento mais novo`);
+            return;
+          }
+          if (isHumanActive(phone)) {
+            console.log(`👨‍⚕️ Resposta atrasada de ${phone} descartada — Dr. Diego assumiu`);
+            return;
+          }
+          await sendMessage(phone, lateReply);
+          console.log(`📤 Resposta ATRASADA entregue a ${phone} (levou mais que o limite)`);
+          if (late?.activateHumanTakeover) activateHumanTakeover(phone);
+        })
+        .catch((err) => console.warn('⚠️ Falha na entrega atrasada:', err.message));
+    }
   } finally {
     // Liberar lock
     processingLock.delete(phone);
