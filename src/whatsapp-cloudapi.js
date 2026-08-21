@@ -6,6 +6,7 @@
  */
 
 import express from 'express';
+import { extrairIp, checarOrigemMeta, TOTAL_FAIXAS } from './metaIps.js';
 import { processMessage } from './agent.js';
 import { isValidPhone } from './lidMap.js';
 import { logMessage, wasRecentBotOutbound } from './patientManager.js';
@@ -16,6 +17,8 @@ const ACCESS_TOKEN    = process.env.WA_ACCESS_TOKEN;
 const VERIFY_TOKEN    = process.env.WA_VERIFY_TOKEN || 'holiz_claudia_2026';
 const WEBHOOK_PORT    = parseInt(process.env.WEBHOOK_PORT || '8443', 10);
 const CHAKRA_PLUGIN_ID = process.env.CHAKRA_PLUGIN_ID;
+// Conta WhatsApp da clínica — payload de outra conta é descartado
+const WABA_ID = process.env.WABA_ID || '122098688444003982';
 const GRAPH_API_URL   = CHAKRA_PLUGIN_ID
   ? `https://api.chakrahq.com/v1/ext/plugin/whatsapp/${CHAKRA_PLUGIN_ID}/api/v22.0/${PHONE_NUMBER_ID}/messages`
   : `https://graph.facebook.com/v21.0/${PHONE_NUMBER_ID}/messages`;
@@ -542,6 +545,44 @@ async function handleInstagramWebhook(body) {
 }
 function createWebhookServer() {
   const app = express();
+  // ── AUTENTICAÇÃO DE ORIGEM DO WEBHOOK ──────────────────────────────────
+  // O /webhook aceitava qualquer payload: dava pra FORJAR mensagem de paciente
+  // e dirigir o agente (achado crítico da revisão de 21/ago/2026). A WABA é da
+  // ChakraHQ, então não temos App Secret pra validar a assinatura HMAC da Meta
+  // — autenticamos pela ORIGEM (faixas AS32934).
+  //
+  // MODO PADRÃO = SOMBRA (só observa e loga). Motivo: a lista de faixas é um
+  // retrato de 21/ago; se a Meta passar a entregar de um prefixo novo, bloquear
+  // deixaria a clínica MUDA e a Meta acabaria desativando a inscrição. Rejeitar
+  // é pior que a própria vulnerabilidade. Depois de semanas de sombra com 100%
+  // de acerto, ligar com WEBHOOK_IP_CHECK=enforce.
+  //   sombra  (padrão) → só loga  ·  enforce → 403  ·  off → nem loga
+  // Roda ANTES do express.json(): request rejeitado nem chega a parsear body.
+  const MODO_IP = (process.env.WEBHOOK_IP_CHECK || 'sombra').toLowerCase();
+  const LOCAIS = new Set(['127.0.0.1', '::1', 'localhost']);
+  let forasteiros = 0;
+  console.log(`🛡️ Origem do webhook: modo ${MODO_IP.toUpperCase()} — ${TOTAL_FAIXAS} faixas da Meta`);
+
+  app.use(['/webhook', '/webhook-chakra'], (req, res, next) => {
+    // GET = handshake de verificação da Meta, já autenticado por hub.verify_token.
+    // Não filtrar por IP aqui evita criar uma falha extra justo ao religar a inscrição.
+    if (req.method === 'GET' || MODO_IP === 'off') return next();
+    const ip = extrairIp(req);
+    if (LOCAIS.has(ip)) return next();
+    const daMeta = checarOrigemMeta(ip);
+    if (daMeta === false) {
+      forasteiros++;
+      if (MODO_IP === 'enforce') {
+        console.warn(`🚫 Webhook REJEITADO — origem ${ip} fora da Meta (${req.method} ${req.originalUrl}) [total: ${forasteiros}]`);
+        return res.sendStatus(403);
+      }
+      console.warn(`👁️ [SOMBRA] Webhook de ${ip} está FORA das faixas da Meta (${req.method} ${req.originalUrl}) [total: ${forasteiros}] — permitido; investigar antes de ligar o enforce`);
+    } else if (daMeta === null) {
+      console.warn(`⚠️ Webhook de origem indeterminada ("${ip || 'sem IP'}") — permitido por segurança`);
+    }
+    return next();
+  });
+
   app.use(express.json());
 
   // Health check
@@ -581,7 +622,13 @@ function createWebhookServer() {
       }
       if (body.object !== 'whatsapp_business_account') return;
 
-      const entries = body.entry || [];
+      // Barreira de identidade: só aceita payload da NOSSA conta. Ausência de id
+      // REJEITA (um forjador simplesmente omitiria o campo).
+      const entries = (body.entry || []).filter((e) => {
+        if (e?.id === WABA_ID) return true;
+        console.warn(`🚫 Webhook descartado — WABA "${e?.id ?? 'ausente'}" não é a nossa (${WABA_ID})`);
+        return false;
+      });
       for (const entry of entries) {
         const changes = entry.changes || [];
         for (const change of changes) {
@@ -779,7 +826,7 @@ export async function startWhatsApp() {
   const app = createWebhookServer();
 
   return new Promise((resolve) => {
-    app.listen(WEBHOOK_PORT, () => {
+    app.listen(WEBHOOK_PORT, '127.0.0.1', () => {
       isConnected = true;
       console.log(`\n✅ WhatsApp Cloud API conectado!`);
       console.log(`📡 Webhook escutando na porta ${WEBHOOK_PORT}`);
