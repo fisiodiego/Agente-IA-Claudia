@@ -829,7 +829,17 @@ export async function processMessage(phone, message, options = {}) {
     const isSlotOfferContext = /hor[aá]rios?\s+(livres?|dispon[ií]ve)|qual\s+hor[aá]rio|algum\s+(desses|desse|deles)|prefere\s+(manh|tarde|noite)|(manh[ãa]|tarde|noite)\s+ou\s+(manh[ãa]|tarde|noite)|(quer|deseja|posso|gostaria\s+de)\s+confirmar|temos\s+dispon[ií]ve|confirmar\s+(esse|este)\s+hor[aá]rio/i.test(lastAssistantMsg);
 
     const isConfirming = (isExplicitConfirm || isGenericYes) && !isReschedulingContext && !isSlotOfferContext;
-    const isCancelling = isShortEnough && /^(cancelar?|cancelado|cancelo|nao\s*vou|não\s*vou|nao\s*consigo|não\s*consigo)[!\.\s]*$/i.test(msgTrimmed);
+    // "cancelar/cancelado/cancelo" é inequívoco em qualquer contexto — inclusive
+    // no botão CANCELAR do lembrete de véspera. Mantém o atalho sempre.
+    const isExplicitCancel = isShortEnough && /^(cancelar?|cancelado|cancelo)[!\.\s]*$/i.test(msgTrimmed);
+    // "não vou / não consigo" são AMBÍGUOS quando a Claudia acabou de PERGUNTAR
+    // algo: respondendo a uma oferta de horários significam "nenhum desses me
+    // serve", não "cancele minha consulta". Caso real Luiza (15/jun/2026): a
+    // Claudia ofereceu 14h e 17h, ela respondeu "Não consigo" e o atalho CANCELOU
+    // a consulta dela das 10h ("Seu agendamento foi cancelado"). É o mesmo defeito
+    // que atingiu a Tiala pelo lado da confirmação — aqui pelo lado do cancelamento.
+    const isVagueCancel = isShortEnough && /^(nao\s*vou|não\s*vou|nao\s*consigo|não\s*consigo)[!\.\s]*$/i.test(msgTrimmed);
+    const isCancelling = isExplicitCancel || (isVagueCancel && !isReschedulingContext && !isSlotOfferContext);
 
     if ((isReschedulingContext || isSlotOfferContext) && (isExplicitConfirm || isGenericYes)) {
       console.log(`🔀 Confirmação em contexto de ${isSlotOfferContext ? 'ESCOLHA DE HORÁRIO' : 'REAGENDAMENTO'} detectada — delegando ao Claude (não interceptar como presença)`);

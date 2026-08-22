@@ -132,6 +132,40 @@ export function registerSendMessage(fn, templateFn) {
  * @param {Array} templateParams - parametros do template
  * @returns {boolean} true se enviou com sucesso
  */
+let naoEntreguesJanelaFechada = 0;
+
+/**
+ * A janela de 24h da Meta esta aberta para TEXTO LIVRE?
+ * So esta aberta se o paciente NOS ESCREVEU nas ultimas 24h. Fora dela a Cloud
+ * API devolve 200 OK e derruba a mensagem depois (erro 131047, assincrono): o
+ * envio "da certo", nunca chega, e o cron grava como enviado pra sempre.
+ * Auditoria de 22/ago/2026: 107 campanhas de indicacao e 19 de aniversario
+ * gravadas como enviadas que a Meta havia rejeitado, sem ninguem perceber.
+ * Fail-closed de proposito: na duvida, nao marcar entrega que nao aconteceu.
+ * @returns {boolean} false = texto livre NAO seria entregue
+ */
+function janelaTextoLivreAberta(phone) {
+  try {
+    let pid = getPatientByPhone(phone)?.id || null;
+    if (!pid) {
+      // Regra de ouro do projeto: correlacionar telefone BR por sufixo de 8
+      const s8 = String(phone).replace(/\D/g, '').slice(-8);
+      if (s8.length === 8) {
+        pid = db.prepare(
+          "SELECT id FROM patients WHERE phone LIKE '%'||? OR contact_phone LIKE '%'||? LIMIT 1"
+        ).get(s8, s8)?.id || null;
+      }
+    }
+    if (!pid) return false;
+    return !!db.prepare(
+      "SELECT 1 FROM conversations WHERE patient_id = ? AND role = 'user' AND created_at > datetime('now','localtime','-24 hours') LIMIT 1"
+    ).get(pid);
+  } catch (err) {
+    console.warn(`AVISO: falha ao checar janela de 24h de ${phone}: ${err.message} - assumindo fechada`);
+    return false;
+  }
+}
+
 async function smartSend(phone, text, templateName, templateParams = []) {
   // Estrategia: TEMPLATE-FIRST para mensagens proativas
   // Motivo: Cloud API retorna 200 OK para texto mesmo fora da janela 24h,
@@ -156,8 +190,15 @@ async function smartSend(phone, text, templateName, templateParams = []) {
     }
   }
 
-  // Fallback: texto normal (funciona se paciente mandou msg nas ultimas 24h)
+  // Fallback: texto normal - so funciona DENTRO da janela de 24h.
+  // Antes ele mandava as cegas: a API aceitava (200 OK), a Meta derrubava depois
+  // e o chamador gravava como enviado. Agora a janela e conferida antes.
   if (!sentOk) {
+    if (!janelaTextoLivreAberta(phone)) {
+      naoEntreguesJanelaFechada++;
+      console.warn(`JANELA DE 24h FECHADA para ${phone} - texto livre nao seria entregue (131047). Nao enviado e NAO marcado como enviado. [total: ${naoEntreguesJanelaFechada}]`);
+      return false;
+    }
     try {
       await sendMessageFn(phone, text);
       console.log(`📝 Texto enviado para ${phone} (fallback)`);
@@ -1361,7 +1402,14 @@ async function sendBirthdayMessages() {
         console.log(`🎂 Enviando parabéns para ${patient.name} (${patient.phone})`);
 
         const bdayFirstName = patient.name.split(' ')[0];
-        await smartSend(patient.phone, message, 'aniversario_paciente', [bdayFirstName]);
+        // So marca como enviado se o envio aconteceu mesmo: se o template falhar
+        // E a janela de 24h estiver fechada, o smartSend devolve false e o paciente
+        // continua elegivel (o cron roda todo dia dentro do ano).
+        const bdayOk = await smartSend(patient.phone, message, 'aniversario_paciente', [bdayFirstName]);
+        if (!bdayOk) {
+          console.warn(`Parabens para ${patient.name} nao foram entregues - nao marcado como enviado`);
+          continue;
+        }
 
         db.prepare(
           'INSERT OR IGNORE INTO sent_birthdays (patient_phone, year, sent_at) VALUES (?, ?, ?)'
@@ -1846,12 +1894,16 @@ async function sendReferralCampaign() {
     if (!appointments || appointments.length === 0) return;
 
     // Filtrar apenas consultas de 3 dias atrás
-    const targetAppointments = appointments.filter(a => a.date === targetDate);
+    // Tenta nos dias 3, 4 e 5 apos a consulta - nao so no dia 3. Se hoje a janela
+    // de 24h estiver fechada, o paciente pode escrever amanha e ai a mensagem chega
+    // de verdade. O dedupe permanente em sent_referrals garante um envio unico.
+    const targetAppointments = appointments.filter(a => a.date >= sinceDate && a.date <= targetDate);
 
     if (targetAppointments.length === 0) return;
 
     console.log(`🤝 ${targetAppointments.length} paciente(s) elegível(eis) para indicação`);
 
+    let semJanela = 0;
     for (const apt of targetAppointments) {
       try {
         // Verificar se já enviou indicação para este telefone
@@ -1865,7 +1917,12 @@ async function sendReferralCampaign() {
 
         console.log(`🤝 Enviando campanha de indicação para ${apt.patientName}`);
 
-        await sendMessageFn(apt.patientPhone, message);
+        // Nao existe template aprovado para indicacao, entao so ha texto livre -
+        // e texto livre fora da janela de 24h nunca chega. O smartSend barra isso
+        // e devolve false; nesse caso NAO gravamos em sent_referrals, de modo que
+        // o paciente continua elegivel nos dias 4 e 5.
+        const enviado = await smartSend(apt.patientPhone, message, null, []);
+        if (!enviado) { semJanela++; continue; }
 
         db.prepare(
           'INSERT OR IGNORE INTO sent_referrals (patient_phone, sent_at) VALUES (?, ?)'
@@ -1884,6 +1941,7 @@ async function sendReferralCampaign() {
         console.error(`❌ Erro ao enviar indicação para ${apt.patientName}:`, err.message);
       }
     }
+    if (semJanela > 0) console.log(`Indicacao: ${semJanela} paciente(s) sem janela de 24h aberta - nao marcados, continuam elegiveis amanha`);
   } catch (err) {
     console.error('❌ Erro geral na campanha de indicação:', err.message);
   }
