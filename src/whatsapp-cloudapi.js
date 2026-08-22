@@ -367,6 +367,30 @@ async function processBuffered(phone) {
           if (late?.activateHumanTakeover) activateHumanTakeover(phone);
         })
         .catch((err) => console.warn('⚠️ Falha na entrega atrasada:', err.message));
+
+      // O timeout parou de ESPERAR, mas a geracao antiga CONTINUA rodando e ainda
+      // pode chamar ferramentas que mexem na agenda (agendar, cancelar). Soltar o
+      // lock agora deixaria DUAS geracoes operando o mesmo paciente ao mesmo tempo:
+      // o guard de geracao logo acima protege apenas o ENVIO da resposta atrasada,
+      // nao os efeitos colaterais que ela ja executou. Entao seguramos o lock ate
+      // a geracao antiga terminar.
+      //
+      // Com TETO, porque foi justamente um await pendurado para sempre que motivou
+      // a criacao deste timeout (caso Rafael: lock nunca liberado, paciente no
+      // silencio ate reinicio manual). O remedio nao pode reintroduzir a doenca.
+      //
+      // Nao atrasa o webhook: processBuffered e disparada por setTimeout e nao e
+      // aguardada pelo handler HTTP. O que chegar nesse meio tempo fica na
+      // pendingQueue, como ja fica durante qualquer processamento normal.
+      const TETO_LOCK_MS = 180000;
+      let liberarTeto;
+      const tetoAlcancado = new Promise((resolve) => { liberarTeto = resolve; });
+      const tetoTimer = setTimeout(() => {
+        console.warn(`Geracao antiga de ${phone} passou de ${TETO_LOCK_MS}ms - liberando o lock a forca`);
+        liberarTeto();
+      }, TETO_LOCK_MS);
+      await Promise.race([processing.catch(() => {}), tetoAlcancado]);
+      clearTimeout(tetoTimer);
     }
   } finally {
     // Liberar lock
