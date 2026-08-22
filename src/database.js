@@ -138,6 +138,16 @@ db.exec(`
     sent_at       TEXT NOT NULL
   );
 
+  -- Pacientes que nunca recebem o pedido de indicacao automatico, porque o
+  -- Diego cuida do relacionamento na mao. Chave por sufixo de 8 digitos, a
+  -- regra de correlacao do projeto.
+  CREATE TABLE IF NOT EXISTS referral_optout (
+    phone_suffix8 TEXT PRIMARY KEY,
+    patient_name  TEXT,
+    reason        TEXT,
+    created_at    TEXT DEFAULT (datetime('now','localtime'))
+  );
+
     CREATE TABLE IF NOT EXISTS sent_sameday_reminders (
       appointment_id TEXT PRIMARY KEY,
       sent_at TEXT NOT NULL

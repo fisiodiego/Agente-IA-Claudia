@@ -1943,6 +1943,23 @@ function sufixo8Indicacao(telefone) {
  * diferentes ("(11) 95114-1821", "(11)95943-1297", "5511959431297") - com
  * igualdade exata o paciente receberia o pedido duas vezes, um por gatilho.
  */
+/**
+ * Paciente esta fora da campanha de indicacao por decisao do Diego?
+ * Fail-closed: se a consulta falhar, nao envia - errar mandando para quem foi
+ * explicitamente excluido e pior do que deixar de mandar.
+ */
+function indicacaoBloqueada(s8) {
+  if (!s8 || s8.length !== 8) return true;
+  try {
+    return !!db.prepare(
+      'SELECT 1 FROM referral_optout WHERE phone_suffix8 = ? LIMIT 1'
+    ).get(s8);
+  } catch (err) {
+    console.warn(`AVISO: falha ao checar lista de excluidos da indicacao: ${err.message} - nao enviando`);
+    return true;
+  }
+}
+
 function jaPediuIndicacao(s8) {
   if (!s8 || s8.length !== 8) return false;
   return !!db.prepare(
@@ -1986,6 +2003,7 @@ async function sendReferralAfterCheckIn() {
       try {
         const s8 = sufixo8Indicacao(env.phone);
         if (s8.length !== 8) continue;
+        if (indicacaoBloqueada(s8)) continue;
         if (jaPediuIndicacao(s8)) continue;
 
         const pac = acharPacientePorSufixo8(env.phone);
@@ -2078,7 +2096,9 @@ async function sendReferralCampaign() {
         // Verificar se já enviou indicação para este telefone
         // Dedupe por sufixo-8: o gatilho pos-consulta grava o telefone em outro
         // formato, e com igualdade exata o paciente receberia o pedido duas vezes.
-        if (jaPediuIndicacao(sufixo8Indicacao(apt.patientPhone))) continue;
+        const s8Antigo = sufixo8Indicacao(apt.patientPhone);
+        if (indicacaoBloqueada(s8Antigo)) continue;
+        if (jaPediuIndicacao(s8Antigo)) continue;
 
         const message = referralMessage(apt.patientName);
 
