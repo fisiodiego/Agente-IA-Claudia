@@ -91,7 +91,7 @@ function activateHumanTakeover(phone) {
 /**
  * Verifica se o modo humano está ativo para um número.
  */
-function isHumanActive(phone) {
+export function isHumanActive(phone) {
   // Checar pausa global
   if (humanTakeoverMap.has("__ALL__")) {
     if (humanTakeoverMap.get("__ALL__") > Date.now()) return true;

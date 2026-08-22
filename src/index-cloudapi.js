@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { startWhatsApp, sendTemplateMessage } from './whatsapp-cloudapi.js';
+import { startWhatsApp, sendTemplateMessage, isHumanActive } from './whatsapp-cloudapi.js';
 import { startScheduler, registerSendMessage } from './scheduler.js';
 
 // ─── Validação de Variáveis de Ambiente ───────────────────────────────────────
@@ -28,7 +28,7 @@ async function main() {
     const sendMessage = await startWhatsApp();
 
     // 2. Registrar função de envio no agendador
-    registerSendMessage(sendMessage, sendTemplateMessage);
+    registerSendMessage(sendMessage, sendTemplateMessage, isHumanActive);
 
     // 3. Iniciar agendador de follow-ups
     startScheduler();

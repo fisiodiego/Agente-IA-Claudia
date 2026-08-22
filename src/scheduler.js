@@ -1,4 +1,5 @@
 import cron from 'node-cron';
+import { respostaClaramentePositiva } from './referralSentiment.js';
 import { getPendingFollowups, markFollowupSent, getPatientByPhone, confirmDischarge, saveMessage } from './patientManager.js';
 import { followupTemplates, followupDescriptions, appointmentReminder24h, getGreeting, packageReminderLevel1, packageReminderLevel2, packageReminderLevel3, noShowRescheduling, waitlistNotification, postConsultationCheckIn, birthdayMessage, reactivationMessage, weeklyReportMessage, packageCompletedMessage, referralMessage, sameDayReminder } from './messageTemplates.js';
 import { getUpcomingAppointments, getRecentDischarges, getStalePackages, getRecentNoShows, getWaitlistMatches, removeFromWaitlist, getCompletedAppointments, getBirthdays, getInactivePatients, getWeeklyReport, getCompletedPackages, logClaudiaActivity, getFollowUpsByPhone } from './crmApi.js';
@@ -7,6 +8,7 @@ import { recentReminderPhones, recentReminderNames } from './agent.js';
 
 let sendMessageFn = null;
 let sendTemplateFn = null;
+let isHumanActiveFn = null;
 
 /**
  * Valida formato de telefone BR (10-13 dígitos, com/sem DDI 55).
@@ -120,9 +122,10 @@ function markReminderSent(db, appointmentId, type, date) {
 /**
  * Registra a função de envio de mensagens do WhatsApp.
  */
-export function registerSendMessage(fn, templateFn) {
+export function registerSendMessage(fn, templateFn, humanActiveFn) {
   sendMessageFn = fn;
   sendTemplateFn = templateFn || null;
+  isHumanActiveFn = humanActiveFn || null;
 }
 /**
  * Envia mensagem com fallback para template se fora da janela de 24h.
@@ -133,6 +136,38 @@ export function registerSendMessage(fn, templateFn) {
  * @returns {boolean} true se enviou com sucesso
  */
 let naoEntreguesJanelaFechada = 0;
+
+// O telefone chega em formatos diferentes: "(71) 99187-0018" no
+// pos_consulta_log, "5571991870018" em patients.phone, e 229 dos 513
+// contact_phone estao pontuados. Toda correlacao passa por esta limpeza,
+// centralizada para as queries nao voltarem a divergir entre si.
+const SQL_FONE_PHONE = "replace(replace(replace(replace(replace(phone,'(',''),')',''),' ',''),'-',''),'+','')";
+const SQL_FONE_CONTATO = "replace(replace(replace(replace(replace(COALESCE(contact_phone,'zz'),'(',''),')',''),' ',''),'-',''),'+','')";
+
+/**
+ * Acha o paciente local pelo telefone, correlacionando por sufixo de 8 digitos.
+ * getPatientByPhone sozinho nao resolve: ele compara por IGUALDADE e falha em
+ * qualquer telefone pontuado.
+ */
+function acharPacientePorSufixo8(phone) {
+  const s8 = String(phone || '').replace(/\D/g, '').slice(-8);
+  if (s8.length !== 8) return null;
+  const cands = db.prepare(
+    "SELECT id, name FROM patients WHERE " + SQL_FONE_PHONE + " LIKE '%'||? OR " + SQL_FONE_CONTATO + " LIKE '%'||?"
+  ).all(s8, s8);
+  if (!cands.length) return null;
+  if (cands.length === 1) return cands[0];
+  // Desempate: o cadastro que o paciente realmente usa e o da conversa mais
+  // recente. Sem isso o SQLite entrega o de menor rowid, que nesta base costuma
+  // ser o registro LID/duplicado - a elegibilidade seria lida num cadastro e a
+  // janela conferida em outro, e a saudacao sairia com nome de registro-lixo.
+  const ultimaConversa = db.prepare(
+    "SELECT MAX(created_at) AS quando FROM conversations WHERE patient_id = ?"
+  );
+  return cands
+    .map((c) => ({ ...c, quando: ultimaConversa.get(c.id)?.quando || '' }))
+    .sort((a, b) => (a.quando < b.quando ? 1 : -1))[0];
+}
 
 /**
  * A janela de 24h da Meta esta aberta para TEXTO LIVRE?
@@ -146,16 +181,7 @@ let naoEntreguesJanelaFechada = 0;
  */
 function janelaTextoLivreAberta(phone) {
   try {
-    let pid = getPatientByPhone(phone)?.id || null;
-    if (!pid) {
-      // Regra de ouro do projeto: correlacionar telefone BR por sufixo de 8
-      const s8 = String(phone).replace(/\D/g, '').slice(-8);
-      if (s8.length === 8) {
-        pid = db.prepare(
-          "SELECT id FROM patients WHERE phone LIKE '%'||? OR contact_phone LIKE '%'||? LIMIT 1"
-        ).get(s8, s8)?.id || null;
-      }
-    }
+    const pid = getPatientByPhone(phone)?.id || acharPacientePorSufixo8(phone)?.id || null;
     if (!pid) return false;
     return !!db.prepare(
       "SELECT 1 FROM conversations WHERE patient_id = ? AND role = 'user' AND created_at > datetime('now','localtime','-24 hours') LIMIT 1"
@@ -167,6 +193,20 @@ function janelaTextoLivreAberta(phone) {
 }
 
 async function smartSend(phone, text, templateName, templateParams = []) {
+  // Se o Diego assumiu a conversa, nenhum cron fala por cima dele. Isso pesa
+  // sobretudo no pedido de indicacao, cujo gatilho e "o paciente escreveu ha
+  // 2-22h" - exatamente o estado de uma conversa que ele esta tocando na mao.
+  if (isHumanActiveFn) {
+    try {
+      if (isHumanActiveFn(phone)) {
+        console.log(`Atendimento humano ativo para ${phone} - envio automatico suprimido`);
+        return false;
+      }
+    } catch (err) {
+      console.warn(`AVISO: falha ao checar takeover de ${phone}: ${err.message}`);
+    }
+  }
+
   // Estrategia: TEMPLATE-FIRST para mensagens proativas
   // Motivo: Cloud API retorna 200 OK para texto mesmo fora da janela 24h,
   // mas o erro 131047 so chega async via webhook — nunca cai no catch.
@@ -317,9 +357,24 @@ export function startScheduler() {
     await checkCompletedPackages();
   });
 
-  // ── Campanha de indicação: 3 dias após pós-consulta, às 11h BRT (14h UTC) ──
-  cron.schedule('0 14 * * *', async () => {
-    await sendReferralCampaign();
+  // ── Campanha de indicação D+3..D+5: DESLIGADA em 22/ago/2026 ──
+  // Ela dispara sem olhar o TOM da resposta do paciente. Caso real: Joana Cardoso
+  // respondeu "bem melhor, ainda com um certo desconforto" e recebeu o pedido de
+  // indicacao em 20/08. Pior, o veto do gatilho novo nao a protegia: quando ele
+  // barra por dor, nao grava nada em sent_referrals, entao o paciente continuava
+  // elegivel para esta campanha 2-4 dias depois - o veto durava so 24h.
+  // O gatilho sendReferralAfterCheckIn cobre o mesmo objetivo conferindo tom,
+  // janela de 24h e takeover. A funcao sendReferralCampaign fica no arquivo, sem
+  // agendamento, caso se decida reativa-la com filtro.
+  // cron.schedule('0 14 * * *', async () => {
+  //   await sendReferralCampaign();
+  // });
+
+  // ── Indicacao apos resposta positiva ao pos-consulta: checa a cada 30min ──
+  // Frequente de proposito: a janela de 24h e o recurso escasso aqui, entao
+  // varremos as respostas de perto. A funcao so age em horario comercial BRT.
+  cron.schedule('*/30 * * * *', async () => {
+    await sendReferralAfterCheckIn();
   });
 
   // ── Aniversário: enviar parabéns às 9h BRT (12h UTC) ──
@@ -1326,7 +1381,15 @@ async function sendPostConsultationMessages() {
         const postFirstName = apt.patientName.split(' ')[0];
         const [py, pm, pd] = (apt.date || yesterdayStr).split('-');
         const postDateBR = pd + '/' + pm + '/' + py;
-        await smartSend(apt.patientPhone, message, 'pos_consulta', [postFirstName]);
+        // O retorno importa: esta tabela virou a FONTE do gatilho de indicacao,
+        // entao gravar envio que falhou faria o gatilho perseguir uma conversa que
+        // nunca existiu. Caso real no log de 25/07: "Falha total ao enviar para
+        // 71988983848" e mesmo assim a linha entrou em pos_consulta_log.
+        const posOk = await smartSend(apt.patientPhone, message, 'pos_consulta', [postFirstName]);
+        if (!posOk) {
+          console.warn(`Pos-consulta para ${apt.patientName} nao foi entregue - nao registrado`);
+          continue;
+        }
 
         // Registrar envio do pos_consulta (usado pela alta para saber se janela 24h esta aberta)
         db.prepare(
@@ -1869,6 +1932,112 @@ async function checkCompletedPackages() {
 // Campanha de indicação (3 dias após pós-consulta positivo)
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/** Sufixo de 8 digitos - chave de correlacao de telefone do projeto. */
+function sufixo8Indicacao(telefone) {
+  return String(telefone || '').replace(/\D/g, '').slice(-8);
+}
+
+/**
+ * Ja pedimos indicacao a esse paciente alguma vez?
+ * Compara por sufixo-8 porque o mesmo numero aparece gravado em formatos
+ * diferentes ("(11) 95114-1821", "(11)95943-1297", "5511959431297") - com
+ * igualdade exata o paciente receberia o pedido duas vezes, um por gatilho.
+ */
+function jaPediuIndicacao(s8) {
+  if (!s8 || s8.length !== 8) return false;
+  return !!db.prepare(
+    "SELECT 1 FROM sent_referrals WHERE replace(replace(replace(replace(replace(patient_phone,'(',''),')',''),' ',''),'-',''),'+','') LIKE '%'||? AND COALESCE(delivered,1) = 1 LIMIT 1"
+  ).get(s8);
+}
+
+/**
+ * Envia o pedido de indicacao a quem respondeu POSITIVAMENTE ao pos-consulta.
+ *
+ * Por que este gatilho e nao um dia fixo: so o paciente ESCREVENDO abre a janela
+ * de 24h da Meta, e e dentro dela que texto livre chega de verdade. O pos-consulta
+ * e template (chega sempre) e ~37% dos pacientes respondem - e a unica janela
+ * confiavel que existe. No modelo antigo o pedido saia no 3o dia, com a janela ja
+ * fechada, e a Meta derrubava em silencio (131047): 107 pedidos comprovadamente
+ * perdidos na auditoria de 22/ago/2026.
+ *
+ * Regras de educacao: so em horario comercial (9h-19h BRT), so depois de 2h da
+ * ultima mensagem do paciente (para a Claudia responder primeiro o que ele disse)
+ * e so com a janela ainda aberta. O tom da resposta e conferido antes - quem
+ * relatou dor, duvida ou melhora parcial nao recebe (ver referralSentiment.js).
+ * Dedupe permanente por sufixo-8, compartilhado com o cron dos dias 3-5.
+ */
+async function sendReferralAfterCheckIn() {
+  if (!sendMessageFn) return;
+
+  try {
+    const nowBRT = new Date(Date.now() - 3 * 3600000);
+    const horaBRT = nowBRT.getUTCHours();
+    if (horaBRT < 9 || horaBRT >= 19) return;
+
+    const envios = db.prepare(
+      "SELECT phone, sent_at FROM pos_consulta_log WHERE sent_at > datetime('now','localtime','-24 hours')"
+    ).all();
+    if (!envios.length) return;
+
+    let enviados = 0;
+    let barrados = 0;
+
+    for (const env of envios) {
+      try {
+        const s8 = sufixo8Indicacao(env.phone);
+        if (s8.length !== 8) continue;
+        if (jaPediuIndicacao(s8)) continue;
+
+        const pac = acharPacientePorSufixo8(env.phone);
+        if (!pac) continue;
+
+        const respostas = db.prepare(
+          "SELECT content, created_at FROM conversations WHERE patient_id = ? AND role = 'user' AND created_at > ? ORDER BY id"
+        ).all(pac.id, env.sent_at);
+        if (!respostas.length) continue;
+
+        const ultima = respostas[respostas.length - 1].created_at;
+        const tempo = db.prepare(
+          "SELECT (? <= datetime('now','localtime','-2 hours')) AS passou2h, (? > datetime('now','localtime','-22 hours')) AS janelaAberta"
+        ).get(ultima, ultima);
+        if (!tempo.passou2h || !tempo.janelaAberta) continue;
+
+        const veredito = respostaClaramentePositiva(respostas.map((r) => r.content).join(' '));
+        if (!veredito.elegivel) {
+          barrados++;
+          console.log(`Indicacao: ${pac.name} nao elegivel (${veredito.motivo}) - nao sera pedida`);
+          continue;
+        }
+
+        const ok = await smartSend(env.phone, referralMessage(pac.name), null, []);
+        if (!ok) continue;
+
+        db.prepare(
+          'INSERT OR IGNORE INTO sent_referrals (patient_phone, sent_at) VALUES (?, ?)'
+        ).run(env.phone, new Date().toISOString());
+
+        await logClaudiaActivity('referral', {
+          patientName: pac.name,
+          phone: env.phone,
+          details: { gatilho: 'resposta_positiva_pos_consulta' },
+        });
+
+        enviados++;
+        console.log(`Indicacao enviada para ${pac.name} apos resposta positiva ao pos-consulta`);
+        await sleep(3000);
+      } catch (err) {
+        console.error(`Erro ao pedir indicacao pos-consulta: ${err.message}`);
+      }
+    }
+
+    if (enviados || barrados) {
+      console.log(`Indicacao pos-consulta: ${enviados} enviada(s), ${barrados} barrada(s) pelo tom da resposta`);
+    }
+  } catch (err) {
+    console.error('Erro geral na indicacao pos-consulta:', err.message);
+  }
+}
+
 async function sendReferralCampaign() {
   if (!sendMessageFn) return;
 
@@ -1907,11 +2076,9 @@ async function sendReferralCampaign() {
     for (const apt of targetAppointments) {
       try {
         // Verificar se já enviou indicação para este telefone
-        const already = db.prepare(
-          'SELECT 1 FROM sent_referrals WHERE patient_phone = ?'
-        ).get(apt.patientPhone);
-
-        if (already) continue;
+        // Dedupe por sufixo-8: o gatilho pos-consulta grava o telefone em outro
+        // formato, e com igualdade exata o paciente receberia o pedido duas vezes.
+        if (jaPediuIndicacao(sufixo8Indicacao(apt.patientPhone))) continue;
 
         const message = referralMessage(apt.patientName);
 
