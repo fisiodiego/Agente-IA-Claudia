@@ -1963,7 +1963,7 @@ function indicacaoBloqueada(s8) {
 function jaPediuIndicacao(s8) {
   if (!s8 || s8.length !== 8) return false;
   return !!db.prepare(
-    "SELECT 1 FROM sent_referrals WHERE replace(replace(replace(replace(replace(patient_phone,'(',''),')',''),' ',''),'-',''),'+','') LIKE '%'||? AND COALESCE(delivered,1) = 1 LIMIT 1"
+    "SELECT 1 FROM sent_referrals WHERE replace(replace(replace(replace(replace(patient_phone,'(',''),')',''),' ',''),'-',''),'+','') LIKE '%'||? AND (COALESCE(delivered,1) = 1 OR sent_at > datetime('now','localtime','-30 days')) LIMIT 1"
   ).get(s8);
 }
 
@@ -2030,8 +2030,13 @@ async function sendReferralAfterCheckIn() {
         const ok = await smartSend(env.phone, referralMessage(pac.name), null, []);
         if (!ok) continue;
 
+        // UPSERT, nao INSERT OR IGNORE: quando ja existe linha para este telefone
+        // (registro antigo com delivered = 0), o IGNORE nao gravava nada e o cron
+        // reenviava a cada 30 min. Caso real 22-23/ago: Jose de Souza recebeu 13
+        // vezes e Rodrigo Espinheira 10 vezes a mesma mensagem.
         db.prepare(
-          'INSERT OR IGNORE INTO sent_referrals (patient_phone, sent_at) VALUES (?, ?)'
+          'INSERT INTO sent_referrals (patient_phone, sent_at, delivered) VALUES (?, ?, 1) ' +
+          'ON CONFLICT(patient_phone) DO UPDATE SET sent_at = excluded.sent_at, delivered = 1'
         ).run(env.phone, new Date().toISOString());
 
         await logClaudiaActivity('referral', {
