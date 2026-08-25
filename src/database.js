@@ -141,6 +141,20 @@ db.exec(`
   -- Pacientes que nunca recebem o pedido de indicacao automatico, porque o
   -- Diego cuida do relacionamento na mao. Chave por sufixo de 8 digitos, a
   -- regra de correlacao do projeto.
+  -- Trava geral anti-flood: conta o que as CAMPANHAS enviaram, por paciente.
+  -- Nao usamos message_log para isso porque ele registra tambem as respostas
+  -- conversacionais da Claudia, e um paciente conversando ativamente estouraria
+  -- o teto e passaria a ter campanha legitima bloqueada.
+  CREATE TABLE IF NOT EXISTS envios_automaticos (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    phone_suffix8 TEXT NOT NULL,
+    rotulo        TEXT,
+    conteudo      TEXT NOT NULL,
+    essencial     INTEGER DEFAULT 0,
+    sent_at       TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_envios_automaticos ON envios_automaticos(phone_suffix8, sent_at);
+
   CREATE TABLE IF NOT EXISTS referral_optout (
     phone_suffix8 TEXT PRIMARY KEY,
     patient_name  TEXT,

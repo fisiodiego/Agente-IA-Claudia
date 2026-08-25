@@ -192,7 +192,77 @@ function janelaTextoLivreAberta(phone) {
   }
 }
 
+const MAX_AUTOMATICAS_24H = 2;
+
+// Lembrete de consulta nunca e barrado por teto: perder o lembrete faz o
+// paciente perder a consulta, dano maior do que receber uma mensagem a mais.
+const TEMPLATES_ESSENCIAIS = new Set(['lembrete_consulta', 'lembrete_dia']);
+
+let bloqueiosAntiFlood = 0;
+
+/**
+ * Trava geral anti-flood — fica DEBAIXO do dedupe de cada campanha.
+ *
+ * Ate 24/ago cada campanha confiava so no proprio controle e nenhuma sabia das
+ * outras. Quando o da indicacao falhou, nada segurou: Jose de Souza recebeu 13
+ * copias da mesma mensagem e Rodrigo Espinheira 10, de meia em meia hora.
+ *
+ * Falha ABERTA de proposito: erro aqui deixa passar e loga. Silenciar toda a
+ * comunicacao da clinica por um defeito na trava seria pior que o flood que ela
+ * previne, e os dedupes das campanhas continuam sendo a primeira linha.
+ */
+function podeEnviarAutomatica(phone, text, templateName) {
+  const s8 = String(phone || '').replace(/\D/g, '').slice(-8);
+  if (s8.length !== 8) return { pode: true };
+
+  try {
+    const repetida = db.prepare(
+      "SELECT 1 FROM envios_automaticos WHERE phone_suffix8 = ? AND conteudo = ? " +
+      "AND sent_at > datetime('now','localtime','-24 hours') LIMIT 1"
+    ).get(s8, text);
+    if (repetida) {
+      return { pode: false, motivo: 'mensagem identica ja enviada nas ultimas 24h' };
+    }
+
+    if (TEMPLATES_ESSENCIAIS.has(templateName)) return { pode: true };
+
+    const { n } = db.prepare(
+      "SELECT COUNT(*) AS n FROM envios_automaticos WHERE phone_suffix8 = ? " +
+      "AND essencial = 0 AND sent_at > datetime('now','localtime','-24 hours')"
+    ).get(s8);
+    if (n >= MAX_AUTOMATICAS_24H) {
+      return { pode: false, motivo: `ja recebeu ${n} mensagens automaticas nas ultimas 24h` };
+    }
+    return { pode: true };
+  } catch (err) {
+    console.warn(`AVISO: trava anti-flood falhou para ${phone}: ${err.message} - deixando passar`);
+    return { pode: true };
+  }
+}
+
+/** Registra o envio para a trava contar. Nao-bloqueante. */
+function registrarEnvioAutomatico(phone, text, templateName) {
+  try {
+    const s8 = String(phone || '').replace(/\D/g, '').slice(-8);
+    if (s8.length !== 8) return;
+    db.prepare(
+      "INSERT INTO envios_automaticos (phone_suffix8, rotulo, conteudo, essencial, sent_at) VALUES (?, ?, ?, ?, datetime('now','localtime'))"
+    ).run(s8, templateName || 'texto-livre', text || '', TEMPLATES_ESSENCIAIS.has(templateName) ? 1 : 0);
+    // Higiene: a trava so olha 24h para tras, guardar mais que 30 dias e lixo.
+    db.prepare("DELETE FROM envios_automaticos WHERE sent_at < datetime('now','localtime','-30 days')").run();
+  } catch (err) {
+    console.warn(`AVISO: falha ao registrar envio automatico de ${phone}: ${err.message}`);
+  }
+}
+
 async function smartSend(phone, text, templateName, templateParams = []) {
+  const permissao = podeEnviarAutomatica(phone, text, templateName);
+  if (!permissao.pode) {
+    bloqueiosAntiFlood++;
+    console.warn(`ANTI-FLOOD: envio para ${phone} bloqueado - ${permissao.motivo} [total: ${bloqueiosAntiFlood}]`);
+    return false;
+  }
+
   // Se o Diego assumiu a conversa, nenhum cron fala por cima dele. Isso pesa
   // sobretudo no pedido de indicacao, cujo gatilho e "o paciente escreveu ha
   // 2-22h" - exatamente o estado de uma conversa que ele esta tocando na mao.
@@ -249,6 +319,8 @@ async function smartSend(phone, text, templateName, templateParams = []) {
       return false;
     }
   }
+
+  registrarEnvioAutomatico(phone, text, templateName);
 
   // Persistir em conversations para preservar contexto da Claudia.
   // Caso real (Priscila, 30/abr/2026): cron envia template lembrete_pacote,
