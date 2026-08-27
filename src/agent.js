@@ -826,7 +826,25 @@ export async function processMessage(phone, message, options = {}) {
     // 12/ago/2026 — ficou sem o agendamento de 13/08 13h).
     // Os lembretes NÃO casam: eles dizem "confirme sua presença respondendo
     // CONFIRMAR", nunca "quer/deseja confirmar".
-    const isSlotOfferContext = /hor[aá]rios?\s+(livres?|dispon[ií]ve)|qual\s+hor[aá]rio|algum\s+(desses|desse|deles)|prefere\s+(manh|tarde|noite)|(manh[ãa]|tarde|noite)\s+ou\s+(manh[ãa]|tarde|noite)|(quer|deseja|posso|gostaria\s+de)\s+confirmar|temos\s+dispon[ií]ve|confirmar\s+(esse|este)\s+hor[aá]rio/i.test(lastAssistantMsg);
+    // A lista de frases abaixo cobre os casos sem horario explicito. Mas ela ja
+    // deixou passar quatro variacoes (Rogerio, Fabiane, Tiala e Ivan), porque
+    // cada texto novo da Claudia inventa uma forma nova de oferecer. Entao vale
+    // tambem um criterio ESTRUTURAL, que nao depende da redacao:
+    // e oferta quando ela CITA UM HORARIO e PROPOE algo, e nao e lembrete de
+    // consulta ja existente.
+    //
+    // Caso Ivan Arias (26/ago/2026): "temos apenas 11h disponivel pela manha...
+    // Posso reservar esse horario pra voce?" -> ele respondeu "Confirmado", o
+    // atalho disparou, ela disse "Consulta confirmada!" e nao agendou nada.
+    const ofertaCitaHorario = /\b\d{1,2}\s*(h\b|h[0-9]|:\d{2})/i.test(lastAssistantMsg);
+    const ofertaEhLembrete = /sua consulta (e|es|est)|lembrete|confirme sua presen|te esperamos/i.test(
+      lastAssistantMsg.normalize('NFD').replace(/[\u0300-\u036f]/g, ''),
+    );
+    const ofertaPropoe = /\?|posso (reservar|agendar|marcar|deixar)|quer(o|ia)? que eu|deseja|prefere|algum (desses|deles|desse)|te atende|serve (pra|para)/i.test(
+      lastAssistantMsg,
+    );
+    const isSlotOfferPelaFrase = /hor[aá]rios?\s+(livres?|dispon[ií]ve)|qual\s+hor[aá]rio|algum\s+(desses|desse|deles)|prefere\s+(manh|tarde|noite)|(manh[ãa]|tarde|noite)\s+ou\s+(manh[ãa]|tarde|noite)|(quer|deseja|posso|gostaria\s+de)\s+confirmar|temos\s+dispon[ií]ve|confirmar\s+(esse|este)\s+hor[aá]rio/i.test(lastAssistantMsg);
+    const isSlotOfferContext = isSlotOfferPelaFrase || (ofertaCitaHorario && ofertaPropoe && !ofertaEhLembrete);
 
     const isConfirming = (isExplicitConfirm || isGenericYes) && !isReschedulingContext && !isSlotOfferContext;
     // "cancelar/cancelado/cancelo" é inequívoco em qualquer contexto — inclusive
