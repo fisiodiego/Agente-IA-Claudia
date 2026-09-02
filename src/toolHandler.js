@@ -26,7 +26,11 @@ const AVAILABILITY_TTL_MS = 5 * 60 * 1000; // 5 min
 // logo após criar um agendamento — evita interpretar o próprio slot como "ocupado
 // por outro paciente". Casos Lidia/Carol (12/mai) e Dimitri/Anna (12/mai).
 const recentCreates = new Map(); // phone -> [{ professionalId, date, time, ts }, ...]
-const RECENT_CREATE_TTL_MS = 10 * 60 * 1000; // 10 min
+// 24h, nao 10 min: caso Joaquim/Luana (02/set/2026) — 23 min depois de
+// confirmar, um "Top" do paciente fez o LLM re-verificar a agenda, ver o
+// horario ocupado pela propria marcacao e pedir desculpas oferecendo outro.
+// O aviso e inofensivo; a conversa pode durar horas.
+const RECENT_CREATE_TTL_MS = 24 * 60 * 60 * 1000; // 24h
 
 /**
  * Executa uma tool e retorna o resultado formatado para tool_result.
@@ -166,11 +170,20 @@ export async function handleToolCall(toolName, toolInput, phone = null) {
         const result = await findOrCreatePatient(toolInput);
         if (!result.ok) return JSON.stringify({ error: result.error });
 
-        const { patient, created } = result.data;
+        const { patient, created, birthDateRecorded, birthDateConflict } = result.data;
+        // Deixar claro quando o cadastro ficou COMPLETO: antes a API descartava a
+        // data de nascimento de paciente existente e o LLM, achando o cadastro
+        // incompleto, ficava tentando "finaliza-lo" (caso Luana, 02/set/2026).
+        let message = created
+          ? `Paciente ${patient.name} cadastrado com sucesso no CRM.`
+          : `Paciente ${patient.name} já existe no CRM. Cadastro completo — não peça mais dados.`;
+        if (!created && birthDateRecorded) {
+          message = `Paciente ${patient.name} já existia no CRM; data de nascimento gravada agora. Cadastro completo — não peça mais dados.`;
+        } else if (!created && birthDateConflict) {
+          message = `Paciente ${patient.name} já existe no CRM com nascimento ${birthDateConflict.stored}; a data informada (${birthDateConflict.given}) foi ignorada. Não peça de novo — siga com o agendamento.`;
+        }
         return JSON.stringify({
-          message: created
-            ? `Paciente ${patient.name} cadastrado com sucesso no CRM.`
-            : `Paciente ${patient.name} já existe no CRM.`,
+          message,
           patientId: patient.id,
           patientName: patient.name,
           created,
