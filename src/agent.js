@@ -610,6 +610,55 @@ Quando o paciente perguntar sobre localização ou como chegar, envie essas info
  * @param {string} message - texto da mensagem recebida
  * @returns {string} - resposta gerada pelo agente
  */
+/**
+ * Periodo em que o Dr. Diego esta fora. Formato YYYY-MM-DD, inclusive nas duas
+ * pontas. Deixar as duas strings vazias desliga o aviso.
+ *
+ * Viagem a serra gaucha (set/2026): fora de 05 a 12/09, volta segunda 14/09.
+ * A agenda ja esta bloqueada no CRM para o mesmo periodo — a Claudia nao
+ * consegue oferecer horario nesses dias mesmo que ignore este texto.
+ */
+const AUSENCIA = {
+  de: '2026-09-05',
+  ate: '2026-09-13',      // domingo: no dia 14 o aviso some sozinho
+  voltaEm: 'segunda, 14/09',
+  ultimoDiaFora: '12/09',
+};
+
+/**
+ * Devolve o aviso de ausencia quando hoje cai dentro da janela, ou string vazia.
+ * Entra no bloco VOLATIL do system prompt: nao invalida o cache do bloco estavel
+ * e desaparece sozinho quando o periodo termina.
+ */
+function blocoAusencia() {
+  const { de, ate, voltaEm, ultimoDiaFora } = AUSENCIA;
+  if (!de || !ate) return '';
+  const hojeBRT = new Date(Date.now() - 3 * 3600000).toISOString().slice(0, 10);
+  if (hojeBRT < de || hojeBRT > ate) return '';
+
+  return [
+    '\u2501\u2501\u2501 DR. DIEGO ESTA FORA (ate ' + ultimoDiaFora + ') \u2501\u2501\u2501',
+    'O Dr. Diego esta de ferias e volta a atender na ' + voltaEm + '.',
+    '',
+    'COMO AGIR NESTE PERIODO:',
+    '1. Quem quiser marcar: avise que ele esta de ferias e volta ' + voltaEm + ',',
+    '   e JA OFERECA agendar a partir dessa data. Nao encerre a conversa sem',
+    '   tentar deixar o horario reservado — quem procurou agora quer ser atendido.',
+    '2. NUNCA ofereca horario dentro do periodo de ausencia. A agenda esta',
+    '   bloqueada e o check_availability nao vai retornar vagas nesses dias.',
+    '3. Quem ja TEM consulta marcada para depois de ' + voltaEm + ': esta mantida,',
+    '   confirme normalmente.',
+    '4. Se o paciente relatar dor forte, piora ou algo urgente: acolha, registre',
+    '   a mensagem e diga que o Dr. Diego le os recados e retorna assim que',
+    '   possivel. NAO prometa prazo, NAO prometa que ele responde hoje, e NAO',
+    '   oriente conduta clinica.',
+    '5. Tom: natural e acolhedor, sem pedir desculpas em excesso. Ferias sao',
+    '   normais — informe com leveza e siga para o agendamento.',
+    '',
+    '',
+  ].join('\n');
+}
+
 export async function processMessage(phone, message, options = {}) {
   try {
     const { pushName, isLid, lidJid } = options;
@@ -1620,10 +1669,11 @@ export async function processMessage(phone, message, options = {}) {
     //   [0] estável (SYSTEM_PROMPT + __DATE_BLOCK__) → cacheado via ephemeral cache_control
     //   [1] volátil (patientContext) → fresco a cada request, sem invalidar o cache do bloco [0]
     // Ordem de cache na API: tools → system → messages. Marcar o fim do system[0] cacheia tools+system[0].
+    const avisoAusencia = blocoAusencia();
     const stableSystem = SYSTEM_PROMPT.replace("__DATE_BLOCK__", getDateSection(professionalsInfo));
     const systemBlocks = [
       { type: 'text', text: stableSystem, cache_control: { type: 'ephemeral' } },
-      { type: 'text', text: patientContext },
+      { type: 'text', text: avisoAusencia + patientContext },
     ];
 
     // Tool use loop - keep calling until we get a text response
