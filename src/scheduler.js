@@ -368,8 +368,13 @@ export function startScheduler() {
     await checkAndSendFollowups();
   });
 
-  // Lembrete noturno: 20h BRT (23h UTC) — envia para todos os agendamentos do dia seguinte
-  cron.schedule('0 23 * * *', async () => {
+  // Lembrete noturno: 20h BRT (23h UTC) — envia para todos os agendamentos do dia seguinte.
+  // node-cron 3.0.3 só dispara se um tick de ~1s cair exatamente no segundo :00 e não
+  // recupera tick perdido — em 16/09/2026 pulou o dia inteiro, em silêncio. Ligar
+  // recoverMissedExecutions nessa versão DUPLICA toda execução (issue #400) — NÃO usar.
+  // Solução: três chances (20:00, 20:10, 20:20 BRT). A função é idempotente
+  // (sent_reminders_log + sentReminders) e tem guarda de reentrância (remindersRunning).
+  cron.schedule('0,10,20 23 * * *', async () => {
     await checkAndSendReminders();
   });
 
@@ -839,6 +844,12 @@ async function sendFollowup(followup) {
   console.log(`✅ Follow-up enviado com sucesso para ${followup.name}`);
 }
 
+// Guarda de reentrância do lembrete noturno: o cron roda em 3 horários (20:00/20:10/20:20 BRT)
+// e o boot também pode chamar a função. Uma rodada em curso (cada envio leva ~4s) não pode
+// ser atropelada por outra — a marcação em sent_reminders_log só acontece DEPOIS do smartSend,
+// então duas rodadas simultâneas lembrariam o mesmo paciente duas vezes.
+let remindersRunning = false;
+
 /**
  * Verifica agendamentos do dia seguinte e envia lembretes via WhatsApp.
  */
@@ -847,6 +858,11 @@ async function checkAndSendReminders() {
     console.warn('⚠️ Função de envio não registrada para lembretes');
     return;
   }
+  if (remindersRunning) {
+    console.log('⏭️ Lembrete noturno já em execução — rodada extra ignorada');
+    return;
+  }
+  remindersRunning = true;
 
   try {
     // Calcular data de amanhã em BRT (UTC-3)
@@ -950,6 +966,8 @@ async function checkAndSendReminders() {
     console.log(`📊 Lembretes noturno: ${enviados} enviado(s) para ${dateBR}`);
   } catch (error) {
     console.error('❌ Erro geral no sistema de lembretes:', error.message);
+  } finally {
+    remindersRunning = false;
   }
 }
 
