@@ -469,7 +469,10 @@ export function startScheduler() {
   // ── Pós-consulta: dia seguinte às 10h BRT (13h UTC) ──
   // Pesquisa de satisfação foi movida pro cron das 14h BRT (4h depois)
   // pra dar respiro natural entre as duas mensagens ao paciente.
-  cron.schedule('0 13 * * *', async () => {
+  // 3 chances (10:00/10:10/10:20 BRT): node-cron 3.0.3 pula tick e esta rotina só
+  // olha as consultas de ONTEM — dia pulado = paciente nunca recebe (02/09 e 06/09).
+  // processed_completions (por consulta) + guarda posConsultaRunning = sem repetição.
+  cron.schedule('0,10,20 13 * * *', async () => {
     await sendPostConsultationMessages();
   });
 
@@ -1503,8 +1506,12 @@ async function sendPendingSurveys() {
 // Pós-consulta: check-in no dia seguinte
 // ═══════════════════════════════════════════════════════════════════════════════
 
+let posConsultaRunning = false;
+
 async function sendPostConsultationMessages() {
   if (!sendMessageFn) return;
+  if (posConsultaRunning) { console.log('⏭️ Pós-consulta já em execução — rodada extra ignorada'); return; }
+  posConsultaRunning = true;
 
   try {
     // Buscar consultas concluídas nos últimos 3 dias
@@ -1584,6 +1591,8 @@ async function sendPostConsultationMessages() {
     }
   } catch (err) {
     console.error('❌ Erro geral no sistema de pós-consulta:', err.message);
+  } finally {
+    posConsultaRunning = false;
   }
 }
 
