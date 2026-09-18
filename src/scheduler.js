@@ -491,6 +491,9 @@ export function startScheduler() {
     await checkStaleLeads();
     await expireUnansweredLeadReengagements();
     await expireStaleRetornoCards();
+    // Cards de cancelamento/reagendamento criados pela Claudia (cancel_appointment /
+    // request_reschedule): 30 dias sem consulta nova → perdido (caso 18/09/2026, 27 cards invisíveis desde abril).
+    await expireStaleRescheduleCards();
   });
 }
 
@@ -671,6 +674,8 @@ async function expireUnansweredLeadReengagements() {
 // NÃO envia mensagem nenhuma: é só organização do Kanban.
 const RETORNO_EXPIRE_DAYS = 30;
 const RETORNO_CARD_TYPES = ['retorno_1m', 'retorno_3m', 'retorno_6m', 'retorno_12m'];
+const RESCHEDULE_EXPIRE_DAYS = 30;
+const RESCHEDULE_CARD_TYPES = ['cancelamento', 'reagendamento'];
 
 async function expireStaleRetornoCards() {
   try {
@@ -715,6 +720,75 @@ async function expireStaleRetornoCards() {
     }
   } catch (err) {
     console.error('❌ Erro na expiração de cards de retorno:', err.message);
+  }
+}
+
+// Expiração dos cards de CANCELAMENTO/REAGENDAMENTO criados pela Claudia
+// (cancel_appointment / request_reschedule): paciente pediu pra cancelar ou
+// remarcar, o card entrou no Kanban e, se ele nunca marcou consulta nova, ficava
+// lá para sempre (27 cards invisíveis desde abril, detectados em 18/09/2026).
+// Idade = o que foi tocado por último (createdAt ou updatedAt): "Reativar" ou
+// arrastar o card no Kanban zera o relógio, como em expireStaleRetornoCards.
+// Card adiado (snoozedUntil no futuro) nunca expira. NÃO envia mensagem
+// nenhuma: é só organização do Kanban.
+async function expireStaleRescheduleCards() {
+  try {
+    const { listFollowUps, updateFollowUp, getPatientAppointments } = await import('./crmApi.js');
+    const cutoffMs = RESCHEDULE_EXPIRE_DAYS * 24 * 3600 * 1000;
+    let expired = 0;
+    let kept = 0;
+
+    for (const type of RESCHEDULE_CARD_TYPES) {
+      const res = await listFollowUps(type, ['pendente', 'enviado', 'respondeu']);
+      if (!res.ok || !Array.isArray(res.data)) {
+        console.warn(`⚠️ Expiração de reagendamentos: falha ao listar ${type}:`, res.error || 'resposta inesperada');
+        continue;
+      }
+      for (const card of res.data) {
+        // Adiado pelo Diego no Kanban → respeita o prazo dele.
+        const hoje = new Date().toISOString().slice(0, 10);
+        if (card.snoozedUntil && String(card.snoozedUntil).slice(0, 10) > hoje) { kept++; continue; }
+
+        // Relógio pelo último toque (criação OU ação humana no card).
+        const tCriado = new Date(card.createdAt || 0).getTime() || 0;
+        const tTocado = new Date(card.updatedAt || 0).getTime() || 0;
+        const touched = Math.max(tCriado, tTocado);
+        if (!touched || Date.now() - touched < cutoffMs) { kept++; continue; }
+        const stamp = touched === tTocado && card.updatedAt ? card.updatedAt : card.createdAt;
+
+        // Segurança: se existe consulta DEPOIS do dia do pedido e não cancelada,
+        // o paciente remarcou (o auto-update do CRM pode ter falhado) → mantém.
+        // Em erro do CRM não decide nada: tenta na próxima rodada.
+        try {
+          const apts = await getPatientAppointments(card.phone, { includeCompleted: true });
+          if (!apts?.ok) {
+            console.warn(`⚠️ Expiração de reagendamentos: CRM falhou para card ${card.id} (${card.phone || 'sem telefone'}):`, apts?.error || apts?.status);
+            kept++; continue;
+          }
+          const arr = Array.isArray(apts.data) ? apts.data : [];
+          const cardDay = String(stamp).slice(0, 10);
+          if (arr.some((a) => String(a.date || '') > cardDay && a.status !== 'cancelado')) { kept++; continue; }
+        } catch { continue; /* CRM instável — tenta na próxima rodada */ }
+
+        try {
+          const up = await updateFollowUp(card.id, {
+            status: 'perdido',
+            lostReason: 'nao_remarcou',
+            notes: `${card.notes || ''}\nNão remarcou em ${RESCHEDULE_EXPIRE_DAYS} dias — encerrado automaticamente em ${new Date().toLocaleDateString('pt-BR')}`.trim(),
+          });
+          // crmFetch nunca lança: sem conferir .ok o log diria "→ perdido" para PATCH que falhou.
+          if (!up?.ok) { console.warn(`⚠️ Expiração de reagendamentos: erro ao mover card ${card.id}:`, up?.error); continue; }
+          expired++;
+        } catch (err) {
+          console.warn(`⚠️ Expiração de reagendamentos: erro ao mover card ${card.id}:`, err.message);
+        }
+      }
+    }
+    if (expired || kept) {
+      console.log(`🗂️ Expiração de reagendamentos: ${expired} card(s) → perdido, ${kept} mantido(s)`);
+    }
+  } catch (err) {
+    console.error('❌ Erro na expiração de cards de reagendamento:', err.message);
   }
 }
 
