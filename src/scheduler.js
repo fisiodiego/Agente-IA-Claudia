@@ -455,7 +455,9 @@ export function startScheduler() {
   });
 
   // ── Aniversário: enviar parabéns às 9h BRT (12h UTC) ──
-  cron.schedule('0 12 * * *', async () => {
+  // 3 chances (9:00/9:10/9:20): node-cron 3.0.3 pula tick (pulou 18/05, 07/09,
+  // 16/09). sent_birthdays (telefone+ano) + guarda birthdaysRunning = sem repetição.
+  cron.schedule('0,10,20 12 * * *', async () => {
     await sendBirthdayMessages();
   });
 
@@ -477,7 +479,9 @@ export function startScheduler() {
   });
 
   // ── Lembrete no dia da consulta: 8h BRT (11h UTC) ──
-  cron.schedule('0 11 * * *', async () => {
+  // 3 chances (8:00/8:10/8:20): node-cron 3.0.3 pula tick (pulou 16/05 e 04/08).
+  // sent_sameday_reminders (por consulta) + guarda samedayRunning = sem repetição.
+  cron.schedule('0,10,20 11 * * *', async () => {
     await sendSameDayReminders();
   });
 
@@ -1588,8 +1592,12 @@ async function sendPostConsultationMessages() {
 // Aniversário: parabéns automáticos
 // ═══════════════════════════════════════════════════════════════════════════════
 
+let birthdaysRunning = false;
+
 async function sendBirthdayMessages() {
   if (!sendMessageFn) return;
+  if (birthdaysRunning) { console.log('⏭️ Aniversários já em execução — rodada extra ignorada'); return; }
+  birthdaysRunning = true;
 
   try {
     // Data de hoje no formato MM-DD (ajustando para BRT = UTC-3)
@@ -1657,6 +1665,8 @@ async function sendBirthdayMessages() {
     }
   } catch (err) {
     console.error('❌ Erro geral no sistema de aniversários:', err.message);
+  } finally {
+    birthdaysRunning = false;
   }
 }
 
@@ -2307,8 +2317,12 @@ async function sendReferralCampaign() {
 // Lembrete no dia da consulta (manhã 8h BRT)
 // ═══════════════════════════════════════════════════════════════════════════════
 
+let samedayRunning = false;
+
 async function sendSameDayReminders() {
   if (!sendMessageFn) return;
+  if (samedayRunning) { console.log('⏭️ Lembrete do dia já em execução — rodada extra ignorada'); return; }
+  samedayRunning = true;
 
   try {
     // Data de hoje (BRT)
@@ -2416,6 +2430,8 @@ async function sendSameDayReminders() {
     }
   } catch (error) {
     console.error('❌ Erro geral no sistema de lembretes do dia:', error.message);
+  } finally {
+    samedayRunning = false;
   }
 }
 
