@@ -368,13 +368,15 @@ export function startScheduler() {
     await checkAndSendFollowups();
   });
 
-  // Lembrete noturno: 20h BRT (23h UTC) — envia para todos os agendamentos do dia seguinte.
+  // Lembrete noturno: 18h BRT (21h UTC) — envia para todos os agendamentos do dia seguinte.
+  // Era 20h; Diego pediu 18h em 21/09/2026 (teste de 2 semanas: baseline 53% confirmam na
+  // mesma noite / 61% até as 8h, 142 lembretes em 30 dias).
   // node-cron 3.0.3 só dispara se um tick de ~1s cair exatamente no segundo :00 e não
   // recupera tick perdido — em 16/09/2026 pulou o dia inteiro, em silêncio. Ligar
   // recoverMissedExecutions nessa versão DUPLICA toda execução (issue #400) — NÃO usar.
-  // Solução: três chances (20:00, 20:10, 20:20 BRT). A função é idempotente
+  // Solução: três chances (18:00, 18:10, 18:20 BRT). A função é idempotente
   // (sent_reminders_log + sentReminders) e tem guarda de reentrância (remindersRunning).
-  cron.schedule('0,10,20 23 * * *', async () => {
+  cron.schedule('0,10,20 21 * * *', async () => {
     await checkAndSendReminders();
   });
 
@@ -387,16 +389,16 @@ export function startScheduler() {
   // Executar follow-ups imediatamente ao iniciar
   setTimeout(() => checkAndSendFollowups(), 3000);
 
-  // Executar checagem de lembretes 10s após iniciar (APENAS se horario BRT entre 19:30-23:59)
+  // Executar checagem de lembretes 10s após iniciar (APENAS se horario BRT entre 17:30-23:59)
   setTimeout(() => {
     const nowBRT = new Date(Date.now() - 3 * 3600000);
     const hourBRT = nowBRT.getUTCHours();
     const minBRT = nowBRT.getUTCMinutes();
-    if (hourBRT >= 20 || (hourBRT === 19 && minBRT >= 30)) {
+    if (hourBRT >= 18 || (hourBRT === 17 && minBRT >= 30)) {
       console.log("⏰ Horario BRT (" + hourBRT + ":" + String(minBRT).padStart(2, "0") + ") dentro da janela — executando lembretes noturno");
       checkAndSendReminders();
     } else {
-      console.log("⏰ Horario BRT (" + hourBRT + ":" + String(minBRT).padStart(2, "0") + ") fora da janela de lembretes (19:30-23:59) — pulando");
+      console.log("⏰ Horario BRT (" + hourBRT + ":" + String(minBRT).padStart(2, "0") + ") fora da janela de lembretes (17:30-23:59) — pulando");
     }
   }, 10000);
 
@@ -925,7 +927,7 @@ async function sendFollowup(followup) {
   console.log(`✅ Follow-up enviado com sucesso para ${followup.name}`);
 }
 
-// Guarda de reentrância do lembrete noturno: o cron roda em 3 horários (20:00/20:10/20:20 BRT)
+// Guarda de reentrância do lembrete noturno: o cron roda em 3 horários (18:00/18:10/18:20 BRT)
 // e o boot também pode chamar a função. Uma rodada em curso (cada envio leva ~4s) não pode
 // ser atropelada por outra — a marcação em sent_reminders_log só acontece DEPOIS do smartSend,
 // então duas rodadas simultâneas lembrariam o mesmo paciente duas vezes.
@@ -956,7 +958,7 @@ async function checkAndSendReminders() {
     const [y, m, d] = targetDate.split('-');
     const dateBR = `${d}/${m}/${y}`;
 
-    console.log(`🌙 Lembrete noturno (20h) — buscando agendamentos de ${dateBR}...`);
+    console.log(`🌙 Lembrete noturno (18h) — buscando agendamentos de ${dateBR}...`);
 
     const result = await getUpcomingAppointments(targetDate);
     if (!result.ok) {
