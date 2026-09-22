@@ -255,11 +255,122 @@ function registrarEnvioAutomatico(phone, text, templateName) {
   }
 }
 
+// Templates que a exclusao geral de campanhas NUNCA barra.
+//
+// Set PROPRIO de proposito: nao reaproveitamos TEMPLATES_ESSENCIAIS porque
+// mexer naquele Set mudaria o teto de 2 automaticas/24h do anti-flood, que e
+// outra regra. Os dois calham de comecar iguais; nao sao a mesma lista.
+//
+// O criterio e "o paciente PERDE algo concreto se ficar sem esta mensagem?":
+//   - a consulta DELE  -> ficar mudo faz ele perder o horario;
+//   - o dinheiro DELE  -> ficar mudo faz ele perder credito que ja pagou.
+//
+// Ficaram DE FORA (ou seja, sao campanha e podem ser barradas), com o porque:
+//   - pesquisa_satisfacao_a / followup_satisfacao: pedido de favor ao paciente
+//     (avaliar no Doctoralia). Nada se perde no silencio, e e da mesma familia
+//     da indicacao, da qual a Alice ja estava excluida desde 22/08.
+//   - falta_reagendamento_a: o paciente faltou e perguntamos se quer remarcar.
+//     E reativo, mas nada se perde - a consulta ja passou e ele pode ligar.
+//     Para quem pediu para sair do automatico, "voce faltou, quer remarcar?" e
+//     exatamente o tipo de cutucao automatica de que ele saiu; no caso da Alice
+//     o proprio motivo registrado e que o Diego trata o relacionamento na mao.
+//     E o mais discutivel dos tres: se o Diego quiser, basta adicionar aqui.
+//   - lembrete_pacote, reativacao_paciente, aniversario_paciente, pos_consulta,
+//     retorno_*, lead_agendamento_*, indicacao: campanha pura.
+//
+// A vaga da lista de espera nao aparece aqui porque nao passa por este funil:
+// checkWaitlistVacancies chama sendMessageFn direto. E operacional (o paciente
+// PEDIU para ser avisado e perde a vaga se ficar mudo), entao fica como esta -
+// de fora do opt-out por construcao.
+const TEMPLATES_FORA_DO_OPTOUT = new Set([
+  'lembrete_consulta',
+  'lembrete_dia',
+  'plano_aviso_encerramento',
+  'plano_encerrado_credito',
+  'credito_aviso_vencimento_c',
+]);
+
+let bloqueiosOptout = 0;
+
+/**
+ * Paciente esta na exclusao geral de campanhas?
+ *
+ * Compara por SUFIXO DE 8 DIGITOS, regra de correlacao do projeto: o 9o digito
+ * do celular brasileiro aparece e some no wa_id, e igualdade exata deixaria o
+ * excluido passar.
+ *
+ * Fail-CLOSED de proposito - ao contrario do anti-flood logo acima, que e
+ * fail-open e esta documentado como tal. Nao e incoerencia, sao riscos
+ * diferentes:
+ *   - o anti-flood e um teto de VOLUME; se ele falhar aberto, o custo e uma
+ *     mensagem a mais, e calar a clinica inteira por um defeito na trava seria
+ *     pior que o flood que ela previne;
+ *   - esta lista e uma decisao NOMINAL do Diego sobre uma pessoa. Falhar aberto
+ *     aqui significa mandar justamente para quem ele disse para nao mandar -
+ *     que e a unica coisa que esta funcao existe para impedir. O dano e de
+ *     relacionamento e nao tem desfazer.
+ * Falhar fechado custa, no maximo, uma mensagem de campanha que o proximo giro
+ * do cron reenvia. E so e seguro por causa da ordem abaixo: a isencao e
+ * conferida ANTES de encostar no banco, entao nenhum erro de leitura consegue
+ * calar lembrete de consulta nem aviso de credito.
+ *
+ * Mesma escolha ja feita na indicacaoBloqueada, que e a irma desta funcao.
+ */
+// A tabela tambem e criada aqui, e nao so no database.js, de proposito: a funcao
+// abaixo e fail-closed, entao um deploy que subisse so este arquivo (sem o
+// database.js) faria o SELECT lancar e BLOQUEARIA TODAS as campanhas para TODOS
+// os pacientes, em silencio. Com o CREATE IF NOT EXISTS aqui, o pior caso de um
+// deploy parcial passa a ser "lista vazia" em vez de "clinica muda".
+try {
+  db.exec(`CREATE TABLE IF NOT EXISTS campanha_optout (
+    phone_suffix8 TEXT PRIMARY KEY,
+    patient_name  TEXT,
+    reason        TEXT,
+    created_at    TEXT DEFAULT (datetime('now','localtime'))
+  )`);
+} catch (err) {
+  console.error('❌ Falha ao garantir a tabela campanha_optout:', err.message);
+}
+
+function campanhaBloqueada(phone, templateName) {
+  // Isencao primeiro: e o que torna o fail-closed seguro (ver acima).
+  if (templateName && TEMPLATES_FORA_DO_OPTOUT.has(templateName)) return false;
+
+  const s8 = String(phone || '').replace(/\D/g, '').slice(-8);
+  // Telefone com menos de 8 digitos nao e "nao sei", e "nao pode ser chave
+  // desta tabela". Bloquear ali seria suprimir em silencio sem impedir nada —
+  // fail-closed vale para erro de LEITURA da lista, nao para telefone curto.
+  // (Nao confundir com telefone FALSO tipo 1111...: esse tem 8 digitos e passa
+  // por aqui normalmente; quem filtra fake e o isValidBRPhone de cada campanha.)
+  if (s8.length !== 8) return false;
+
+  try {
+    return !!db.prepare(
+      'SELECT 1 FROM campanha_optout WHERE phone_suffix8 = ? LIMIT 1'
+    ).get(s8);
+  } catch (err) {
+    console.warn(`OPT-OUT CAMPANHA: falha ao ler a lista para ${phone}: ${err.message} - NAO enviando (fail-closed)`);
+    return true;
+  }
+}
+
 async function smartSend(phone, text, templateName, templateParams = []) {
   const permissao = podeEnviarAutomatica(phone, text, templateName);
   if (!permissao.pode) {
     bloqueiosAntiFlood++;
     console.warn(`ANTI-FLOOD: envio para ${phone} bloqueado - ${permissao.motivo} [total: ${bloqueiosAntiFlood}]`);
+    return false;
+  }
+
+  // Exclusao geral de campanhas (pedido do Diego, 22/09/2026). Fica DEPOIS do
+  // anti-flood e ANTES do takeover de proposito: das tres travas e a mais
+  // permanente, e o log precisa dizer OPT-OUT em vez de "atendimento humano
+  // ativo", que e estado passageiro e mandaria o Diego investigar a coisa
+  // errada daqui a seis meses. Tambem e a mais barata: so le o banco local,
+  // sem entrar no isHumanActiveFn.
+  if (campanhaBloqueada(phone, templateName)) {
+    bloqueiosOptout++;
+    console.warn(`OPT-OUT CAMPANHA: envio para ${phone} bloqueado (rotulo: ${templateName || 'texto-livre'}) - paciente na lista campanha_optout [total: ${bloqueiosOptout}]`);
     return false;
   }
 
@@ -589,6 +700,19 @@ async function checkStaleLeads() {
       const firstNameRaw = (!rawName || /^contato/i.test(rawName)) ? '' : rawName.split(/\s+/)[0];
       // pushName sem letra (só emoji/símbolo) → saudação neutra "Ola, tudo bem."
       const firstName = /[a-zà-ú]/i.test(firstNameRaw) ? firstNameRaw : 'tudo bem';
+
+      // Exclusao geral de campanhas. Este envio nao passa pelo smartSend, entao
+      // a trava precisa estar aqui tambem - senao a exclusao valeria "em quase
+      // todas" as campanhas, que e o que o Diego pediu para acabar.
+      // Nao gravamos em lead_reengagement: o dedupe de la e PERMANENTE e
+      // queimaria a unica chance do lead se o Diego tirar o paciente da lista.
+      // Fica no FIM da fila de skips, depois dos filtros caros, de proposito:
+      // assim a linha no log significa "um envio de verdade foi impedido", e
+      // nao "passou alguem da lista por aqui" - que encheria o log de ruido.
+      if (campanhaBloqueada(digits, templateName)) {
+        console.warn(`OPT-OUT CAMPANHA: reengajamento de lead para ${digits} bloqueado - paciente na lista campanha_optout`);
+        skipped++; continue;
+      }
 
       const ok = await sendTemplateFn(digits, templateName, [firstName]);
       if (ok) {
@@ -1242,7 +1366,14 @@ async function checkStalePackages() {
         console.log(`📦 Enviando lembrete nível ${level} para ${pkg.patientName} (pacote: ${pkg.productName})`);
 
         const pkgFirstName = pkg.patientName.split(' ')[0];
-        await smartSend(pkg.phone, message, 'lembrete_pacote', [pkgFirstName, String(pkg.freeSessions), pkg.productName, deadlineBR]);
+        // Dedupe de package_reminders e permanente por nivel: se o envio foi
+        // barrado (opt-out, anti-flood, takeover, janela fechada), gravar aqui
+        // queimaria aquele nivel do lembrete para sempre.
+        const pkgOk = await smartSend(pkg.phone, message, 'lembrete_pacote', [pkgFirstName, String(pkg.freeSessions), pkg.productName, deadlineBR]);
+        if (!pkgOk) {
+          console.warn(`⚠️ Lembrete de pacote de ${pkg.patientName} (nivel ${level}) nao entregue — NAO marcado, segue elegivel`);
+          continue;
+        }
 
         // Registrar envio
         db.prepare(
@@ -1317,7 +1448,13 @@ async function checkNoShows() {
         const nsFirstName = ns.patientName.split(' ')[0];
         const [ny, nm, nd] = ns.date.split('-');
         const nsDateBR = `${nd}/${nm}/${ny}`;
-        await smartSend(ns.patientPhone, message, 'falta_reagendamento_a', [nsFirstName, nsDateBR, ns.time, ns.professionalName]);
+        // processed_noshows e permanente: marcar com o envio barrado queimaria
+        // o contato daquele no-show para sempre.
+        const nsOk = await smartSend(ns.patientPhone, message, 'falta_reagendamento_a', [nsFirstName, nsDateBR, ns.time, ns.professionalName]);
+        if (!nsOk) {
+          console.warn(`⚠️ Contato de falta de ${ns.patientName} nao entregue — NAO marcado, segue elegivel`);
+          continue;
+        }
 
         // Marcar como processado
         db.prepare(
@@ -1476,6 +1613,21 @@ async function sendPendingSurveys() {
       // Envia template UTILITY pesquisa_satisfacao_a — Header + Body + Footer + botão URL
       // (Avaliar agora → Doctoralia) + botão QUICK_REPLY (Ja avaliei).
       // Template UTILITY entrega independente da janela 24h. ID Meta: 1642198767063313.
+      // Exclusao geral de campanhas. A pesquisa e um pedido de favor ao
+      // paciente (avaliar no Doctoralia), nao um aviso sobre a consulta ou o
+      // dinheiro dele - por isso NAO esta em TEMPLATES_FORA_DO_OPTOUT.
+      // Marcamos a linha como 'optout' em vez de deixar 'pending': a fila roda
+      // todo dia com scheduled_for <= hoje e ficaria repetindo o mesmo bloqueio
+      // no log para sempre. O agent.js so procura status = 'sent' ao marcar
+      // "Ja avaliei", entao o status novo nao atrapalha nada.
+      if (campanhaBloqueada(p.phone, 'pesquisa_satisfacao_a')) {
+        db.prepare(
+          "UPDATE pending_surveys SET status = 'optout', last_error = 'paciente na lista campanha_optout' WHERE id = ?"
+        ).run(p.id);
+        console.warn(`OPT-OUT CAMPANHA: pesquisa de satisfacao de ${p.patient_name} nao enviada - paciente na lista campanha_optout`);
+        continue;
+      }
+
       const ok = await sendTemplateFn(p.phone, 'pesquisa_satisfacao_a', [firstName]);
       if (!ok) throw new Error('sendTemplate retornou false');
 
@@ -1712,6 +1864,10 @@ async function sendReactivationMessages() {
     // 0 saindo por semana, os 31 presos além da posição 10. Agora filtra primeiro
     // e o teto de 10 é gasto só com quem de fato vai receber.
     const naoReceberam = patients.filter((p) => {
+      // Quem esta na lista de exclusao sai AQUI, antes do teto de 10 — senao
+      // ocupa um slot que seria barrado la na frente e a rodada entrega 9 em
+      // vez de 10, semana apos semana.
+      if (campanhaBloqueada(p.phone, 'reativacao_paciente')) return false;
       try {
         return !db.prepare('SELECT 1 FROM sent_reactivations WHERE patient_id = ?').get(p.patientId);
       } catch (e) {
@@ -1929,6 +2085,16 @@ async function runPackageExpiryCycle() {
       continue;
     }
 
+    // Exclusao geral de campanhas. HOJE nunca barra, porque plano_aviso_
+    // encerramento esta em TEMPLATES_FORA_DO_OPTOUT (e dinheiro do paciente).
+    // A chamada fica aqui assim mesmo para que a POLITICA viva num lugar so
+    // (aquele Set) em vez de virar uma lista de call sites que alguem tem de
+    // lembrar de sincronizar. Se o Diego um dia mudar de ideia, muda o Set.
+    if (campanhaBloqueada(pkg.phone, 'plano_aviso_encerramento')) {
+      console.warn(`OPT-OUT CAMPANHA: aviso de encerramento de ${pkg.patientName} bloqueado - paciente na lista campanha_optout`);
+      continue;
+    }
+
     const firstName = String(pkg.patientName || '').split(' ')[0] || 'tudo bem';
     const ok = await sendTemplateFn(pkg.phone, 'plano_aviso_encerramento', [firstName, String(pkg.freeSessions)]);
     if (ok) {
@@ -1951,6 +2117,16 @@ async function runPackageExpiryCycle() {
   for (const row of toClose) {
     const pkg = stale.find((p) => p.packageId === row.package_id);
     if (!pkg) continue; // não está mais parado — o bloco acima já limpou
+
+    // Exclusao geral de campanhas. Hoje nunca barra (plano_encerrado_credito e
+    // isento - e dinheiro do paciente). A guarda fica ANTES do encerramento, e
+    // nao colada na mensagem, porque se um dia esse template sair da lista de
+    // isentos, barrar so o aviso encerraria o pacote em silencio e o paciente
+    // descobriria sozinho que virou credito com validade correndo.
+    if (campanhaBloqueada(row.phone, 'plano_encerrado_credito')) {
+      console.warn(`OPT-OUT CAMPANHA: encerramento de plano de ${row.patient_name} nao processado - paciente na lista campanha_optout`);
+      continue;
+    }
 
     try {
       const res = await closeExpiredPackage(row.package_id, CREDIT_VALIDITY_MONTHS);
@@ -1982,6 +2158,13 @@ async function runPackageExpiryCycle() {
     for (const c of (res.ok && Array.isArray(res.data) ? res.data : [])) {
       if (db.prepare('SELECT 1 FROM credit_expiry_notices WHERE credit_id = ?').get(c.creditId)) continue;
       if (!isValidBRPhone(c.phone)) continue;
+      // Exclusao geral de campanhas. Hoje nunca barra: credito_aviso_vencimento_c
+      // e isento, avisa que o credito PAGO esta prestes a vencer. Mesmo motivo
+      // das outras duas do ciclo de plano para a chamada existir mesmo assim.
+      if (campanhaBloqueada(c.phone, 'credito_aviso_vencimento_c')) {
+        console.warn(`OPT-OUT CAMPANHA: aviso de vencimento de credito de ${c.patientName} bloqueado - paciente na lista campanha_optout`);
+        continue;
+      }
       const firstName = String(c.patientName || '').split(' ')[0] || 'tudo bem';
       const [y, m, d] = String(c.expiresAt).split('-');
       const ok = await sendTemplateFn(c.phone, 'credito_aviso_vencimento_c', [
@@ -2104,6 +2287,15 @@ async function checkCompletedPackages() {
 
         if (already) continue;
 
+        // Exclusao geral de campanhas: parabens por pacote concluido e campanha
+        // pura (o proprio texto convida a agendar de novo) e este envio nao passa
+        // pelo smartSend — precisa da guarda aqui. Antes do INSERT no dedupe, pra
+        // nao queimar o aviso de quem sair da lista depois.
+        if (campanhaBloqueada(pkg.phone, 'pacote_concluido')) {
+          console.warn(`OPT-OUT CAMPANHA: aviso de pacote concluido de ${pkg.patientName} suprimido (lista de exclusao)`);
+          continue;
+        }
+
         const message = packageCompletedMessage(pkg.patientName, pkg.productName, pkg.totalSessions);
 
         console.log(`🏆 Notificando conclusão de pacote para ${pkg.patientName} (${pkg.productName})`);
@@ -2152,13 +2344,20 @@ function sufixo8Indicacao(telefone) {
  * Paciente esta fora da campanha de indicacao por decisao do Diego?
  * Fail-closed: se a consulta falhar, nao envia - errar mandando para quem foi
  * explicitamente excluido e pior do que deixar de mandar.
+ *
+ * Desde 22/09/2026 consulta as DUAS listas. A referral_optout NAO foi removida
+ * nem absorvida: por decisao registrada do Diego em 22/08 ela e a lista
+ * so-de-indicacao (a Priscila nao esta nela - o skip dela e so do ciclo de
+ * planos), enquanto a campanha_optout tira o paciente de TODA campanha. Quem
+ * esta em qualquer uma das duas nao recebe pedido de indicacao.
  */
 function indicacaoBloqueada(s8) {
   if (!s8 || s8.length !== 8) return true;
   try {
     return !!db.prepare(
-      'SELECT 1 FROM referral_optout WHERE phone_suffix8 = ? LIMIT 1'
-    ).get(s8);
+      'SELECT 1 FROM referral_optout WHERE phone_suffix8 = ? ' +
+      'UNION ALL SELECT 1 FROM campanha_optout WHERE phone_suffix8 = ? LIMIT 1'
+    ).get(s8, s8);
   } catch (err) {
     console.warn(`AVISO: falha ao checar lista de excluidos da indicacao: ${err.message} - nao enviando`);
     return true;

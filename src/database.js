@@ -162,6 +162,32 @@ db.exec(`
     created_at    TEXT DEFAULT (datetime('now','localtime'))
   );
 
+  -- Exclusao GERAL de campanhas, pedida pelo Diego em 22/09/2026: "criar uma
+  -- exclusao geral, que vale para todas as campanhas, em vez de listas
+  -- separadas". Ate entao so existia a referral_optout, consultada unicamente
+  -- pela indicacao; a reativacao nao olhava lista nenhuma e a Alice Portugal,
+  -- fora da indicacao desde 22/08, estava na posicao 4 da fila da reativacao.
+  --
+  -- Esta tabela NAO substitui a referral_optout. Decisao registrada do Diego em
+  -- 22/08: a referral_optout e a lista so-de-indicacao (a Priscila nao esta
+  -- nela; o skip dela e so do ciclo de planos). Sao listas separadas de
+  -- proposito e a indicacao passou a consultar as DUAS.
+  --
+  -- Chave por sufixo de 8 digitos, como todo o resto do projeto: o 9o digito do
+  -- celular brasileiro aparece e some no wa_id, e igualdade exata deixaria o
+  -- excluido passar.
+  --
+  -- DEFAULT (datetime(...)) e o mesmo padrao de phone_lid_map, lead_reengagement
+  -- e pending_surveys, que o node:sqlite desta VPS cria sem reclamar. (Atencao:
+  -- a referral_optout em producao foi criada na mao e esta SEM o default, entao
+  -- ela nao serve de prova do padrao - as outras tres servem.)
+  CREATE TABLE IF NOT EXISTS campanha_optout (
+    phone_suffix8 TEXT PRIMARY KEY,
+    patient_name  TEXT,
+    reason        TEXT,
+    created_at    TEXT DEFAULT (datetime('now','localtime'))
+  );
+
     CREATE TABLE IF NOT EXISTS sent_sameday_reminders (
       appointment_id TEXT PRIMARY KEY,
       sent_at TEXT NOT NULL
