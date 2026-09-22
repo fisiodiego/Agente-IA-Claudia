@@ -1705,26 +1705,46 @@ async function sendReactivationMessages() {
       return;
     }
 
-    console.log(`🔄 ${patients.length} paciente(s) inativo(s) encontrado(s)`);
+    // FILA ENTUPIDA (corrigido 22/09/2026): o corte dos 10 acontecia ANTES de
+    // filtrar quem já recebeu. Como a ordem da lista é estável e os primeiros da
+    // fila já tinham recebido meses atrás, toda terça pegava os mesmos 10, pulava
+    // todos e mandava ZERO. Medido no dia: 50 elegíveis, 31 nunca contemplados,
+    // 0 saindo por semana, os 31 presos além da posição 10. Agora filtra primeiro
+    // e o teto de 10 é gasto só com quem de fato vai receber.
+    const naoReceberam = patients.filter((p) => {
+      try {
+        return !db.prepare('SELECT 1 FROM sent_reactivations WHERE patient_id = ?').get(p.patientId);
+      } catch (e) {
+        console.warn(`⚠️ Reativação: erro ao checar dedupe de ${p.name}:`, e.message);
+        return false; // na dúvida, NÃO envia (dedupe é de tiro único e permanente)
+      }
+    });
+    console.log(`🔄 ${patients.length} paciente(s) inativo(s) — ${naoReceberam.length} ainda não contemplado(s)`);
+    if (naoReceberam.length === 0) {
+      console.log('🔄 Todos os inativos já receberam reativação — nada a enviar');
+      return;
+    }
 
-    // Limitar a 10 mensagens por execução para não sobrecarregar
-    const batch = patients.slice(0, 10);
+    // Teto de 10 por execução (cron semanal) para não disparar a fila inteira de uma vez
+    const batch = naoReceberam.slice(0, 10);
 
     for (const patient of batch) {
       try {
-        // Verificar se já enviou reativação (só envia 1 vez)
-        const already = db.prepare(
-          'SELECT 1 FROM sent_reactivations WHERE patient_id = ?'
-        ).get(patient.patientId);
-
-        if (already) continue;
-
         const message = reactivationMessage(patient.name, patient.daysSinceLastAppointment);
 
         console.log(`🔄 Enviando reativação para ${patient.name} (${patient.daysSinceLastAppointment} dias sem consulta)`);
 
         const reactFirstName = patient.name.split(' ')[0];
-        await smartSend(patient.phone, message, 'reativacao_paciente', [reactFirstName]);
+        // O retorno do smartSend era DESCARTADO: envio barrado (takeover do Diego,
+        // anti-flood, ou janela de 24h fechada com falha no template) marcava o
+        // paciente como contemplado mesmo assim — e o dedupe aqui é de TIRO ÚNICO
+        // E PERMANENTE, ou seja, queimava a única chance dele. Mesma classe da
+        // "entrega fantasma" das campanhas, corrigida em 22/ago.
+        const reatOk = await smartSend(patient.phone, message, 'reativacao_paciente', [reactFirstName]);
+        if (!reatOk) {
+          console.warn(`⚠️ Reativação de ${patient.name} não entregue — NÃO marcada, segue elegível na próxima rodada`);
+          continue;
+        }
 
         db.prepare(
           'INSERT OR IGNORE INTO sent_reactivations (patient_id, sent_at) VALUES (?, ?)'
