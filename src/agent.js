@@ -1667,12 +1667,19 @@ export async function processMessage(phone, message, options = {}) {
 
     // System prompt dividido em 2 blocos:
     //   [0] estável (SYSTEM_PROMPT + __DATE_BLOCK__) → cacheado via ephemeral cache_control
+    //       com ttl de 1 HORA (padrão são 5 min). Medido em 22/09/2026: das 1.327
+    //       recargas do prompt inteiro em 5 meses, 715 aconteceram com intervalo
+    //       entre 5 min e 1 h — viram leitura barata. As demais custam 2x em vez
+    //       de 1,25x e ainda sobra saldo: -14% no custo de entrada. Conteúdo
+    //       enviado é idêntico (zero efeito no comportamento); prompt alterado
+    //       continua invalidando o cache normalmente. Testado no SDK 0.39.0 sem
+    //       header beta (o campo vai no corpo da requisição).
     //   [1] volátil (patientContext) → fresco a cada request, sem invalidar o cache do bloco [0]
     // Ordem de cache na API: tools → system → messages. Marcar o fim do system[0] cacheia tools+system[0].
     const avisoAusencia = blocoAusencia();
     const stableSystem = SYSTEM_PROMPT.replace("__DATE_BLOCK__", getDateSection(professionalsInfo));
     const systemBlocks = [
-      { type: 'text', text: stableSystem, cache_control: { type: 'ephemeral' } },
+      { type: 'text', text: stableSystem, cache_control: { type: 'ephemeral', ttl: '1h' } },
       { type: 'text', text: avisoAusencia + patientContext },
     ];
 
