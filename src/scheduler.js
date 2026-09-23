@@ -1683,18 +1683,29 @@ async function sendPostConsultationMessages() {
     const appointments = result.data;
     if (!appointments || appointments.length === 0) return;
 
-    // Filtrar: só enviar para consultas de ONTEM (dia seguinte = hoje)
+    // Janela: consultas dos ultimos 3 dias, EXCETO as de hoje (mandar "como voce
+    // esta apos a consulta?" 2h depois do atendimento seria cedo demais).
+    // Antes olhava so as de ONTEM: consulta marcada como concluida no CRM depois
+    // da rodada das 10h do dia seguinte ficava sem pos-consulta para sempre, e
+    // sem pos-consulta tambem nao dispara o pedido de indicacao. Medido em
+    // 23/09/2026: 6 pacientes em jun-set (Felipe Sacramento, Camila Viecceli,
+    // Djairo Costa 2x, Luciana Magalhaes, Joao Pedro Canella). O texto nao diz
+    // "ontem" ("como voce esta se sentindo apos a consulta"), entao serve para
+    // consulta de 2-3 dias atras. O dedupe por consulta (processed_completions)
+    // impede reenvio.
+    const hoje = new Date();
+    const todayStr = hoje.toISOString().slice(0, 10);
     const yesterday = new Date();
     yesterday.setDate(yesterday.getDate() - 1);
     const yesterdayStr = yesterday.toISOString().slice(0, 10);
 
-    const yesterdayAppointments = appointments.filter(a => a.date === yesterdayStr);
+    const pendentes = appointments.filter(a => a.date >= since && a.date < todayStr);
 
-    if (yesterdayAppointments.length === 0) return;
+    if (pendentes.length === 0) return;
 
-    console.log(`💬 ${yesterdayAppointments.length} consulta(s) concluída(s) ontem — enviando pós-consulta`);
+    console.log(`💬 ${pendentes.length} consulta(s) concluída(s) nos últimos 3 dias — verificando pós-consulta`);
 
-    for (const apt of yesterdayAppointments) {
+    for (const apt of pendentes) {
       try {
         // Verificar se já processou
         const already = db.prepare(
@@ -1702,6 +1713,28 @@ async function sendPostConsultationMessages() {
         ).get(apt.appointmentId);
 
         if (already) continue;
+
+        // UM pos-consulta por PACIENTE, nao por consulta. Com a janela de 3 dias,
+        // quem teve 2 consultas no mesmo dia (caso Marilia, 19/09: 8h e 9h) teria
+        // a 2a mensagem barrada pelo anti-flood no dia 1 — e, como envio barrado
+        // nao e marcado, ela seria tentada de novo no dia 2, com as 24h do
+        // anti-flood ja vencidas, e o paciente receberia o mesmo "como voce esta?"
+        // em dias seguidos. Se ele ja recebeu nos ultimos 3 dias, marca esta
+        // consulta como resolvida SEM mandar e SEM gravar em pos_consulta_log (que
+        // e a fonte do gatilho de indicacao e so pode ter envio real).
+        const s8pos = String(apt.patientPhone || '').replace(/\D/g, '').slice(-8);
+        if (s8pos.length === 8) {
+          const jaRecebeu = db.prepare(
+            "SELECT 1 FROM pos_consulta_log WHERE substr(replace(replace(replace(replace(replace(phone,' ',''),'-',''),'(',''),')',''),'+',''), -8) = ? AND sent_at > datetime('now','localtime','-3 days') LIMIT 1"
+          ).get(s8pos);
+          if (jaRecebeu) {
+            db.prepare(
+              'INSERT OR IGNORE INTO processed_completions (appointment_id, scheduled_date, processed_at) VALUES (?, ?, ?)'
+            ).run(apt.appointmentId, todayStr, new Date().toISOString());
+            console.log(`⏭️ Pós-consulta de ${apt.patientName} (consulta ${apt.date}) pulado — já recebeu nos últimos 3 dias`);
+            continue;
+          }
+        }
 
         const message = postConsultationCheckIn(apt.patientName);
 
