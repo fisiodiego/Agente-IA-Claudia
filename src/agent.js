@@ -659,6 +659,24 @@ function blocoAusencia() {
   ].join('\n');
 }
 
+// Mensagem de contingência quando a Claudia não consegue produzir resposta:
+// usada no catch (erro/exceção) e quando o modelo é chamado mas não devolve
+// texto nenhum (ver "RESPOSTA VAZIA" no fim do laço). Um texto só, para os
+// dois caminhos nunca divergirem. NÃO vai para o histórico (conversations):
+// o paciente reenvia e o modelo responde à pergunta original, sem se ver
+// pedindo desculpas nem perder o contexto do último turno de verdade.
+const MSG_DIFICULDADE_TECNICA = 'Desculpe, tive uma dificuldade técnica agora. Por favor, tente novamente em instantes ou ligue para a clínica. 🙏';
+// Variante para quando uma ferramenta que MEXE NA AGENDA já rodou neste turno
+// e só a redação da resposta falhou: "tente novamente" faria o paciente repetir
+// o pedido e o modelo (que não guarda os resultados de ferramenta no histórico)
+// poderia marcar/remarcar/cancelar de novo. Aqui o convite é CONFERIR, não repetir.
+const MSG_DIFICULDADE_POS_ACAO = 'Desculpe, tive uma dificuldade técnica para terminar minha resposta. Se quiser conferir como ficou sua agenda, é só me perguntar. 🙏';
+const TOOLS_QUE_MEXEM_NA_AGENDA = new Set(['create_appointment', 'reschedule_appointment', 'cancel_appointment', 'request_reschedule', 'add_to_waitlist']);
+// Teto de idas ao modelo por turno. Historico medido: 99,9% dos turnos usam ate
+// 8; o recorde foi 9+ (4 turnos em 6 meses, check_availability em serie). Com o
+// teto de 8000 tokens por chamada, um laco sem fim seguraria o lock por minutos.
+const MAX_ITERACOES_LLM = 12;
+
 export async function processMessage(phone, message, options = {}) {
   try {
     const { pushName, isLid, lidJid } = options;
@@ -1684,15 +1702,32 @@ export async function processMessage(phone, message, options = {}) {
     ];
 
     // Tool use loop - keep calling until we get a text response
+    let ultimaResposta = null; // stop_reason/usage da última chamada (log de RESPOSTA VAZIA)
+    const toolsExecutadas = [];  // nomes das ferramentas que rodaram neste turno (auditoria + texto da contingência)
+    let iteracoes = 0;
     while (true) {
+      if (++iteracoes > MAX_ITERACOES_LLM) {
+        console.warn(`⚠️ LAÇO DE TOOLS ESTOUROU (${MAX_ITERACOES_LLM} chamadas) — ${patient.name || phone}: tools=${toolsExecutadas.join(',') || 'nenhuma'}`);
+        assistantReply = "";
+        break;
+      }
       const response = await anthropic.messages.create({
         model: 'claude-sonnet-4-6',
-        max_tokens: 2048,
+        // 8000 (era 2048): com thinking adaptive o raciocínio CONTA no max_tokens.
+        // Em conversa confusa o modelo gastava os 2048 pensando e devolvia só o
+        // bloco thinking — sem texto, sem erro, sem log: paciente no silêncio.
+        // Caso Felipe Sica (29/09/2026, 08:50): 2 chamadas seguidas cortadas,
+        // 7h sem resposta; 15 casos desde 02/07 (~0,3% das chamadas). É só teto:
+        // paga-se o que o modelo gera (p99 medido = 1.328 tokens). A ~60 tok/s,
+        // uma chamada que chegue ao teto leva ~2,3 min e cai na ENTREGA ATRASADA
+        // do whatsapp-cloudapi.js (timeout de 90s só para de esperar).
+        max_tokens: 8000,
         thinking: { type: 'adaptive' },
         system: systemBlocks,
         messages: currentMessages,
         tools: CRM_TOOLS,
       });
+      ultimaResposta = response;
       // Log de cache para medir economia (cache_read_input_tokens indica hit)
       if (response.usage) {
         const u = response.usage;
@@ -1704,6 +1739,25 @@ export async function processMessage(phone, message, options = {}) {
       // Check if response has tool_use blocks
       const toolUseBlocks = response.content.filter(b => b.type === 'tool_use');
       const textBlocks = response.content.filter(b => b.type === 'text');
+
+      // Resposta CORTADA (bateu no max_tokens, ou recusa do classificador que
+      // também interrompe a geração): está incompleta por definição.
+      //  - tool_use cortado pode vir com argumentos pela metade (a API devolve o
+      //    que conseguiu montar e o SDK não valida) → executar seria marcar/
+      //    cancelar/remarcar consulta com dados truncados. NÃO executa.
+      //  - o texto que veio junto é preâmbulo ("vou verificar a agenda...") ou
+      //    frase pela metade → mandar isso promete o que não vai acontecer.
+      // Descarta tudo e sai do laço; a contingência abaixo responde o paciente.
+      // So 'tool_use' garante bloco de ferramenta completo; qualquer outro motivo
+      // de parada com tool_use (ex.: 'model_context_window_exceeded') e tratado
+      // como corte — lista branca, nao lista negra.
+      if (response.stop_reason === 'max_tokens' || response.stop_reason === 'refusal' ||
+          (toolUseBlocks.length > 0 && response.stop_reason !== 'tool_use')) {
+        const textoCortado = textBlocks.map(b => b.text).join("");
+        console.warn(`⚠️ RESPOSTA CORTADA (${response.stop_reason}) — ${patient.name || phone}: output_tokens=${response.usage?.output_tokens} tools_descartadas=${toolUseBlocks.map(b => b.name).join(',') || 'nenhuma'} tools_ja_executadas=${toolsExecutadas.join(',') || 'nenhuma'} texto_descartado=${textoCortado.length} chars`);
+        assistantReply = "";
+        break;
+      }
 
       if (toolUseBlocks.length === 0) {
         // No tools called, get text response
@@ -1717,6 +1771,7 @@ export async function processMessage(phone, message, options = {}) {
       const toolResults = [];
       for (const toolBlock of toolUseBlocks) {
         console.log("Tool call: " + toolBlock.name + " " + JSON.stringify(toolBlock.input));
+        toolsExecutadas.push(toolBlock.name);
         // Marcar paciente como recém-agendado quando create_appointment sucede
         if (toolBlock.name === 'create_appointment') {
           const toolResult = await handleToolCall(toolBlock.name, toolBlock.input, phone);
@@ -1751,6 +1806,26 @@ export async function processMessage(phone, message, options = {}) {
       }
     }
 
+    // 5c. NUNCA FICAR MUDA: o modelo foi chamado e não produziu texto (cortado
+    // no max_tokens, só thinking, ou end_turn vazio). Antes o "" era gravado no
+    // histórico e o whatsapp-cloudapi.js não enviava nada (if (reply)) — silêncio
+    // sem erro e sem log (caso Felipe Sica, 29/09/2026: 7h sem resposta).
+    // Os silêncios INTENCIONAIS (rate limit já avisado, confirmação duplicada,
+    // "ok" pós-agendamento) retornam null ANTES do laço e não passam por aqui.
+    // Mesmo tratamento do catch: a contingência NÃO vai para o histórico.
+    if (ultimaResposta && !assistantReply.trim()) {
+      // "Obrigado"/"ok" fora da janela do recentlyScheduled cai no modelo; se a
+      // resposta vier vazia, silêncio é o certo (responder "tente novamente" a um
+      // agradecimento assusta o paciente — 4 dos 15 casos historicos eram isso).
+      // Mesma lista do guard de msg curta pós-agendamento (~L1218).
+      const ehAckCurto = msgTrimmed.length <= 20 && /^(ok|certo|beleza|blz|perfeito|show|fechado|obrigad[oa]|valeu|brigad[oa]|muito obrigad[oa]|combinado|ate la|até lá|tudo bem|ta bom|tá bom)[!\.\ ]*$/i.test(msgTrimmed);
+      const mexeuNaAgenda = toolsExecutadas.some(t => TOOLS_QUE_MEXEM_NA_AGENDA.has(t));
+      console.warn(`⚠️ RESPOSTA VAZIA — ${patient.name || phone} (#${patient.id}): stop_reason=${ultimaResposta.stop_reason} output_tokens=${ultimaResposta.usage?.output_tokens} tools_ja_executadas=${toolsExecutadas.join(',') || 'nenhuma'} — ${ehAckCurto ? 'ack curto, silêncio mantido' : (mexeuNaAgenda ? 'contingência pós-ação' : 'enviando contingência')}`);
+      if (ehAckCurto && !mexeuNaAgenda) return null;
+      const contingencia = mexeuNaAgenda ? MSG_DIFICULDADE_POS_ACAO : MSG_DIFICULDADE_TECNICA;
+      return pendingLgpdAsk ? `${contingencia}\n\n${pendingLgpdAsk}` : contingencia;
+    }
+
     // 6. Cobrar o consentimento pendente no FIM da resposta (em vez de substituí-la)
     if (pendingLgpdAsk) {
       assistantReply = `${assistantReply}\n\n${pendingLgpdAsk}`;
@@ -1776,7 +1851,7 @@ export async function processMessage(phone, message, options = {}) {
 
   } catch (error) {
     console.error('❌ Erro no agente:', error.message);
-    return 'Desculpe, tive uma dificuldade técnica agora. Por favor, tente novamente em instantes ou ligue para a clínica. 🙏';
+    return MSG_DIFICULDADE_TECNICA;
   }
 }
 
