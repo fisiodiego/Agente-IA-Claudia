@@ -50,6 +50,29 @@ const REMINDER_WINDOW = 24 * 60 * 60 * 1000; // 24h
 // Pacientes que acabaram de agendar (evita interpretar 'Ok' como novo pedido)
 const recentlyScheduled = new Map(); // phone -> timestamp
 const SCHEDULE_COOLDOWN = 10 * 60 * 1000; // 10 minutos
+// Pergunta "trocar a consulta ou ficar com as duas?" em aberto (30/09/2026).
+// Enquanto vale, a resposta curta ("Sim", "Confirmo", "Cancelar", "Reagendar",
+// "ok") vai para o LLM: os atalhos confirmavam presença, cancelavam pending[0]
+// ou descartavam em silêncio (caso Gabriela 29/09: lembrete às 18h, pergunta
+// às 22h, "Sim"/"Simmm"). No toolHandler ela libera as travas só se a resposta
+// não for vaga (turnCtx.perguntaPendente + msgAtual) — quem lê a resposta é o LLM.
+// Vale se a ÚLTIMA fala da Claudia é a pergunta (sem prazo; sobrevive a pm2
+// restart, vem do banco) ou pela marca deste Map (2h), gravada quando uma trava
+// bloqueia ou a Claudia pergunta com outras palavras — menos quando a última
+// fala é o lembrete de véspera (aí "Confirmar" volta a confirmar no CRM).
+const perguntaTrocaPendente = new Map(); // phone -> timestamp
+const PERGUNTA_TROCA_TTL = 2 * 60 * 60 * 1000; // 2h
+// Um lado "trocar", um lado "ficar com as duas" e "?". Inclui a redação que a
+// Claudia já usou ("Quer *mudar* o horário ... ou uma consulta *adicional*?",
+// 19/05; "quer *manter* o de sábado ou prefere *cancelar*?", 26/05). Com \b:
+// "as duas" casava dentro de "nas duas datas".
+const RE_PERGUNTA_TROCA_A = /\btroc|\bsubstitu|\bno lugar\b|\bremarc|\bpassar (pra|para)\b|\bem vez\b|\bcancel|\bmud(ar|a|e|o)\b|\bmov(er|a|e|o)\b|\btransfer|\bdesmar[cq]|\breagend|\bantecip|\balter(ar|a|e|o)\b/i;
+const RE_PERGUNTA_TROCA_B = /\bas duas\b|\bas tr[eê]s\b|\bambas\b|\bambos\b|\btodas\b|\ba mais\b|\bmais uma\b|\bal[eé]m d|\bextra\b|\bmanter\b|\btamb[eé]m\b|\badicional\b|\bnos dois\b|\bos dois\b|\brepor\b/i;
+const ehPerguntaTroca = (txt) => /\?/.test(txt || '') && RE_PERGUNTA_TROCA_A.test(txt) && RE_PERGUNTA_TROCA_B.test(txt);
+// Lembrete de véspera/do dia (template).
+const ehLembrete = (txt) => /passando (para|pra) lembrar que voce tem \*?consulta|confirme sua presen/i.test(
+  String(txt || '').normalize('NFD').replace(/[̀-ͯ]/g, ''),
+);
 // ── Criar lead no CRM Kanban para contatos novos ──
 async function createLeadInCRM(name, phone, interest) {
   try {
@@ -438,6 +461,7 @@ Quando o paciente pedir para agendar:
    b) find_or_create_patient → pegar ID do paciente
    c) get_patient_packages → verificar se tem pacote ativo (IMPORTANTE!)
    d) create_appointment → criar o agendamento
+   ⚠️ Se o paciente JA TEM consulta futura, veja antes "TROCA x SESSAO A MAIS" (abaixo).
 
 ━━━ REGRA OBRIGATORIA: CADASTRO ANTES DE AGENDAR ━━━
 ANTES de chamar find_or_create_patient, verifique se voce tem:
@@ -521,11 +545,16 @@ PARE de chamar tools, NAO interprete como conflito, e responda apenas afirmando
 que a marcacao continua valendo.
 
 ━━━ REGRA ABSOLUTA: VERIFICAR AGENDAMENTOS ANTES DE CRIAR ━━━
-⚠️ ANTES de usar create_appointment, SEMPRE use get_patient_appointments primeiro.
-Se o paciente JA TEM um agendamento futuro:
-1. Use reschedule_appointment para MOVER o agendamento existente (nao crie um novo)
-2. reschedule_appointment atualiza data/hora automaticamente sem criar duplicata
-3. NUNCA use create_appointment se o paciente ja tem consulta agendada — use reschedule_appointment
+⚠️ ANTES de create_appointment ou reschedule_appointment, confira as consultas futuras
+do paciente ("Proximos agendamentos" no contexto; na duvida, get_patient_appointments).
+Se ele JA TEM consulta futura e pede outro dia — TROCA x SESSAO A MAIS — siga o que ELE disse:
+- Pediu TROCA (remarcar, trocar, mudar, passar pra, em vez de) → CASO A ou CASO B abaixo.
+- Pediu sessao A MAIS (mais uma, tambem quero, alem da de X, as N sessoes do plano) → create_appointment com additionalSession=true.
+- Ambiguo ("tem horario sexta?", "nao vou poder" solto, antecipar por dor) → PERGUNTE uma vez, citando a consulta:
+  "Só pra eu não bagunçar sua agenda 😊 Você quer *trocar* a consulta de [dia DD/MM às HHh] pela de [dia DD/MM às HHh], ou *ficar com as duas*?"
+- "Sim"/"ok" nao respondem essa pergunta: pergunte de novo, mais simples: "É pra *trocar* ou *ficar com as duas*?"
+NUNCA mova uma consulta sem ele pedir troca, nem crie outra sem ele dizer que quer as duas.
+Se a ferramenta devolver bloqueio, ele traz as consultas e a pergunta pronta: siga a regra que casa com o que o paciente disse.
 
 ⚠️ REGRA APLICA TAMBEM AO MESMO TURNO:
 Se VOCE acabou de agendar (create_appointment) e logo depois o paciente quer mudar
@@ -539,9 +568,6 @@ Exemplo do erro classico:
 - ✅ CERTO: reschedule_appointment(appointmentId do 14h, newTime=13h)
 
 ⚠️ DUAS CONSULTAS NO MESMO DIA (caso raro):
-O guard so bloqueia consultas na MESMA DATA. Se paciente quer marcar em dias
-DIFERENTES (avaliacao quarta + retorno sexta), siga normal — sem flag.
-
 Se o paciente confirmar EXPLICITAMENTE que quer 2 consultas no MESMO dia
 (ex: pacote intensivo, sessoes seguidas), chame create_appointment passando
 forceCreate=true para pular o guard. Use isso APENAS apos confirmacao do
@@ -567,10 +593,11 @@ CASO B — paciente pede remarcar E JA informa o novo dia/horario na mesma msg
 (ex: "quero mudar pra terca as 10h", "da pra passar pra sexta 14h?"):
 → get_patient_appointments → reschedule_appointment (move a consulta direto).
 
-create_appointment SEM forceCreate so deve ser usado para pacientes SEM agendamento
-futuro na mesma data. Se tiver duvida, use get_patient_appointments para verificar.
+create_appointment SEM flag: paciente sem outra consulta futura ativa, ou reposicao do
+CASO A (a antiga ja foi liberada). Se tiver duvida, use get_patient_appointments para verificar.
 ━━━ REGRA CRÍTICA: CORRIGIR AGENDAMENTO ERRADO ━━━
-⚠️ Se o paciente disser que a data/horário está ERRADO (ex: "quero na sexta", "não, era segunda", "errou o dia"):
+⚠️ SÓ quando o paciente disser que a marcação que VOCÊ acabou de fazer saiu com dia/horário ERRADO (ex: "não, era segunda", "errou o dia").
+"Quero na sexta" sozinho NÃO é correção: se ele já tem consulta, veja TROCA x SESSAO A MAIS.
 1. PRIMEIRO cancele o agendamento errado com cancel_appointment
 2. DEPOIS crie o agendamento correto com create_appointment
 - NUNCA crie um segundo agendamento sem cancelar o primeiro
@@ -675,7 +702,10 @@ const TOOLS_QUE_MEXEM_NA_AGENDA = new Set(['create_appointment', 'reschedule_app
 // Teto de idas ao modelo por turno. Historico medido: 99,9% dos turnos usam ate
 // 8; o recorde foi 9+ (4 turnos em 6 meses, check_availability em serie). Com o
 // teto de 8000 tokens por chamada, um laco sem fim seguraria o lock por minutos.
-const MAX_ITERACOES_LLM = 12;
+// 16 (era 12) em 30/09/2026: o lote do Rafael (05/08) fez 13 chamadas por causa
+// dos DATE_MISMATCH em creates paralelos, e cada bloqueio da trava de troca x
+// sessao a mais custa mais uma.
+const MAX_ITERACOES_LLM = 16;
 
 export async function processMessage(phone, message, options = {}) {
   try {
@@ -887,6 +917,11 @@ export async function processMessage(phone, message, options = {}) {
     // confirmação — deixa o Claude (LLM) processar com contexto e chamar a tool certa.
     const recentHistory = getConversationHistory(patient.id).slice(-4);
     const lastAssistantMsg = recentHistory.filter(m => m.role === 'assistant').slice(-1)[0]?.content || '';
+    // Pergunta de troca em aberto: nenhum atalho abaixo (confirmar, cancelar,
+    // ack pós-agendamento, botão Reagendar) captura a resposta.
+    const marcaTroca = perguntaTrocaPendente.get(phone);
+    const perguntaTrocaAtiva = ehPerguntaTroca(lastAssistantMsg) ||
+      (!!marcaTroca && Date.now() - marcaTroca < PERGUNTA_TROCA_TTL && !ehLembrete(lastAssistantMsg));
     const isReschedulingContext = /reagendamento|reagendar|alterar.*(consulta|hor[aá]rio)|mudar.*(consulta|hor[aá]rio)|trocar.*(consulta|hor[aá]rio)|passar.*(p[ar]+a|para)\s+(\d|outr|amanh|segunda|ter[çc]a|quarta|quinta|sexta|s[áa]bado|domingo)/i.test(lastAssistantMsg);
     // Contexto de OFERTA/ESCOLHA de horário: a Claudia acabou de listar horários pra
     // o paciente escolher. "Sim"/"Confirmado" aqui é AMBÍGUO (qual horário?) e NÃO deve
@@ -925,7 +960,7 @@ export async function processMessage(phone, message, options = {}) {
     const isSlotOfferPelaFrase = /hor[aá]rios?\s+(livres?|dispon[ií]ve)|qual\s+hor[aá]rio|algum\s+(desses|desse|deles)|prefere\s+(manh|tarde|noite)|(manh[ãa]|tarde|noite)\s+ou\s+(manh[ãa]|tarde|noite)|(quer|deseja|posso|gostaria\s+de)\s+confirmar|temos\s+dispon[ií]ve|confirmar\s+(esse|este)\s+hor[aá]rio/i.test(lastAssistantMsg);
     const isSlotOfferContext = isSlotOfferPelaFrase || (ofertaCitaHorario && ofertaPropoe && !ofertaEhLembrete);
 
-    const isConfirming = (isExplicitConfirm || isGenericYes) && !isReschedulingContext && !isSlotOfferContext;
+    const isConfirming = (isExplicitConfirm || isGenericYes) && !isReschedulingContext && !isSlotOfferContext && !perguntaTrocaAtiva;
     // "cancelar/cancelado/cancelo" é inequívoco em qualquer contexto — inclusive
     // no botão CANCELAR do lembrete de véspera. Mantém o atalho sempre.
     const isExplicitCancel = isShortEnough && /^(cancelar?|cancelado|cancelo)[!\.\s]*$/i.test(msgTrimmed);
@@ -936,10 +971,15 @@ export async function processMessage(phone, message, options = {}) {
     // a consulta dela das 10h ("Seu agendamento foi cancelado"). É o mesmo defeito
     // que atingiu a Tiala pelo lado da confirmação — aqui pelo lado do cancelamento.
     const isVagueCancel = isShortEnough && /^(nao\s*vou|não\s*vou|nao\s*consigo|não\s*consigo)[!\.\s]*$/i.test(msgTrimmed);
-    const isCancelling = isExplicitCancel || (isVagueCancel && !isReschedulingContext && !isSlotOfferContext);
+    // Com a pergunta de troca em aberto nem o "Cancelar" é atalho: cancelaria
+    // pending[0] antes de a consulta nova existir (30/09/2026).
+    const isCancelling = !perguntaTrocaAtiva && (isExplicitCancel || (isVagueCancel && !isReschedulingContext && !isSlotOfferContext));
 
     if ((isReschedulingContext || isSlotOfferContext) && (isExplicitConfirm || isGenericYes)) {
       console.log(`🔀 Confirmação em contexto de ${isSlotOfferContext ? 'ESCOLHA DE HORÁRIO' : 'REAGENDAMENTO'} detectada — delegando ao Claude (não interceptar como presença)`);
+    }
+    if (perguntaTrocaAtiva && (isExplicitConfirm || isGenericYes || isExplicitCancel || isVagueCancel)) {
+      console.log(`🔀 Resposta curta com pergunta de TROCA x A MAIS em aberto — delegando ao Claude: "${msgTrimmed}"`);
     }
 
     if (isConfirming) {
@@ -1226,7 +1266,8 @@ export async function processMessage(phone, message, options = {}) {
     const recentSchedule = recentlyScheduled.get(phone);
     if (recentSchedule && Date.now() - recentSchedule < SCHEDULE_COOLDOWN) {
       const isShortAck = msgTrimmed.length <= 20 && /^(ok|certo|beleza|blz|perfeito|show|fechado|obrigad[oa]|valeu|brigad[oa]|muito obrigad[oa]|combinado|ate la|até lá|tudo bem|ta bom|tá bom)[!\.\ ]*$/i.test(msgTrimmed);
-      if (isShortAck) {
+      // "ok" respondendo à pergunta de troca não é agradecimento (30/09/2026).
+      if (isShortAck && !perguntaTrocaAtiva) {
         console.log(`⏭️ Msg curta pós-agendamento ignorada: \"${msgTrimmed}\" de ${patient.name || phone}`);
         saveMessage(patient.id, 'user', message);
         return null;
@@ -1258,7 +1299,8 @@ export async function processMessage(phone, message, options = {}) {
     // encontrei nenhuma consulta... é possível que já tenha sido cancelada".
     // Caso Fabiane (09/jul/2026): 2 cliques = 2 respostas confusas. O fluxo por
     // TEXTO ("preciso remarcar") continua com o LLM via tool request_reschedule.
-    if (!isNewPatient && msgTrimmed.toLowerCase() === 'reagendar') {
+    // Com a pergunta de troca em aberto, "Reagendar" responde a ela: vai ao LLM.
+    if (!isNewPatient && msgTrimmed.toLowerCase() === 'reagendar' && !perguntaTrocaAtiva) {
       try {
         const { getPatientAppointments, getFollowUpsByPhone, createFollowUp, cancelAppointment } = await import('./crmApi.js');
         const phoneToCheck = patient.contact_phone || phone;
@@ -1704,6 +1746,35 @@ export async function processMessage(phone, message, options = {}) {
     // Tool use loop - keep calling until we get a text response
     let ultimaResposta = null; // stop_reason/usage da última chamada (log de RESPOSTA VAZIA)
     const toolsExecutadas = [];  // nomes das ferramentas que rodaram neste turno (auditoria + texto da contingência)
+    // Contexto do TURNO para as travas de troca x sessão a mais (30/09/2026):
+    //  - ids criados neste turno não barram os seguintes (lote "as 5 sessões",
+    //    Rafael 05/08, Osmira); turno novo começa vazio;
+    //  - userText = falas do PACIENTE nas últimas 3h (a conversa começa turnos
+    //    antes: "Reagendar" / "sexta?" / "16");
+    //  - perguntaPendente é lida ANTES das tools: a marca que o próprio turno
+    //    grava ao ser bloqueado não vale como resposta;
+    //  - loteTemCreate/bloqueou: cancelar nesse contexto é mover (toolHandler);
+    //  - perguntaFeita: a pergunta chegou ao paciente (só então a resposta libera);
+    //  - ofertaHorario: a última fala ofereceu horário; cancelar aqui também é mover.
+    let userText = message;
+    try {
+      const falas = db.prepare(
+        "SELECT content FROM conversations WHERE patient_id = ? AND role = 'user' AND created_at > datetime('now','localtime','-3 hours') ORDER BY id"
+      ).all(patient.id).map((r) => r.content);
+      userText = [...falas, message].join(' / ');
+    } catch (e) { /* sem histórico: só a mensagem atual */ }
+    const turnCtx = {
+      createdAppointmentIds: new Set(),
+      cancelledAppointmentIds: new Set(),
+      additionalSessionPatients: new Set(),
+      perguntaPendente: perguntaTrocaAtiva,
+      msgAtual: message,
+      userText,
+      loteTemCreate: false,
+      bloqueou: false,
+      perguntaFeita: ehPerguntaTroca(lastAssistantMsg),
+      ofertaHorario: isSlotOfferContext,
+    };
     let iteracoes = 0;
     while (true) {
       if (++iteracoes > MAX_ITERACOES_LLM) {
@@ -1768,35 +1839,40 @@ export async function processMessage(phone, message, options = {}) {
       // Execute tools and add results
       currentMessages.push({ role: 'assistant', content: response.content });
       
-      const toolResults = [];
-      for (const toolBlock of toolUseBlocks) {
+      const toolResults = new Array(toolUseBlocks.length);
+      // Cancelar antes de criar no MESMO lote (30/09/2026): na regra CORRIGIR o
+      // LLM pode mandar [create, cancel], e o create era barrado pela consulta
+      // que ia ser cancelada logo depois (paciente sem nenhuma). O resto mantém a
+      // ordem; as respostas voltam na ordem ORIGINAL (sort estável).
+      const ehCancel = (b) => b.name === 'cancel_appointment' || b.name === 'request_reschedule';
+      const ordem = [...toolUseBlocks.entries()].sort(([, a], [, b]) => ehCancel(b) - ehCancel(a));
+      turnCtx.loteTemCreate = toolUseBlocks.some((b) => b.name === 'create_appointment');
+      for (const [idx, toolBlock] of ordem) {
         console.log("Tool call: " + toolBlock.name + " " + JSON.stringify(toolBlock.input));
         toolsExecutadas.push(toolBlock.name);
-        // Marcar paciente como recém-agendado quando create_appointment sucede
-        if (toolBlock.name === 'create_appointment') {
-          const toolResult = await handleToolCall(toolBlock.name, toolBlock.input, phone);
+        const toolResult = await handleToolCall(toolBlock.name, toolBlock.input, phone, turnCtx);
+        toolResults[idx] = { type: 'tool_result', tool_use_id: toolBlock.id, content: toolResult };
+        try {
+          const parsed = JSON.parse(toolResult);
+          // Bloqueio da trava: a pergunta fica em aberto (atalhos) e o resto do
+          // turno não pode contornar cancelando (toolHandler).
+          if (['FUTURE_APPOINTMENT_EXISTS', 'EXISTING_APPOINTMENT', 'RESCHEDULE_NEEDS_CONFIRMATION', 'REPOSICAO_PENDENTE'].includes(parsed.error)) {
+            perguntaTrocaPendente.set(phone, Date.now());
+            turnCtx.bloqueou = true;
+          }
+          if (!parsed.appointmentId || !['create_appointment', 'reschedule_appointment'].includes(toolBlock.name)) continue;
+          perguntaTrocaPendente.delete(phone); // criou/remarcou: a pergunta acabou
+          if (toolBlock.name !== 'create_appointment') continue;
+          // Marcar paciente como recém-agendado quando create_appointment sucede
+          recentlyScheduled.set(phone, Date.now());
+          console.log(`📌 Paciente ${phone} marcado como recém-agendado`);
+          // Criar lead no Kanban para quem agendou via WhatsApp
           try {
-            const parsed = JSON.parse(toolResult);
-            if (parsed.appointmentId) {
-              recentlyScheduled.set(phone, Date.now());
-              console.log(`📌 Paciente ${phone} marcado como recém-agendado`);
-              // Criar lead no Kanban para quem agendou via WhatsApp
-              try {
-                const leadName = patient.name || pushName || 'Novo Paciente';
-                await createLeadInCRM(leadName, phone, 'agendamento_whatsapp');
-                console.log(`✅ Lead criado no Kanban para ${leadName} (agendou via WhatsApp)`);
-              } catch (e) { console.warn('⚠️ Erro ao criar lead pós-agendamento:', e.message); }
-            }
-          } catch {}
-          toolResults.push({ type: 'tool_result', tool_use_id: toolBlock.id, content: toolResult });
-          continue;
-        }
-        const result = await handleToolCall(toolBlock.name, toolBlock.input, phone);
-        toolResults.push({
-          type: 'tool_result',
-          tool_use_id: toolBlock.id,
-          content: result,
-        });
+            const leadName = patient.name || pushName || 'Novo Paciente';
+            await createLeadInCRM(leadName, phone, 'agendamento_whatsapp');
+            console.log(`✅ Lead criado no Kanban para ${leadName} (agendou via WhatsApp)`);
+          } catch (e) { console.warn('⚠️ Erro ao criar lead pós-agendamento:', e.message); }
+        } catch {}
       }
       currentMessages.push({ role: 'user', content: toolResults });
       
@@ -1829,6 +1905,15 @@ export async function processMessage(phone, message, options = {}) {
     // 6. Cobrar o consentimento pendente no FIM da resposta (em vez de substituí-la)
     if (pendingLgpdAsk) {
       assistantReply = `${assistantReply}\n\n${pendingLgpdAsk}`;
+    }
+
+    // 6a. A Claudia perguntou "trocar ou ficar com as duas?" com as próprias
+    // palavras: grava a marca MESMO se o turno criou/remarcou ("Agendado! ✅ ...
+    // E o de sábado — quer manter ou cancelo?", Djairo 26/05: sem a marca, um
+    // "Cancela" caía no atalho e cancelava a recém-criada).
+    if (ehPerguntaTroca(assistantReply)) {
+      perguntaTrocaPendente.set(phone, Date.now());
+      console.log(`❓ Pergunta de TROCA x A MAIS em aberto para ${patient.name || phone} (2h)`);
     }
 
     // 6b. Salvar resposta do assistente

@@ -119,6 +119,18 @@ export async function getPatientAppointments(phone, { includeCompleted = false }
 }
 
 /**
+ * Lista agendamentos futuros de um paciente pelo ID do CRM (não pelo telefone).
+ * Usado pelo guard de consulta existente do create_appointment (30/09/2026):
+ * pelo telefone o CRM pega o PRIMEIRO paciente que casar pelo sufixo-8, e em
+ * telefone de família isso é o paciente errado (Dimitri marcando para a Anna,
+ * 12/05; Magali para a Nair, 15/06). O endpoint já aceitava ?patientId=.
+ */
+export async function getPatientAppointmentsById(patientId) {
+  const params = new URLSearchParams({ patientId });
+  return crmFetch(`/appointments?${params}`);
+}
+
+/**
  * Lista agendamentos de uma data específica (para lembretes).
  */
 export async function getUpcomingAppointments(date, { includeConfirmed = false } = {}) {

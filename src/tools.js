@@ -67,7 +67,7 @@ export const CRM_TOOLS = [
   },
   {
     name: 'create_appointment',
-    description: 'Cria um novo agendamento no CRM. Valida automaticamente: disponibilidade do profissional, conflitos de horário e bloqueios de agenda. Use após confirmar com o paciente o horário desejado.',
+    description: 'Cria um novo agendamento no CRM. Valida automaticamente: disponibilidade do profissional, conflitos de horário e bloqueios de agenda. Use após confirmar com o paciente o horário desejado. Se o paciente já tem consulta futura ativa, bloqueia (EXISTING_APPOINTMENT na mesma data, FUTURE_APPOINTMENT_EXISTS em outra) até ficar claro se é TROCA (reschedule_appointment) ou sessão A MAIS (additionalSession=true).',
     input_schema: {
       type: 'object',
       properties: {
@@ -97,7 +97,11 @@ export const CRM_TOOLS = [
         },
         forceCreate: {
           type: 'boolean',
-          description: 'Use APENAS após paciente confirmar EXPLICITAMENTE que quer outro agendamento na mesma data, além de um existente (ex: pacote intensivo com 2 consultas no mesmo dia). Pula o guard EXISTING_APPOINTMENT. NÃO use pra reagendamento — use reschedule_appointment.',
+          description: 'Use APENAS após paciente confirmar EXPLICITAMENTE que quer outro agendamento na mesma data, além de um existente (ex: pacote intensivo com 2 consultas no mesmo dia). Pula o guard EXISTING_APPOINTMENT. NÃO use pra reagendamento — use reschedule_appointment. Não vale para consulta em OUTRA data (isso é additionalSession). Sem "a mais" nas falas nem resposta à pergunta, o sistema ignora a flag.',
+        },
+        additionalSession: {
+          type: 'boolean',
+          description: 'Use quando o PACIENTE disse que quer uma sessão A MAIS, além da(s) consulta(s) futura(s) que já tem em OUTRA data (ex: "mais uma", "também quero", "as 5 sessões do plano"), inclusive respondendo "as duas" à pergunta "trocar ou ficar com as duas?". Nunca só porque o sistema bloqueou, nem para troca (troca = reschedule_appointment). Sem "a mais" nas falas nem resposta à pergunta, o sistema ignora a flag.',
         },
       },
       required: ['patientId', 'professionalId', 'date', 'time'],
@@ -123,7 +127,7 @@ export const CRM_TOOLS = [
   },
   {
     name: 'reschedule_appointment',
-    description: 'Reagenda um agendamento existente para nova data e/ou horário. Valida automaticamente disponibilidade e conflitos. Use quando o paciente quiser mudar a data ou horário de uma consulta já agendada, em vez de cancelar e criar um novo.',
+    description: 'Reagenda um agendamento existente para nova data e/ou horário. Valida automaticamente disponibilidade e conflitos. Use quando o paciente quiser mudar a data ou horário de uma consulta já agendada, em vez de cancelar e criar um novo. Use SÓ quando o paciente pediu para TROCAR/remarcar essa consulta: se ele quer uma sessão A MAIS, NÃO mova a que já existe (use create_appointment com additionalSession=true); se não ficou claro, pergunte antes. Mudar a DATA sem pedido de troca volta RESCHEDULE_NEEDS_CONFIRMATION; com outra consulta dele recém-liberada (Cancelar/Reagendar), REPOSICAO_PENDENTE. Nos dois casos, pergunte ao paciente.',
     input_schema: {
       type: 'object',
       properties: {
@@ -149,13 +153,17 @@ export const CRM_TOOLS = [
   },
   {
     name: 'request_reschedule',
-    description: 'Use quando o paciente pedir para REAGENDAR/REMARCAR a consulta mas AINDA NÃO informar o novo dia/horário (ex: "preciso remarcar", "vou ter que reagendar pra outra semana", "não vou conseguir ir, quero mudar"). Cancela a consulta atual (LIBERA o horário na agenda) e registra o pedido de reagendamento. DEPOIS de chamar, pergunte ao paciente qual o novo dia e turno. Quando ele informar, use create_appointment para criar a nova consulta. IMPORTANTE: NÃO use esta tool se o paciente JÁ informou o novo dia/horário na mesma mensagem — nesse caso use reschedule_appointment diretamente.',
+    description: 'Use quando o paciente pedir para REAGENDAR/REMARCAR a consulta mas AINDA NÃO informar o novo dia/horário (ex: "preciso remarcar", "vou ter que reagendar pra outra semana", "não vou conseguir ir, quero mudar"). Cancela a consulta atual (LIBERA o horário na agenda) e registra o pedido de reagendamento. DEPOIS de chamar, pergunte ao paciente qual o novo dia e turno. Quando ele informar, use create_appointment para criar a nova consulta. IMPORTANTE: NÃO use esta tool se o paciente JÁ informou o novo dia/horário na mesma mensagem — nesse caso use reschedule_appointment diretamente. Se ele tem MAIS de uma consulta futura, passe appointmentId (sem ele, nada é cancelado e a tool pede para perguntar qual).',
     input_schema: {
       type: 'object',
       properties: {
         phone: {
           type: 'string',
           description: 'Telefone do paciente (apenas dígitos)',
+        },
+        appointmentId: {
+          type: 'string',
+          description: 'ID da consulta que o paciente quer remarcar (obrigatório na prática quando ele tem mais de uma consulta futura; obtido via get_patient_appointments)',
         },
       },
       required: ['phone'],
