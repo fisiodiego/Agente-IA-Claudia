@@ -10,6 +10,7 @@ import { extrairIp, checarOrigemMeta, TOTAL_FAIXAS } from './metaIps.js';
 import { processMessage } from './agent.js';
 import { isValidPhone } from './lidMap.js';
 import { logMessage, wasRecentBotOutbound } from './patientManager.js';
+import { receberAudio } from './transcricao.js';
 
 // ─── Config via .env ────────────────────────────────────────────────────────
 const PHONE_NUMBER_ID = process.env.WA_PHONE_NUMBER_ID;   // 1045271008668555
@@ -703,6 +704,15 @@ function createWebhookServer() {
                 const pushName = contact?.profile?.name || null;
 
                 handleIncomingMessage(from, msgText, pushName);
+              } else if (msg.type === 'audio') {
+                // Áudio (01/10/2026): AUDIO_TRANSCRICAO ausente/off = ignorado como sempre.
+                // Em sombra só transcreve e grava na tabela audio_sombra: não responde,
+                // não entra na conversa, não vai ao CRM. Sem await (o 200 já saiu) e com
+                // .catch: erro no ramo de áudio não chega ao uncaughtException (exit 1).
+                // Takeover lido sem efeito colateral (isHumanActive loga e apaga).
+                const fone = normalizeBRPhone(msg.from);
+                const takeoverAtivo = () => [fone, '__ALL__'].some((k) => (humanTakeoverMap.get(k) || 0) > Date.now());
+                receberAudio(msg, { takeoverAtivo }).catch((e) => console.error('🎤 Erro no ramo de áudio:', e?.message));
               }
               // TODO: suportar mensagens de imagem, áudio, etc.
             }
