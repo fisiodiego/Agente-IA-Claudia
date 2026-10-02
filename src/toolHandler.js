@@ -33,6 +33,11 @@ const recentCreates = new Map(); // phone -> [{ professionalId, date, time, ts }
 // O aviso e inofensivo; a conversa pode durar horas.
 const RECENT_CREATE_TTL_MS = 24 * 60 * 60 * 1000; // 24h
 
+// ─── Telefone do cadastro no CRM de cada paciente visto em find_or_create_patient ──
+// O create_appointment usa para saber se a consulta é do dono da conversa ou de
+// outra pessoa antes de mexer nos retornos pós-alta dele (02/10/2026).
+const fonePorPacienteCrm = new Map(); // patientId (CRM) -> telefone do cadastro
+
 // ─── Trava de TROCA x SESSÃO A MAIS (30/09/2026) ─────────────────────────────
 // Gabriela (29/09) queria TROCAR e ficou com duas; Felipe Sica (29/09) queria
 // uma A MAIS e teve a dele movida. Frases quase iguais tinham intenções opostas,
@@ -288,6 +293,7 @@ export async function handleToolCall(toolName, toolInput, phone = null, turnCtx 
         if (!result.ok) return JSON.stringify({ error: result.error });
 
         const { patient, created, birthDateRecorded, birthDateConflict } = result.data;
+        if (patient?.id) fonePorPacienteCrm.set(patient.id, String(patient.phone || toolInput.phone || ''));
         // Deixar claro quando o cadastro ficou COMPLETO: antes a API descartava a
         // data de nascimento de paciente existente e o LLM, achando o cadastro
         // incompleto, ficava tentando "finaliza-lo" (caso Luana, 02/set/2026).
@@ -459,16 +465,25 @@ export async function handleToolCall(toolName, toolInput, phone = null, turnCtx 
         // cancelar retornos pós-alta pendentes na hora (o CRM já reativa do lado
         // dele no POST /appointments; aqui fecha o lado da Claudia sem esperar o
         // cron). Nova alta futura recria o ciclo. (Caso Julia Camelier, 03/jul/2026.)
+        // Só quando a consulta é DO DONO da conversa: quem marcava para outra
+        // pessoa pelo próprio WhatsApp perdia os retornos e ficava com alta no
+        // CRM e nenhum contato previsto (Monique 17/09 e Marília 28/09/2026, 2 de
+        // 46). Na dúvida não cancela: o sendFollowup confere de novo antes de enviar.
         if (phone) {
           try {
             const db = (await import('./database.js')).default;
             const lp = db.prepare("SELECT id, status FROM patients WHERE phone = ?").get(phone);
             if (lp && (lp.status === 'alta_confirmada' || lp.status === 'alta')) {
-              db.prepare("UPDATE patients SET status='em_tratamento', discharge_date=NULL WHERE id = ?").run(lp.id);
-              const cancelled = db.prepare(
-                "UPDATE followups SET status='cancelado' WHERE patient_id = ? AND status='pendente' AND type LIKE 'lembrete_%' AND type != 'lembrete_consulta'"
-              ).run(lp.id).changes;
-              console.log(`🔄 Paciente #${lp.id} estava de alta e agendou — reativado (em_tratamento), ${cancelled} retorno(s) pós-alta cancelado(s)`);
+              const doDono = await consultaEhDoDonoDaConversa(toolInput.patientId, phone);
+              if (doDono !== true) {
+                console.log(`↪️ Paciente #${lp.id} está de alta e a consulta é ${doDono === false ? 'de outra pessoa' : 'de dono não conferido'} (${toolInput.patientId}) — retornos pós-alta dele mantidos`);
+              } else {
+                db.prepare("UPDATE patients SET status='em_tratamento', discharge_date=NULL WHERE id = ?").run(lp.id);
+                const cancelled = db.prepare(
+                  "UPDATE followups SET status='cancelado' WHERE patient_id = ? AND status='pendente' AND type LIKE 'lembrete_%' AND type != 'lembrete_consulta'"
+                ).run(lp.id).changes;
+                console.log(`🔄 Paciente #${lp.id} estava de alta e agendou — reativado (em_tratamento), ${cancelled} retorno(s) pós-alta cancelado(s)`);
+              }
             }
           } catch (e) { console.warn('⚠️ Erro ao reativar paciente pós-alta:', e.message); }
         }
@@ -898,6 +913,27 @@ async function fonesDoPaciente(...dados) {
     const s8 = f.replace(/\D/g, '').slice(-8);
     return s8.length === 8 && !vistos.has(s8) && vistos.add(s8);
   });
+}
+
+// A consulta recém-criada é do dono desta conversa? true / false, ou null quando
+// não deu para saber. Se o telefone do cadastro agendado (guardado no
+// find_or_create_patient do mesmo turno) é um dos telefones da conversa, é dele.
+// Senão — ou sem esse telefone, ou se ele mudou no CRM depois — pergunta ao CRM
+// de quem são os telefones da conversa.
+async function consultaEhDoDonoDaConversa(patientId, phone) {
+  const s8 = (f) => String(f).replace(/\D/g, '').slice(-8);
+  const fones = await fonesDoPaciente(phone);
+  const doAgendado = fonePorPacienteCrm.get(patientId);
+  if (doAgendado && s8(doAgendado).length === 8 && fones.some((f) => s8(f) === s8(doAgendado))) return true;
+
+  const { searchPatientByPhone } = await import('./crmApi.js');
+  let falhou = false;
+  for (const f of fones) {
+    const r = await searchPatientByPhone(f);
+    if (!r?.ok) { falhou = true; continue; }
+    if (r.data?.found && r.data.patient?.id === patientId) return true;
+  }
+  return falhou || !fones.length ? null : false;
 }
 
 // Consulta atual (data/hora ANTES de mover) e a lista do mesmo telefone. O GET

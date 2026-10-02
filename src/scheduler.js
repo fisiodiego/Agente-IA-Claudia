@@ -1,6 +1,6 @@
 import cron from 'node-cron';
 import { respostaClaramentePositiva } from './referralSentiment.js';
-import { getPendingFollowups, markFollowupSent, getPatientByPhone, confirmDischarge, saveMessage } from './patientManager.js';
+import { getPendingFollowups, markFollowupSent, getPatientByPhone, createPatient, confirmDischarge, saveMessage } from './patientManager.js';
 import { followupTemplates, followupDescriptions, appointmentReminder24h, getGreeting, packageReminderLevel1, packageReminderLevel2, packageReminderLevel3, noShowRescheduling, waitlistNotification, postConsultationCheckIn, birthdayMessage, reactivationMessage, weeklyReportMessage, packageCompletedMessage, referralMessage, sameDayReminder } from './messageTemplates.js';
 import { getUpcomingAppointments, getRecentDischarges, getStalePackages, getRecentNoShows, getWaitlistMatches, removeFromWaitlist, getCompletedAppointments, getBirthdays, getInactivePatients, getWeeklyReport, getCompletedPackages, logClaudiaActivity, getFollowUpsByPhone } from './crmApi.js';
 import db from './database.js';
@@ -606,15 +606,56 @@ export function startScheduler() {
     await runPackageExpiryCycle();
   });
 
-  // ── Reengajamento de leads sem agendamento: 11:30 BRT (14:30 UTC) ──
-  cron.schedule('30 14 * * *', async () => {
+  // ── Rotinas diárias do Kanban: 11:30 BRT (14:30 UTC) ──
+  // Reengajamento de leads sem agendamento + as três expirações de cards.
+  // 3 chances (11:30/11:40/11:50): node-cron 3.0.3 pula tick e este cron tinha
+  // uma chance só — não rodou em 18/09 nem em 30/09/2026, com o processo no ar.
+  // config.kanbanDailyRun (dia) + guarda kanbanDailyRunning = uma rodada
+  // completa por dia.
+  cron.schedule('30,40,50 14 * * *', async () => {
+    await runKanbanDaily();
+  });
+}
+
+let kanbanDailyRunning = false;
+
+async function runKanbanDaily() {
+  if (kanbanDailyRunning) {
+    console.log('⏳ Rotinas diárias do Kanban: rodada anterior ainda em execução — pulando esta chance');
+    return;
+  }
+  const hoje = new Date().toISOString().slice(0, 10);
+  try {
+    if (db.prepare("SELECT value FROM config WHERE key = 'kanbanDailyRun'").get()?.value === hoje) return;
+  } catch (err) {
+    console.warn('⚠️ Rotinas do Kanban: não consegui ler a marca do dia, rodando assim mesmo:', err.message);
+  }
+  kanbanDailyRunning = true;
+  try {
+    // CRM fora do ar nesta chance: sai sem gravar a marca, para a próxima tentar
+    // (as quatro rotinas só logam a falha de listagem e seguem em frente).
+    const { listFollowUps } = await import('./crmApi.js');
+    const crm = await listFollowUps('lead', ['pendente']);
+    if (!crm?.ok) {
+      console.warn(`⚠️ Rotinas do Kanban: CRM indisponível nesta chance (${crm?.error || crm?.status}) — a próxima tenta de novo`);
+      return;
+    }
     await checkStaleLeads();
     await expireUnansweredLeadReengagements();
     await expireStaleRetornoCards();
     // Cards de cancelamento/reagendamento criados pela Claudia (cancel_appointment /
     // request_reschedule): 30 dias sem consulta nova → perdido (caso 18/09/2026, 27 cards invisíveis desde abril).
     await expireStaleRescheduleCards();
-  });
+    // A marca só entra com a rodada inteira feita: restart no meio deixa a
+    // próxima chance refazer (as expirações são idempotentes e o teto do
+    // reengajamento é contado no banco).
+    db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('kanbanDailyRun', ?)").run(hoje);
+    console.log(`🗂️ Rotinas diárias do Kanban concluídas (${hoje})`);
+  } catch (err) {
+    console.error('❌ Erro nas rotinas diárias do Kanban:', err.message);
+  } finally {
+    kanbanDailyRunning = false;
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -668,7 +709,10 @@ async function checkStaleLeads() {
     }
 
     const cutoffMs = LEAD_REENGAGE_MIN_DAYS * 24 * 3600 * 1000;
-    let sent = 0;
+    // O teto é por DIA, contado no banco: com 3 chances (e restart no meio da
+    // rodada) a conta em memória recomeçava do zero e podia passar de 10.
+    let sent = db.prepare("SELECT COUNT(*) AS n FROM lead_reengagement WHERE sent_at >= date('now','localtime')").get().n;
+    const jaEnviadosHoje = sent;
     let skipped = 0;
 
     for (const lead of leadsRes.data) {
@@ -730,7 +774,7 @@ async function checkStaleLeads() {
         console.warn(`⚠️ Reengajamento: falha no envio para ${digits}`);
       }
     }
-    console.log(`📣 Reengajamento de leads: ${sent} enviado(s), ${skipped} pulado(s) de ${leadsRes.data.length} card(s)`);
+    console.log(`📣 Reengajamento de leads: ${sent - jaEnviadosHoje} enviado(s), ${skipped} pulado(s) de ${leadsRes.data.length} card(s)`);
   } catch (err) {
     console.error('❌ Erro no reengajamento de leads:', err.message);
   }
@@ -989,7 +1033,15 @@ async function sendFollowup(followup) {
       // e o cameBack ficava cego pra quem voltou e JÁ CONCLUIU a consulta
       // (caso Ana Clara, 09/jul/2026 — recebeu retorno de 1 mês indevido).
       const aptsResult = await getPatientAppointments(targetPhone, { includeCompleted: true });
-      const apts = (aptsResult.ok && Array.isArray(aptsResult.data)) ? aptsResult.data : [];
+      // CRM não respondeu: não manda retorno sem conferir se o paciente voltou.
+      // Fica pendente e o cron tenta de novo em 5 min. Antes a falha virava lista
+      // vazia e o retorno saía — e é esta conferência que cobre quem marcou
+      // consulta e não teve o ciclo cancelado na hora (02/10/2026).
+      if (!aptsResult.ok) {
+        console.warn(`⚠️ Retorno de ${followup.name} adiado: o CRM não respondeu na conferência de consultas (${aptsResult.error || aptsResult.status}) — tento de novo em 5 min`);
+        return;
+      }
+      const apts = Array.isArray(aptsResult.data) ? aptsResult.data : [];
       const hasUpcoming = apts.some(a => a.status === 'agendado' || a.status === 'confirmado');
 
       const db = (await import('./database.js')).default;
@@ -1189,6 +1241,63 @@ function sleep(ms) {
 // ── Polling de altas do CRM ────────────────────────────────────────────────
 
 /**
+ * wa_id que o WhatsApp usa para um CELULAR brasileiro, ou null se o telefone não
+ * for um. Aceita DDD + 9 + 8 dígitos, ou DDD + 8 dígitos começando em 6–9
+ * (celular antigo, sem o 9). Fixo, estrangeiro (+33…, +1…: com 11 dígitos
+ * passava pelo isValidBRPhone como se o código do país fosse DDD), número curto
+ * e 1111-1111 → null.
+ * O WhatsApp só guarda o 9º dígito nos DDDs 11–28 (SP/RJ/ES); nos demais, o
+ * celular que começa em 8 ou 9 tem wa_id SEM o 9 — no banco local, os 461
+ * telefones de DDD 71 têm 12 dígitos e os de DDD 11/19/21/27 têm 13, e em 2.394
+ * envios a Meta tirou o 9. Para 6, 7 e as faixas novas não há envio observado:
+ * fica COM o 9, que a Meta entrega nos dois casos.
+ */
+function waIdDeCelularBR(rawPhone) {
+  const raw = String(rawPhone || '').trim();
+  if (raw.startsWith('+') && !raw.startsWith('+55')) return null;
+  let d = raw.replace(/\D/g, '');
+  if (d.startsWith('55') && d.length >= 12) d = d.slice(2);
+  const m = d.match(/^([1-9][1-9])(?:9(\d{8})|([6-9]\d{7}))$/);
+  if (!m) return null;
+  const ddd = m[1];
+  const oito = m[2] || m[3];
+  if (/^(\d)\1{7}$/.test(oito)) return null;
+  const semNove = Number(ddd) > 28 && /^[89]/.test(oito);
+  return semNove ? `55${ddd}${oito}` : `55${ddd}9${oito}`;
+}
+
+/**
+ * Cadastro local para quem teve alta no CRM sem nunca ter conversado com a
+ * Claudia. `phone` vai no formato do wa_id: quando o paciente escrever, a
+ * conversa cai NESTE cadastro (não cria outro) e as buscas por igualdade — a
+ * reativação no create_appointment, o takeover no smartSend — o encontram.
+ * `contact_phone` fica como está no CRM e registration_complete = 1, igual ao
+ * cadastro criado na 1ª conversa de um paciente do CRM (agent.js). Telefone que
+ * não é celular brasileiro → null, e a alta segue sem retornos.
+ */
+function criarPacienteLocalDaAlta(discharge) {
+  const waId = waIdDeCelularBR(discharge.phone);
+  if (!waId) {
+    console.warn(`⚠️ Alta de ${discharge.name} (${discharge.phone}): telefone não é celular brasileiro — sem cadastro local, retornos automáticos pulados (a pesquisa segue).`);
+    return null;
+  }
+  try {
+    const patient = createPatient({
+      name: String(discharge.name || '').trim() || 'Paciente',
+      phone: waId,
+      contact_phone: discharge.phone,
+      registration_complete: 1,
+      notes: 'Cadastro criado pela alta no CRM (paciente nunca conversou com a Claudia)',
+    });
+    console.log(`👤 Cadastro local #${patient.id} criado pela alta de ${discharge.name} — paciente nunca conversou com a Claudia`);
+    return patient;
+  } catch (err) {
+    console.warn(`⚠️ Alta de ${discharge.name}: não consegui criar o cadastro local, retornos automáticos pulados:`, err.message);
+    return null;
+  }
+}
+
+/**
  * Verifica no CRM se há pacientes com alta recente e agenda follow-ups.
  */
 async function checkCrmDischarges() {
@@ -1221,13 +1330,22 @@ async function checkCrmDischarges() {
           continue;
         }
 
-        // Buscar paciente na Claudia (pra agendar retornos no banco local)
-        const claudiaPatient = getPatientByPhone(discharge.phone);
+        // Buscar paciente na Claudia (pra agendar retornos no banco local).
+        // Quem marcou direto com o Dr. Diego nunca conversou com a Claudia e não
+        // tem cadastro local: a alta só logava "retornos automáticos pulados" e
+        // era dada como processada, sem nova tentativa — 15% das altas ficaram sem
+        // retorno de 1/3/6/12 meses (70 de 455 desde março; 11 em set/2026) e fora
+        // da reativação, que não inclui alta. Agora o cadastro local nasce aqui,
+        // com o telefone do CRM. A busca é a de sempre; de propósito NÃO se casa
+        // pelo contact_phone de cadastro com outro WhatsApp: há cadastros ligados
+        // por homônimo (Frederico Camerino × Mesquita, Marcus Barojas × Mascarenhas)
+        // e o retorno iria para a pessoa errada. Telefone sem dígitos não é
+        // buscado: '' casava com cadastro de contact_phone vazio.
+        const temDigitos = String(discharge.phone || '').replace(/\D/g, '').length >= 8;
+        const claudiaPatient = (temDigitos ? getPatientByPhone(discharge.phone) : null) || criarPacienteLocalDaAlta(discharge);
 
         if (claudiaPatient) {
           confirmDischarge(claudiaPatient.id, discharge.dischargeDate.split('T')[0]);
-        } else {
-          console.log(`⚠️ Paciente ${discharge.name} (${discharge.phone}) não encontrado na Claudia — pesquisa será enviada mesmo assim, retornos automáticos pulados.`);
         }
 
         // Marcar alta como processada (não reprocessa em ciclos seguintes)
@@ -1279,7 +1397,11 @@ async function checkCrmDischarges() {
           console.warn('⚠️ Erro ao enfileirar pesquisa para ' + discharge.name + ':', e.message);
         }
 
-        console.log(`✅ Follow-ups agendados para ${discharge.name} (alta: ${discharge.dischargeDate})`);
+        // Só diz "agendados" quando agendou: antes a linha saía sempre, inclusive
+        // para as altas puladas, e enganava qualquer conferência pelo log.
+        console.log(claudiaPatient
+          ? `✅ Follow-ups agendados para ${discharge.name} (alta: ${discharge.dischargeDate})`
+          : `ℹ️ Alta de ${discharge.name} processada sem retornos (alta: ${discharge.dischargeDate})`);
       } catch (err) {
         console.error(`❌ Erro ao processar alta de ${discharge.name}:`, err.message);
       }
