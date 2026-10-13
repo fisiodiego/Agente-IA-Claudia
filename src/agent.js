@@ -74,28 +74,55 @@ const ehLembrete = (txt) => /passando (para|pra) lembrar que voce tem \*?consult
   String(txt || '').normalize('NFD').replace(/[̀-ͯ]/g, ''),
 );
 // ── Criar lead no CRM Kanban para contatos novos ──
-async function createLeadInCRM(name, phone, interest) {
+// Card "aberto" no Kanban = ainda pede ação (ou agendamento em curso). Concluído
+// e perdido são história. Caso Luiza (07/10/2026): pediu 2 horários, a conversa
+// parou no nascimento do acompanhante e, como ela só tinha cards antigos
+// FECHADOS, nada apareceu no Kanban — ninguém viu até ela aparecer na clínica.
+const CARD_ABERTO = new Set(['pendente', 'enviado', 'respondeu', 'agendou']);
+export const cardAberto = (f) => CARD_ABERTO.has(String(f?.status || '').toLowerCase());
+// Data (YYYY-MM-DD) no fuso da clínica (UTC-3), sem depender do TZ do servidor.
+const dataBRT = (ms = Date.now()) => new Date(ms - 3 * 3600000).toISOString().slice(0, 10);
+const PEDIDO_HORARIO_PRAZO_DIAS = 2; // card "respondeu" vence em 2 dias → aba Hoje
+
+export async function createLeadInCRM(name, phone, interest, extra = {}) {
   try {
-    // Dedup: verificar se já existe follow-up com esse telefone
+    // Dedup: verificar se já existe follow-up com esse telefone.
+    // - contato novo / agendou: qualquer card (como sempre foi).
+    // - pediu_horario (13/10/2026): só card ABERTO bloqueia — paciente antigo com
+    //   cards fechados ganha card novo, senão o pedido parado fica invisível.
     const { getFollowUpsByPhone } = await import('./crmApi.js');
     const existing = await getFollowUpsByPhone(phone);
-    if (existing && existing.ok && existing.data && existing.data.length > 0) {
-      console.log('[Agent] Lead já existe no Kanban para ' + phone + ' (' + existing.data.length + ' registro(s)), pulando criação');
-      return;
+    const pediuHorario = interest === 'pediu_horario';
+    if (existing && existing.ok && Array.isArray(existing.data) && existing.data.length > 0) {
+      const bloqueiam = pediuHorario ? existing.data.filter(cardAberto) : existing.data;
+      if (bloqueiam.length > 0) {
+        console.log('[Agent] Lead já existe no Kanban para ' + phone + ' (' + bloqueiam.length + ' registro(s)' + (pediuHorario ? ' aberto(s)' : '') + '), pulando criação');
+        return;
+      }
+      console.log('[Agent] Kanban de ' + phone + ' só tem ' + existing.data.length + ' card(s) fechado(s) — criando card do pedido de horário');
     }
+    const now = new Date().toISOString();
+    const hoje = dataBRT();
     const id = 'lead-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6);
     const body = {
       id,
       patientName: name || 'Contato WhatsApp',
       phone,
       type: 'lead',
-      status: interest === 'agendamento_whatsapp' ? 'agendou' : 'pendente',
+      status: interest === 'agendamento_whatsapp' ? 'agendou' : pediuHorario ? 'respondeu' : 'pendente',
       source: 'whatsapp',
       interest: interest || null,
-      notes: interest === 'agendamento_whatsapp' ? 'Agendou consulta via WhatsApp' : 'Contato via WhatsApp - nao agendou',
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
+      notes: interest === 'agendamento_whatsapp' ? 'Agendou consulta via WhatsApp'
+        : pediuHorario ? 'Pediu horario via WhatsApp em ' + hoje.slice(8, 10) + '/' + hoje.slice(5, 7) + ' - sem marcacao ainda'
+        : 'Contato via WhatsApp - nao agendou',
+      createdAt: now,
+      updatedAt: now,
     };
+    if (extra.patientId) body.patientId = extra.patientId;
+    if (pediuHorario) {
+      body.respondedAt = now;
+      body.dueDate = dataBRT(Date.now() + PEDIDO_HORARIO_PRAZO_DIAS * 86400000);
+    }
 
     const CRM_URL = process.env.CRM_API_URL || 'https://crm.holiz.com.br/api/integration';
     const API_KEY = process.env.CRM_API_KEY || '';
@@ -113,6 +140,41 @@ async function createLeadInCRM(name, phone, interest) {
     }
   } catch (err) {
     console.error('[Agent] Erro ao criar lead:', err.message);
+  }
+}
+
+// Pedido de horário vira rastro no Kanban já no check_availability (13/10/2026).
+// Se a conversa parar antes do create_appointment, o card "respondeu" vence em
+// 2 dias e aparece na aba Hoje; se marcar, o POST /appointments do CRM leva o
+// card a "agendou". Uma vez por telefone a cada 2h (evita GET/POST repetidos).
+const pedidoHorarioMarcado = new Map(); // phone -> timestamp
+const PEDIDO_HORARIO_TTL = 2 * 60 * 60 * 1000;
+export async function registrarPedidoDeHorario(patient, phone, pushName, deps = {}) {
+  try {
+    const agora = deps.now ? deps.now() : Date.now();
+    if (agora - (pedidoHorarioMarcado.get(phone) || 0) < PEDIDO_HORARIO_TTL) return false;
+    pedidoHorarioMarcado.set(phone, agora);
+    let nome = (patient?.name && patient.name !== 'Novo Paciente') ? patient.name : (pushName || null);
+    let patientId = null;
+    try {
+      const { searchPatientByPhone } = deps.crmApi || await import('./crmApi.js');
+      const r = await searchPatientByPhone(phone);
+      const p = r?.ok && r.data?.found ? r.data.patient : null;
+      // Só confia no cadastro se os 10 últimos dígitos batem (DDD + número):
+      // o sufixo-8 sozinho confunde Idma (71) com Francisco Cirilo (79).
+      const d1 = String(p?.phone || '').replace(/\D/g, '');
+      const d2 = String(phone || '').replace(/\D/g, '');
+      if (p && d1.length >= 10 && d1.slice(-10) === d2.slice(-10)) {
+        patientId = p.id || null;
+        if (p.name) nome = p.name;
+      }
+    } catch { /* sem CRM: segue sem patientId — a conciliação vincula depois */ }
+    const criar = deps.createLeadInCRM || createLeadInCRM;
+    await criar(nome, phone, 'pediu_horario', { patientId });
+    return true;
+  } catch (e) {
+    console.warn('⚠️ Pedido de horário sem rastro no Kanban:', e?.message);
+    return false;
   }
 }
 
@@ -482,6 +544,20 @@ Paciente: "Daniela Ramos Silva, 15/03/1990"
 Claudia: [agora sim chama check_availability → find_or_create_patient com nome e birthDate → create_appointment]
 ⚠️ OTIMIZAÇÃO: NÃO chame list_professionals se o profissional já está no cache acima. Vá direto para check_availability com o ID do cache.
 ⚠️ NUNCA chame a mesma tool 2 vezes na mesma interação com os mesmos parâmetros.
+
+━━━ DUAS PESSOAS (paciente + acompanhante/familiar) ━━━
+Se o paciente pedir horário para ELE e para OUTRA pessoa ("preciso de 2 horários",
+"são duas pessoas", "eu e minha mãe"):
+1. Marque PRIMEIRO a consulta DELE, que já tem cadastro: check_availability →
+   create_appointment no horário que ele escolheu → "Agendado! ✅" com dia e hora.
+2. SÓ DEPOIS cuide da outra pessoa: peça nome completo e data de nascimento dela,
+   e aí find_or_create_patient + create_appointment no segundo horário.
+3. NUNCA deixe a vaga do paciente esperando os dados da outra pessoa, e NUNCA diga
+   que um horário "fica" reservado ou "fica assim" antes do create_appointment —
+   até lá, ele está apenas DISPONÍVEL. Se o paciente responder "pronto"/"ótimo"
+   sem você ter marcado, pergunte de forma direta: "Confirmo as 10h para você?".
+(Caso Luiza, 07/10/2026: pediu 2 vagas, a Claudia esperou o nascimento do
+acompanhante, a conversa parou e NINGUÉM foi marcado.)
    Se o paciente TEM plano de tratamento ativo, informe: "Será descontado do seu plano de tratamento (X/Y sessões usadas)"
    ⚠️ PLANO ATIVO COM SESSAO DISPONIVEL = SEMPRE DESCONTA DO PLANO. Vale mesmo
    que a data escolhida seja depois do "prazo" ou "vencimento" citado em algum
@@ -1859,6 +1935,10 @@ export async function processMessage(phone, message, options = {}) {
           if (['FUTURE_APPOINTMENT_EXISTS', 'EXISTING_APPOINTMENT', 'RESCHEDULE_NEEDS_CONFIRMATION', 'REPOSICAO_PENDENTE'].includes(parsed.error)) {
             perguntaTrocaPendente.set(phone, Date.now());
             turnCtx.bloqueou = true;
+          }
+          // Pediu horário: rastro no Kanban (card "respondeu") — ver registrarPedidoDeHorario.
+          if (toolBlock.name === 'check_availability' && !parsed.error && !parsed.isHoliday) {
+            await registrarPedidoDeHorario(patient, phone, pushName);
           }
           if (!parsed.appointmentId || !['create_appointment', 'reschedule_appointment'].includes(toolBlock.name)) continue;
           perguntaTrocaPendente.delete(phone); // criou/remarcou: a pergunta acabou

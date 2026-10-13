@@ -720,6 +720,10 @@ async function checkStaleLeads() {
         console.log(`📣 Reengajamento: teto diário de ${LEAD_REENGAGE_DAILY_CAP} atingido — restantes ficam pra próxima rodada`);
         break;
       }
+      // Paciente antigo que pediu horário e parou (card criado no check_availability,
+      // 13/10/2026): fica só como rastro para o Dr. Diego, sem template — decisão
+      // dele de 05/10/2026 ("por enquanto não" para cutucada automática).
+      if (lead.interest === 'pediu_horario') { skipped++; continue; }
       const digits = String(lead.phone || '').replace(/\D/g, '');
       const suffix8 = digits.slice(-8);
       // Telefone BR válido (mesma régua dos follow-ups) e não-fake (11111111 etc.)
