@@ -723,7 +723,8 @@ async function checkStaleLeads() {
       // Paciente antigo que pediu horário e parou (card criado no check_availability,
       // 13/10/2026): fica só como rastro para o Dr. Diego, sem template — decisão
       // dele de 05/10/2026 ("por enquanto não" para cutucada automática).
-      if (lead.interest === 'pediu_horario') { skipped++; continue; }
+      // Aviso de falha de resposta (falha_claudia, 15/10/2026) idem: é tarefa do Dr. Diego.
+      if (lead.interest === 'pediu_horario' || lead.interest === 'falha_claudia') { skipped++; continue; }
       const digits = String(lead.phone || '').replace(/\D/g, '');
       const suffix8 = digits.slice(-8);
       // Telefone BR válido (mesma régua dos follow-ups) e não-fake (11111111 etc.)

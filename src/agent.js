@@ -83,6 +83,57 @@ export const cardAberto = (f) => CARD_ABERTO.has(String(f?.status || '').toLower
 // Data (YYYY-MM-DD) no fuso da clínica (UTC-3), sem depender do TZ do servidor.
 const dataBRT = (ms = Date.now()) => new Date(ms - 3 * 3600000).toISOString().slice(0, 10);
 const PEDIDO_HORARIO_PRAZO_DIAS = 2; // card "respondeu" vence em 2 dias → aba Hoje
+// Hora (HH:MM) no fuso da clínica.
+const horaBRT = (ms = Date.now()) => new Date(ms - 3 * 3600000).toISOString().slice(11, 16);
+
+// Telefone BR → DDD + 8 finais (sem o 55 e sem o 9). Compara WhatsApp × CRM quando
+// um lado tem o 9 e o outro não (wa_id antigo de 12 dígitos: card "FS", 14/10/2026)
+// sem confundir DDDs diferentes com o mesmo final (Idma 71 × Francisco Cirilo 79).
+// Medido em 15/10/2026: 502 de 502 pares Claudia × CRM batem por DDD + 8.
+export function chaveFone(p) {
+  let d = String(p || '').replace(/\D/g, '');
+  if (d.length >= 12 && d.startsWith('55')) d = d.slice(2);
+  if (d.length === 11) return d.slice(0, 2) + d.slice(3);
+  if (d.length === 10) return d;
+  return null;
+}
+export function mesmoTelefoneBR(a, b) {
+  const ka = chaveFone(a), kb = chaveFone(b);
+  if (ka && kb) return ka === kb;
+  // Sem DDD num dos lados: só os 8 finais (o que dá para comparar).
+  const sa = String(a || '').replace(/\D/g, '').slice(-8);
+  const sb = String(b || '').replace(/\D/g, '').slice(-8);
+  return sa.length === 8 && sa === sb;
+}
+
+// Data AAAA-MM-DD é hoje ou amanhã no fuso da clínica.
+export const dentroDeHojeOuAmanha = (d) => { const x = String(d || '').slice(0, 10); return x === dataBRT() || x === dataBRT(Date.now() + 86400000); };
+// Instante de uma consulta (data e hora do CRM estão em horário de Brasília). O processo roda
+// em UTC: new Date('AAAA-MM-DDTHH:MM') sem fuso seria lido 3 h antes do real (revisão 15/10/2026).
+export const instanteConsultaBRT = (a) => new Date(`${String(a?.date || '').slice(0, 10)}T${String(a?.time || '00:00').slice(0, 5)}:00-03:00`);
+
+// O nome do cadastro LOCAL (incompleto) pode ser do paciente do CRM achado pelo telefone?
+// Telefone de família: o cadastro da mãe não pode virar o do filho (revisão 15/10/2026).
+// Compatível: "Novo Paciente"/vazio, mesmo nome, mesmo primeiro nome, ou iniciais em ordem
+// ("MV" → Marcelo Valadares Silva; "FM" → Flavia Damasceno Moesia de Albuquerque).
+const semAcento = (s) => String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
+const CONECTIVOS = new Set(['de', 'da', 'do', 'das', 'dos', 'e']);
+export function nomeCompativel(local, crm) {
+  const l = semAcento(local), c = semAcento(crm);
+  if (!l || l === 'novo paciente') return true;
+  if (!c) return false;
+  if (l === c) return true;
+  const pl = l.split(/\s+/), pc = c.split(/\s+/);
+  if (pl[0].length >= 2 && pl[0] === pc[0]) return true;
+  const ini = l.replace(/[^a-z]/g, '');
+  if (/^[A-ZÀ-Ú.\s]{2,10}$/.test(String(local).trim()) && ini.length >= 2 && ini.length <= 4) {
+    const iniCrm = pc.filter((w) => w && !CONECTIVOS.has(w)).map((w) => w[0]).join('');
+    if (iniCrm[0] !== ini[0]) return false;
+    let k = 0; for (const ch of iniCrm) if (ch === ini[k]) k++;
+    return k === ini.length;
+  }
+  return false;
+}
 
 export async function createLeadInCRM(name, phone, interest, extra = {}) {
   try {
@@ -93,13 +144,27 @@ export async function createLeadInCRM(name, phone, interest, extra = {}) {
     const { getFollowUpsByPhone } = await import('./crmApi.js');
     const existing = await getFollowUpsByPhone(phone);
     const pediuHorario = interest === 'pediu_horario';
+    // falha_claudia (15/10/2026): aviso de que a Claudia mandou a contingência.
+    const falhaClaudia = interest === 'falha_claudia';
     if (existing && existing.ok && Array.isArray(existing.data) && existing.data.length > 0) {
-      const bloqueiam = pediuHorario ? existing.data.filter(cardAberto) : existing.data;
+      // contato novo / agendou: qualquer card bloqueia — menos o aviso de falha (não é card de lead).
+      // pediu_horario: só card ABERTO bloqueia. falha_claudia: só outro aviso ABERTO.
+      const bloqueiam = pediuHorario ? existing.data.filter(cardAberto)
+        : falhaClaudia ? existing.data.filter((f) => ['pendente', 'enviado', 'respondeu'].includes(String(f.status || '').toLowerCase()) && f.interest === 'falha_claudia')
+        : existing.data.filter((f) => f.interest !== 'falha_claudia');
       if (bloqueiam.length > 0) {
+        if (falhaClaudia) {
+          // Nova falha com aviso aberto: o aviso volta a vencer HOJE e ganha a hora da nova falha.
+          const { updateFollowUp } = await import('./crmApi.js');
+          const hojeA = dataBRT(); const av = bloqueiam[0];
+          const up = await updateFollowUp(av.id, { status: 'pendente', dueDate: hojeA, notes: `${av.notes || ''}\n⚠️ Nova falha em ${hojeA.slice(8, 10)}/${hojeA.slice(5, 7)} as ${horaBRT()}`.trim() });
+          console.log('[Agent] Aviso de falha já aberto para ' + phone + ' — atualizado para vencer hoje');
+          return up && up.ok ? 'atualizado' : 'erro';
+        }
         console.log('[Agent] Lead já existe no Kanban para ' + phone + ' (' + bloqueiam.length + ' registro(s)' + (pediuHorario ? ' aberto(s)' : '') + '), pulando criação');
-        return;
+        return 'existente';
       }
-      console.log('[Agent] Kanban de ' + phone + ' só tem ' + existing.data.length + ' card(s) fechado(s) — criando card do pedido de horário');
+      if (pediuHorario) console.log('[Agent] Kanban de ' + phone + ' só tem ' + existing.data.length + ' card(s) fechado(s) — criando card do pedido de horário');
     }
     const now = new Date().toISOString();
     const hoje = dataBRT();
@@ -114,6 +179,7 @@ export async function createLeadInCRM(name, phone, interest, extra = {}) {
       interest: interest || null,
       notes: interest === 'agendamento_whatsapp' ? 'Agendou consulta via WhatsApp'
         : pediuHorario ? 'Pediu horario via WhatsApp em ' + hoje.slice(8, 10) + '/' + hoje.slice(5, 7) + ' - sem marcacao ainda'
+        : falhaClaudia ? '⚠️ A Claudia nao conseguiu responder a mensagem de ' + hoje.slice(8, 10) + '/' + hoje.slice(5, 7) + ' as ' + horaBRT() + ' - responder manualmente'
         : 'Contato via WhatsApp - nao agendou',
       createdAt: now,
       updatedAt: now,
@@ -123,6 +189,9 @@ export async function createLeadInCRM(name, phone, interest, extra = {}) {
       body.respondedAt = now;
       body.dueDate = dataBRT(Date.now() + PEDIDO_HORARIO_PRAZO_DIAS * 86400000);
     }
+    // Aviso de falha vence HOJE (aba Hoje) e fica 'pendente': a conciliação só mexe no
+    // prazo de 'respondeu' e o 2b não toca nele — some só quando o Dr. Diego resolver.
+    if (falhaClaudia) body.dueDate = hoje;
 
     const CRM_URL = process.env.CRM_API_URL || 'https://crm.holiz.com.br/api/integration';
     const API_KEY = process.env.CRM_API_KEY || '';
@@ -135,11 +204,13 @@ export async function createLeadInCRM(name, phone, interest, extra = {}) {
 
     if (res.ok) {
       console.log('[Agent] Lead criado no CRM:', name || phone);
-    } else {
-      console.warn('[Agent] Lead CRM respondeu', res.status);
+      return 'criado';
     }
+    console.warn('[Agent] Lead CRM respondeu', res.status);
+    return 'erro';
   } catch (err) {
     console.error('[Agent] Erro ao criar lead:', err.message);
+    return 'erro';
   }
 }
 
@@ -154,26 +225,46 @@ export async function registrarPedidoDeHorario(patient, phone, pushName, deps = 
     const agora = deps.now ? deps.now() : Date.now();
     if (agora - (pedidoHorarioMarcado.get(phone) || 0) < PEDIDO_HORARIO_TTL) return false;
     pedidoHorarioMarcado.set(phone, agora);
-    let nome = (patient?.name && patient.name !== 'Novo Paciente') ? patient.name : (pushName || null);
-    let patientId = null;
-    try {
-      const { searchPatientByPhone } = deps.crmApi || await import('./crmApi.js');
-      const r = await searchPatientByPhone(phone);
-      const p = r?.ok && r.data?.found ? r.data.patient : null;
-      // Só confia no cadastro se os 10 últimos dígitos batem (DDD + número):
-      // o sufixo-8 sozinho confunde Idma (71) com Francisco Cirilo (79).
-      const d1 = String(p?.phone || '').replace(/\D/g, '');
-      const d2 = String(phone || '').replace(/\D/g, '');
-      if (p && d1.length >= 10 && d1.slice(-10) === d2.slice(-10)) {
-        patientId = p.id || null;
-        if (p.name) nome = p.name;
-      }
-    } catch { /* sem CRM: segue sem patientId — a conciliação vincula depois */ }
+    const { nome, patientId } = await identificarNoCrm(patient, phone, pushName, deps);
     const criar = deps.createLeadInCRM || createLeadInCRM;
     await criar(nome, phone, 'pediu_horario', { patientId });
     return true;
   } catch (e) {
     console.warn('⚠️ Pedido de horário sem rastro no Kanban:', e?.message);
+    return false;
+  }
+}
+
+// Nome e id do CRM para o card — só quando o telefone do cadastro é o MESMO
+// (DDD + 8 finais; o 9 pode faltar de um dos lados). Senão, nome local/WhatsApp.
+async function identificarNoCrm(patient, phone, pushName, deps = {}) {
+  let nome = (patient?.name && patient.name !== 'Novo Paciente') ? patient.name : (pushName || null);
+  let patientId = null;
+  try {
+    const { searchPatientByPhone } = deps.crmApi || await import('./crmApi.js');
+    const r = await searchPatientByPhone(phone);
+    const p = r?.ok && r.data?.found ? r.data.patient : null;
+    if (p && mesmoTelefoneBR(p.phone, phone)) {
+      patientId = p.id || null;
+      if (p.name) nome = p.name;
+    }
+  } catch { /* sem CRM: segue sem patientId — a conciliação vincula depois */ }
+  return { nome, patientId };
+}
+
+// A Claudia mandou a contingência ("dificuldade técnica") → card no Kanban vencendo
+// HOJE, para o Dr. Diego responder à mão. Caso Lidia Dantas (13/10/2026): pediu
+// 30/10, o modelo devolveu resposta vazia, ela recebeu a contingência e ninguém
+// viu por 2 dias. Nunca lança.
+export async function registrarFalhaDeResposta(patient, phone, pushName, deps = {}) {
+  try {
+    const { nome, patientId } = await identificarNoCrm(patient, phone, pushName, deps);
+    const criar = deps.createLeadInCRM || createLeadInCRM;
+    const st = await criar(nome, phone, 'falha_claudia', { patientId });
+    console.log(`🚨 Aviso de falha no Kanban (${st || '?'}): a Claudia não conseguiu responder ${nome || phone}`);
+    return st === 'criado' || st === 'atualizado';
+  } catch (e) {
+    console.warn('⚠️ Falha de resposta sem aviso no Kanban:', e?.message);
     return false;
   }
 }
@@ -850,7 +941,11 @@ export async function processMessage(phone, message, options = {}) {
     // (caso Larissa Pedreira, 30/jun/2026). A busca por NOME continua só com pushName útil.
     // IMPORTANTE: só confiar no match por pushName se o nome do CRM COMEÇA com o pushName
     // (evita "Alice" do WhatsApp ser identificada como "Alice Dias Freitas" — outra pessoa).
-    const needsCrmLookup = !patient || (patient && !patient.registration_complete && patient.name === 'Novo Paciente');
+    // Cadastro local INCOMPLETO com nome também busca (apelido do WhatsApp, iniciais
+    // "MV"/"FJ"): antes só "Novo Paciente" buscava, e paciente antigo caía no pedido
+    // de LGPD (caso Marcelo Valadares, 10/10/2026: no CRM desde março; 12 cadastros
+    // assim em 15/10/2026, todos de antes de jul).
+    const needsCrmLookup = !patient || !patient.registration_complete;
     const pushNameHasSurname = pushName && pushName.trim().includes(' ');
     if (needsCrmLookup) {
       try {
@@ -858,7 +953,14 @@ export async function processMessage(phone, message, options = {}) {
         // Primeiro tentar buscar por telefone no CRM (mais confiável que nome)
         const phoneResult = await searchPatientByPhone(phone);
         let nameResult = { ok: false, data: null };
-        if (phoneResult.ok && phoneResult.data?.found && phoneResult.data.patient) {
+        // O CRM acha pelos 9/8 finais: com DDD diferente é OUTRA pessoa (Idma 71 ×
+        // Francisco Cirilo 79, mesmo final). Só vale o match por DDD + 8.
+        const achouPorFone = !!(phoneResult.ok && phoneResult.data?.found && phoneResult.data.patient);
+        const foneConfere = achouPorFone && mesmoTelefoneBR(phoneResult.data.patient.phone, phone);
+        if (achouPorFone && !foneConfere) {
+          console.log(`🚫 Match por telefone DESCARTADO: ${phone} → "${phoneResult.data.patient.name}" (DDD diferente)`);
+        }
+        if (foneConfere) {
           nameResult = phoneResult;
           console.log(`🔍 LID ${phone} identificado como ${phoneResult.data.patient.name} via telefone CRM`);
         } else if (pushNameHasSurname) {
@@ -890,15 +992,27 @@ export async function processMessage(phone, message, options = {}) {
           } else {
             console.log(`🔍 LID ${phone} identificado como ${crmPatient.name} via pushName`);
           }
-          if (patient) {
+          if (patient && !nomeCompativel(patient.name, crmPatient.name)) {
+            // Telefone compartilhado (família): o cadastro local incompleto é de OUTRA pessoa
+            // com o mesmo número — não vira o paciente do CRM (segue o cadastro normal).
+            console.log(`🚫 Cadastro local #${patient.id} "${patient.name}" não parece ser "${crmPatient.name}" (telefone compartilhado?) — mantido`);
+          } else if (patient) {
             // Atualizar registro existente com dados do CRM
+            const nomeLocalAntes = patient.name;
+            const statusAntes = patient.status;
             completePatientRegistration(patient.id, {
               name: crmPatient.name,
-              birth_date: crmPatient.birthDate || null,
+              // completePatientRegistration SOBRESCREVE: sem data no CRM, mantém a local.
+              birth_date: crmPatient.birthDate || patient.birth_date || null,
               contact_phone: crmPatient.phone,
             });
-            patient = { ...patient, name: crmPatient.name, contact_phone: crmPatient.phone, registration_complete: 1 };
-            console.log(`✅ Paciente #${patient.id} atualizado com dados do CRM: ${crmPatient.name}`);
+            // ...e marca 'em_tratamento': quem estava de alta continua de alta (ciclo de retornos).
+            if (statusAntes === 'alta_confirmada') db.prepare("UPDATE patients SET status = 'alta_confirmada' WHERE id = ?").run(patient.id);
+            // Paciente do CRM: cadastro completo sem pedir LGPD (mesma regra do match por nome).
+            setLgpdConsent(patient.id);
+            patient = { ...patient, name: crmPatient.name, contact_phone: crmPatient.phone, registration_complete: 1, lgpd_consent: 1,
+              status: statusAntes === 'alta_confirmada' ? 'alta_confirmada' : 'em_tratamento' };
+            console.log(`✅ Paciente #${patient.id} atualizado com dados do CRM: ${crmPatient.name} (local era "${nomeLocalAntes}") — sem pedir LGPD`);
             // Salvar mapeamento LID → telefone real se veio de LID
             if (options.lidJid && crmPatient.phone) {
               saveLidMapping(options.lidJid, crmPatient.phone, pushName);
@@ -1071,6 +1185,7 @@ export async function processMessage(phone, message, options = {}) {
       // Data (YYYY-MM-DD) do agendamento confirmado — usada para agendar pos_confirmacao_d1
       // no dia SEGUINTE à consulta, não 1 dia depois da confirmação.
       let confirmedApptDate = null;
+      let confirmouNoCrm = false;
 
       // ── Confirmar no CRM ──────────────────────────────────────
       try {
@@ -1079,7 +1194,8 @@ export async function processMessage(phone, message, options = {}) {
         // Tenta buscar agendamentos pelo telefone
         const aptsResult = await getPatientAppointments(phone);
         if (aptsResult.ok && aptsResult.data?.length) {
-          const pending = aptsResult.data.filter(a => a.status === 'agendado');
+          // Com o Dr. Diego na conversa: só consulta de hoje/amanhã achada pelo telefone de quem clicou.
+          const pending = aptsResult.data.filter(a => a.status === 'agendado' && (!options.emTakeover || (dentroDeHojeOuAmanha(a.date) && instanteConsultaBRT(a) >= new Date())));
           if (pending.length > 0) {
             const confirmResult = await confirmAppointment(pending[0].id);
             if (confirmResult.ok) {
@@ -1090,7 +1206,7 @@ export async function processMessage(phone, message, options = {}) {
           }
         }
         // Fallback: busca por contact_phone (número real salvo do CRM para LIDs)
-        if (!confirmed && patient.contact_phone) {
+        if (!confirmed && patient.contact_phone && !options.emTakeover) {
           const aptsResult3 = await getPatientAppointments(patient.contact_phone);
           if (aptsResult3.ok && aptsResult3.data?.length) {
             const pending3 = aptsResult3.data.filter(a => a.status === 'agendado');
@@ -1105,7 +1221,7 @@ export async function processMessage(phone, message, options = {}) {
           }
         }
         // Fallback: busca por pushName ou patient.name no CRM
-        if (!confirmed) {
+        if (!confirmed && !options.emTakeover) {
           const searchName = (pushName && pushName !== 'Novo Paciente' && pushName.length >= 3) ? pushName : patient.name;
           if (searchName && searchName !== 'Novo Paciente') {
             const nameResult = await searchPatientByName(searchName);
@@ -1126,8 +1242,14 @@ export async function processMessage(phone, message, options = {}) {
             }
           }
         }
+        confirmouNoCrm = confirmed;
       } catch (err) {
         console.error(`❌ Erro ao confirmar no CRM: ${err.message}`);
+      }
+      if (options.emTakeover && !confirmouNoCrm) {
+        recentlyConfirmed.delete(patient.id);
+        console.log(`🔘 Confirmar com o Dr. Diego na conversa: nenhuma consulta de hoje/amanhã pelo telefone de ${patient.name || phone} — nada feito`);
+        return null;
       }
 
       // Usar nome do lembrete recente (do CRM) se disponível — mais confiável que o banco local
@@ -1137,7 +1259,7 @@ export async function processMessage(phone, message, options = {}) {
       if (hasRecentRem && reminderName && reminderName !== 'Novo Paciente') {
         confirmName = reminderName;
         console.log(`🔄 Confirmação: usando nome do lembrete "${confirmName}" (banco local: "${patient.name}")`);
-      } else if (confirmName === 'Novo Paciente') {
+      } else if (confirmName === 'Novo Paciente' && !options.emTakeover) {
         // Número desconhecido no banco local (wa_id sem o 9º dígito, ou LID).
         // 1º) Match DETERMINÍSTICO por sufixo de 8 dígitos: lembrete recente cujo
         //     telefone termina igual ao do remetente é do PRÓPRIO paciente.
@@ -1206,7 +1328,8 @@ export async function processMessage(phone, message, options = {}) {
       }
       const firstName = confirmName.split(' ')[0];
       const reply = appointmentConfirmedReminder(confirmName);
-      saveMessage(patient.id, 'assistant', reply);
+      // Resposta não enviada (Dr. Diego na conversa) não entra no histórico.
+      if (!options.emTakeover) saveMessage(patient.id, 'assistant', reply);
       schedulePostConfirmationFollowup(patient.id, confirmedApptDate);
       console.log(`📅 Agendamento confirmado por ${confirmName || phone}`);
       return reply;
@@ -1227,7 +1350,7 @@ export async function processMessage(phone, message, options = {}) {
         // Tenta buscar agendamentos pelo telefone
         const aptsResult = await getPatientAppointments(phone);
         if (aptsResult.ok && aptsResult.data?.length) {
-          const pending = aptsResult.data.filter(a => a.status === 'agendado' || a.status === 'confirmado');
+          const pending = aptsResult.data.filter(a => (a.status === 'agendado' || a.status === 'confirmado') && (!options.emTakeover || (dentroDeHojeOuAmanha(a.date) && instanteConsultaBRT(a) >= new Date())));
           if (pending.length > 0) {
             const cancelResult = await cancelAppointment(pending[0].id, 'Cancelado pelo paciente via WhatsApp');
             if (cancelResult.ok) {
@@ -1238,7 +1361,7 @@ export async function processMessage(phone, message, options = {}) {
           }
         }
         // Fallback: busca por nome (para pacientes LID)
-        if (!cancelled && patient.name) {
+        if (!cancelled && patient.name && !options.emTakeover) {
           const nameResult = await searchPatientByName(patient.name);
           if (nameResult.ok && nameResult.data?.found && nameResult.data.patient?.phone) {
             const realPhone = nameResult.data.patient.phone;
@@ -1266,7 +1389,7 @@ export async function processMessage(phone, message, options = {}) {
       if (cancelled && cancelledApt) {
         try {
           const { createFollowUp, getFollowUpsByPhone } = await import('./crmApi.js');
-          const cardPhone = patient.contact_phone || phone;
+          const cardPhone = options.emTakeover ? phone : (patient.contact_phone || phone);
           const fuRes = await getFollowUpsByPhone(cardPhone);
           const fuArr = Array.isArray(fuRes?.data) ? fuRes.data : [];
           const already = fuArr.some((f) =>
@@ -1294,12 +1417,17 @@ export async function processMessage(phone, message, options = {}) {
         }
       }
 
+      if (options.emTakeover && !cancelled) {
+        console.log(`🔘 Cancelar com o Dr. Diego na conversa: nenhuma consulta de hoje/amanhã pelo telefone de ${patient.name || phone} — nada feito`);
+        return null;
+      }
+
       // Resposta condicional: confirma cancelamento só se houve; senão trata
       // como "não quero agendar agora" (caso típico de follow-up pós-alta).
       const reply = cancelled
         ? appointmentCancelledResponse(patient.name)
         : noAppointmentToCancelResponse(patient.name);
-      saveMessage(patient.id, 'assistant', reply);
+      if (!options.emTakeover) saveMessage(patient.id, 'assistant', reply);
       console.log(cancelled
         ? `❌ Agendamento cancelado por ${patient.name || phone}`
         : `ℹ️ "Cancelar" sem agendamento ativo (follow-up/pós-alta) — ${patient.name || phone}`);
@@ -1357,7 +1485,8 @@ export async function processMessage(phone, message, options = {}) {
         const phoneToCheck = patient.contact_phone || phone;
         const fuResult = await getFollowUpsByPhone(phoneToCheck);
         if (fuResult.ok && Array.isArray(fuResult.data)) {
-          const pendingFUs = fuResult.data.filter(f => f.status === 'enviado' || f.status === 'pendente');
+          // O aviso de falha da Claudia (falha_claudia) fica pendente até o Dr. Diego resolver.
+          const pendingFUs = fuResult.data.filter(f => (f.status === 'enviado' || f.status === 'pendente') && f.interest !== 'falha_claudia');
           for (const fu of pendingFUs) {
             await updateFollowUpStatus(fu.id, 'respondeu');
             console.log(`✅ Follow-up ${fu.id} atualizado para 'respondeu' — ${fu.patientName}`);
@@ -1379,7 +1508,8 @@ export async function processMessage(phone, message, options = {}) {
     if (!isNewPatient && msgTrimmed.toLowerCase() === 'reagendar' && !perguntaTrocaAtiva) {
       try {
         const { getPatientAppointments, getFollowUpsByPhone, createFollowUp, cancelAppointment } = await import('./crmApi.js');
-        const phoneToCheck = patient.contact_phone || phone;
+        // Com o Dr. Diego na conversa, só o telefone de quem clicou (contact_phone pode ser de outra pessoa).
+        const phoneToCheck = options.emTakeover ? phone : (patient.contact_phone || phone);
         const firstName = (patient.name && patient.name !== 'Novo Paciente') ? patient.name.split(' ')[0] : '';
         const greet = firstName ? `, *${firstName}*` : '';
 
@@ -1388,8 +1518,8 @@ export async function processMessage(phone, message, options = {}) {
         const aptsArr = Array.isArray(aptsResult?.data) ? aptsResult.data : [];
         const now = new Date();
         const futureApts = aptsArr
-          .filter(a => a.status !== 'cancelado' && new Date(`${a.date}T${a.time || '00:00'}`) >= now)
-          .sort((a, b) => new Date(`${a.date}T${a.time}`) - new Date(`${b.date}T${b.time}`));
+          .filter(a => a.status !== 'cancelado' && instanteConsultaBRT(a) >= now && (!options.emTakeover || dentroDeHojeOuAmanha(a.date)))
+          .sort((a, b) => instanteConsultaBRT(a) - instanteConsultaBRT(b));
         const nextApt = futureApts[0];
 
         if (nextApt) {
@@ -1439,7 +1569,7 @@ export async function processMessage(phone, message, options = {}) {
           // Resposta DIRETA — o "Reagendar" NÃO segue pro LLM (evita "não encontrei consulta")
           saveMessage(patient.id, 'user', message);
           const reply = `Entendido${greet}! Liberei o horário de ${dateBR} às ${timeStr}. 😊\n\nQual dia e turno (manhã ou tarde) ficam melhor pra você?`;
-          saveMessage(patient.id, 'assistant', reply);
+          if (!options.emTakeover) saveMessage(patient.id, 'assistant', reply);
           return reply;
         }
 
@@ -1449,7 +1579,7 @@ export async function processMessage(phone, message, options = {}) {
         const cardArr = Array.isArray(cardResult?.data) ? cardResult.data : [];
         const hasOpenCard = cardArr.some(f =>
           f.source === 'reagendar_pendente' && f.status !== 'agendou' && f.status !== 'perdido');
-        if (hasOpenCard) {
+        if (hasOpenCard && !options.emTakeover) {
           saveMessage(patient.id, 'user', message);
           const reply = `Seu pedido de reagendamento já está registrado${greet}! 😊\n\nMe diga o dia e turno (manhã ou tarde) de preferência que eu verifico os horários disponíveis.`;
           saveMessage(patient.id, 'assistant', reply);
@@ -1459,6 +1589,16 @@ export async function processMessage(phone, message, options = {}) {
       } catch (err) {
         console.warn('⚠️ Erro ao registrar reagendar_pendente:', err.message);
       }
+    }
+
+    // Botão do lembrete com o Dr. Diego na conversa (15/10/2026): valem só os atalhos
+    // determinísticos acima (Confirmar / Cancelar / Reagendar). Nada de LLM, cadastro
+    // ou LGPD, e a resposta NÃO é enviada (ver handleIncomingMessage). Caso Manoela
+    // Conceição (08/10): "Confirmar" às 22h51 durante a conversa com o Dr. Diego foi
+    // descartado; a consulta ficou sem confirmação e ela recebeu o lembrete do dia.
+    if (options.emTakeover) {
+      console.log(`🔘 Botão "${msgTrimmed}" com o Dr. Diego na conversa: nenhum atalho de agenda se aplicou (sem LLM, sem resposta) (${patient.name || phone})`);
+      return null;
     }
 
     // 3. Se é novo paciente → verificar se já existe no CRM antes de pedir dados
@@ -1852,6 +1992,10 @@ export async function processMessage(phone, message, options = {}) {
       ofertaHorario: isSlotOfferContext,
     };
     let iteracoes = 0;
+    // Mesma lista do guard de msg curta pós-agendamento: agradecimento curto com
+    // resposta vazia fica em silêncio (5c) — sem nova tentativa.
+    const ehAckCurtoMsg = msgTrimmed.length <= 20 && /^(ok|certo|beleza|blz|perfeito|show|fechado|obrigad[oa]|valeu|brigad[oa]|muito obrigad[oa]|combinado|ate la|até lá|tudo bem|ta bom|tá bom)[!\.\ ]*$/i.test(msgTrimmed);
+    let tentouDeNovo = false;
     while (true) {
       if (++iteracoes > MAX_ITERACOES_LLM) {
         console.warn(`⚠️ LAÇO DE TOOLS ESTOUROU (${MAX_ITERACOES_LLM} chamadas) — ${patient.name || phone}: tools=${toolsExecutadas.join(',') || 'nenhuma'}`);
@@ -1909,6 +2053,14 @@ export async function processMessage(phone, message, options = {}) {
       if (toolUseBlocks.length === 0) {
         // No tools called, get text response
         assistantReply = textBlocks.map(b => b.text).join("") || "";
+        // Fim de turno SEM texto (raro): 1 nova tentativa com o MESMO pedido antes da
+        // contingência. Caso Lidia Dantas (13/10/2026): recado pedindo 30/10, o modelo
+        // leu o plano dela e devolveu 2 tokens; ela recebeu "dificuldade técnica".
+        if (!assistantReply.trim() && response.stop_reason === 'end_turn' && !tentouDeNovo && !ehAckCurtoMsg) {
+          tentouDeNovo = true;
+          console.warn(`🔁 Resposta em branco do modelo — tentando de novo (${patient.name || phone}): output_tokens=${response.usage?.output_tokens} tools=${toolsExecutadas.join(',') || 'nenhuma'}`);
+          continue;
+        }
         break;
       }
 
@@ -1974,11 +2126,12 @@ export async function processMessage(phone, message, options = {}) {
       // resposta vier vazia, silêncio é o certo (responder "tente novamente" a um
       // agradecimento assusta o paciente — 4 dos 15 casos historicos eram isso).
       // Mesma lista do guard de msg curta pós-agendamento (~L1218).
-      const ehAckCurto = msgTrimmed.length <= 20 && /^(ok|certo|beleza|blz|perfeito|show|fechado|obrigad[oa]|valeu|brigad[oa]|muito obrigad[oa]|combinado|ate la|até lá|tudo bem|ta bom|tá bom)[!\.\ ]*$/i.test(msgTrimmed);
+      const ehAckCurto = ehAckCurtoMsg;
       const mexeuNaAgenda = toolsExecutadas.some(t => TOOLS_QUE_MEXEM_NA_AGENDA.has(t));
       console.warn(`⚠️ RESPOSTA VAZIA — ${patient.name || phone} (#${patient.id}): stop_reason=${ultimaResposta.stop_reason} output_tokens=${ultimaResposta.usage?.output_tokens} tools_ja_executadas=${toolsExecutadas.join(',') || 'nenhuma'} — ${ehAckCurto ? 'ack curto, silêncio mantido' : (mexeuNaAgenda ? 'contingência pós-ação' : 'enviando contingência')}`);
       if (ehAckCurto && !mexeuNaAgenda) return null;
       const contingencia = mexeuNaAgenda ? MSG_DIFICULDADE_POS_ACAO : MSG_DIFICULDADE_TECNICA;
+      registrarFalhaDeResposta(patient, phone, pushName).catch(() => {});
       return pendingLgpdAsk ? `${contingencia}\n\n${pendingLgpdAsk}` : contingencia;
     }
 
@@ -2016,6 +2169,9 @@ export async function processMessage(phone, message, options = {}) {
 
   } catch (error) {
     console.error('❌ Erro no agente:', error.message);
+    // Botão com o Dr. Diego na conversa: nada vai ao paciente — sem contingência nem aviso.
+    if (options?.emTakeover) return null;
+    registrarFalhaDeResposta(null, phone, options?.pushName).catch(() => {});
     return MSG_DIFICULDADE_TECNICA;
   }
 }

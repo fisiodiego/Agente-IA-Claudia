@@ -234,7 +234,49 @@ export async function sendTemplateMessage(phone, templateName, parameters = []) 
 }
 // ─── Processamento de mensagens recebidas ───────────────────────────────────
 
-async function handleIncomingMessage(from, text, pushName) {
+// Botões dos lembretes de consulta (templates lembrete_consulta / lembrete_dia).
+const BOTOES_DE_AGENDA = /^(confirmar|cancelar|reagendar)$/i;
+// Com o Dr. Diego na conversa: UM botão aplicado por número a cada 30 min (sem resposta, o
+// paciente tende a clicar de novo, e a Meta reentrega webhook), com a trava de processamento
+// (teto 180 s, como o processBuffered). Se o botão não fez nada, a janela não fica.
+// Pausa GERAL (/pause-all) não aplica nada (revisão 15/10/2026).
+const BOTAO_TAKEOVER_JANELA_MS = 30 * 60 * 1000;
+const botaoTakeoverRecente = new Map(); // phone -> instante do último botão aplicado
+function aplicarBotaoComDiegoNaConversa(phone, texto, pushName) {
+  const agora = Date.now();
+  if ((humanTakeoverMap.get('__ALL__') || 0) > agora || !((humanTakeoverMap.get(phone) || 0) > agora)) {
+    console.log(`🔘 Botão "${texto}" de ${phone} com a Claudia em pausa GERAL — só registrado`);
+    return;
+  }
+  const ultimo = botaoTakeoverRecente.get(phone) || 0;
+  if (agora - ultimo < BOTAO_TAKEOVER_JANELA_MS) {
+    console.log(`🔘 Botão "${texto}" de ${phone} repetido (outro aplicado há ${Math.round((agora - ultimo) / 60000)} min) — só registrado`);
+    return;
+  }
+  if (processingLock.get(phone)) {
+    console.log(`🔘 Botão "${texto}" de ${phone} com processamento em andamento — só registrado`);
+    return;
+  }
+  botaoTakeoverRecente.set(phone, agora);
+  processingLock.set(phone, true);
+  let teto;
+  const tetoAlcancado = new Promise((r) => { teto = setTimeout(() => r('teto'), 180000); });
+  Promise.race([processMessage(phone, texto, { pushName, emTakeover: true }).then((r) => (r ? 'feito' : 'nada'), () => 'erro'), tetoAlcancado])
+    .then((res) => { if (res === 'nada') botaoTakeoverRecente.delete(phone); return res; })
+    .then((res) => console.log(`🔘 Botão "${texto}" com o Dr. Diego na conversa (${phone}): ${res === 'feito' ? 'aplicado no CRM, sem resposta ao paciente' : res === 'nada' ? 'nada a fazer' : res === 'teto' ? 'passou de 180 s — trava liberada' : 'erro'}`))
+    .finally(() => {
+      clearTimeout(teto);
+      processingLock.delete(phone);
+      // Mesma retomada do processBuffered: o que entrou na fila durante a trava segue.
+      const pending = pendingQueue.get(phone);
+      if (pending) {
+        pendingQueue.delete(phone);
+        messageBuffer.set(phone, { texts: pending.texts, pushName: pending.pushName, timer: setTimeout(() => processBuffered(phone), 1000) });
+      }
+    });
+}
+
+async function handleIncomingMessage(from, text, pushName, ehBotao = false) {
   const phone = normalizeBRPhone(from);
   if (!phone) return;
 
@@ -247,9 +289,26 @@ async function handleIncomingMessage(from, text, pushName) {
   console.log(`📩 [CloudAPI] Mensagem de ${phone}${pushName ? ' (' + pushName + ')' : ''}: "${text.substring(0, 60)}${text.length > 60 ? '...' : ''}"`);
 
   // Se o Dr. Diego está ativo nessa conversa, Cláudia fica quieta
+  // Clique repetido em Cancelar/Reagendar logo depois de um aplicado com o Dr. Diego na
+  // conversa (30 min): mesmo com a conversa dele encerrada, o caminho normal cancelaria a
+  // PRÓXIMA consulta. Só registra (2ª revisão, 15/10/2026).
+  if (ehBotao && /^(cancelar|reagendar)$/i.test(String(text || '').trim()) &&
+      Date.now() - (botaoTakeoverRecente.get(phone) || 0) < BOTAO_TAKEOVER_JANELA_MS && !isHumanActive(phone)) {
+    console.log(`🔘 Botão "${String(text).trim()}" de ${phone} repetido logo após um aplicado com o Dr. Diego na conversa — só registrado`);
+    logMessage(phone, 'inbound', text);
+    return;
+  }
+
   if (isHumanActive(phone)) {
     console.log(`👨‍⚕️ Modo humano ativo para ${phone} — Cláudia não responde`);
     logMessage(phone, 'inbound', text);
+    // Clique em Confirmar/Cancelar/Reagendar do LEMBRETE vale mesmo com o Dr. Diego
+    // na conversa (pedido dele, 15/10/2026): o CRM é atualizado, nada é enviado ao
+    // paciente. Texto digitado não entra aqui (só botão de verdade). Sem pegar o
+    // lock: veja aplicarBotaoComDiegoNaConversa (trava, 1 por 30 min, pausa geral).
+    if (ehBotao && BOTOES_DE_AGENDA.test(String(text || '').trim())) {
+      aplicarBotaoComDiegoNaConversa(phone, String(text).trim(), pushName);
+    }
     return;
   }
 
@@ -703,7 +762,7 @@ function createWebhookServer() {
                 const contact = (value.contacts || []).find(c => c.wa_id === from);
                 const pushName = contact?.profile?.name || null;
 
-                handleIncomingMessage(from, msgText, pushName);
+                handleIncomingMessage(from, msgText, pushName, msg.type === 'button' || msg.type === 'interactive');
               } else if (msg.type === 'audio') {
                 // Áudio (01/10/2026): AUDIO_TRANSCRICAO ausente/off = ignorado como sempre.
                 // Em sombra só transcreve e grava na tabela audio_sombra: não responde,
