@@ -191,6 +191,67 @@ const vagasLiberadasDoDia = (phone, date, professionalId) => vigentes(phone)
   .filter((v) => v.date === String(date).slice(0, 10) && !(v.professionalId && professionalId && v.professionalId !== professionalId))
   .map((v) => v.time);
 
+// ─── Consultas DESTE telefone que ocupam horário numa data (caso Beatriz, 15/10/2026) ───
+// O aviso do recentCreates ("esse horário ocupado foi VOCÊ que criou") vive na memória do
+// processo e um restart apaga. A Beatriz marcou o filho para 20/10 15h às 10h32; os deploys
+// de 10h37/10h57 reiniciaram a Claudia e, às 13h36, ao responder o preço, ela conferiu a
+// agenda, não viu o 15h livre e pediu desculpas oferecendo outro horário. Aqui a fonte é o
+// CRM: o paciente do telefone (só com DDD + 8 iguais — Idma (71) × Francisco Cirilo (79)
+// dividem os 8 finais) e as consultas futuras DELE naquela data que não aparecem livres.
+// Limite: o CRM devolve UM paciente por telefone; em telefone de família com vários
+// cadastros, os outros ficam sem aviso (como antes). CRM fora do ar ou lento → sem aviso.
+// Telefone: mesma chave de agent.js (chaveFone = DDD + 8), mas SEM o recurso dos 8 finais do
+// mesmoTelefoneBR: cadastro gravado sem DDD casaria com qualquer DDD e o nome de outra pessoa
+// iria para o modelo (revisão de 15/10). O aviso é opcional; na dúvida, fica de fora.
+function chaveFoneBR(p) {
+  let d = String(p || '').replace(/\D/g, '');
+  if (d.length >= 12 && d.startsWith('55')) d = d.slice(2);
+  if (d.length === 11) return d.slice(0, 2) + d.slice(3);
+  if (d.length === 10) return d;
+  return null;
+}
+const mesmoTelefoneComDDD = (a, b) => { const ka = chaveFoneBR(a); return !!ka && ka === chaveFoneBR(b); };
+const PRAZO_CRM_AVISO_MS = 3000;
+const comPrazo = (p, ms) => {
+  let t;
+  return Promise.race([p, new Promise((r) => { t = setTimeout(() => r(null), ms); })]).finally(() => clearTimeout(t));
+};
+async function consultasDoTelefoneNaData(phone, date, professionalName, livres) {
+  try {
+    const { searchPatientByPhone } = await import('./crmApi.js');
+    const busca = await comPrazo(searchPatientByPhone(phone), PRAZO_CRM_AVISO_MS);
+    const pac = busca?.ok && busca.data?.found ? busca.data.patient : null;
+    if (!pac?.id || !mesmoTelefoneComDDD(phone, pac.phone)) return [];
+    const r = await comPrazo(getPatientAppointmentsById(pac.id), PRAZO_CRM_AVISO_MS);
+    if (!r?.ok || !Array.isArray(r.data)) return [];
+    const livresHM = (livres || []).map((h) => String(h).slice(0, 5));
+    const agora = Date.now();
+    // Só consulta ainda por vir: a de hoje que já passou e não foi fechada no CRM não "continua marcada".
+    return r.data
+      .filter((a) => a.date === date && a.time && !livresHM.includes(String(a.time).slice(0, 5)) &&
+        instanteBRT(a.date, String(a.time).slice(0, 5)) > agora &&
+        !(a.professionalName && professionalName && a.professionalName !== professionalName))
+      .map((a) => ({ time: String(a.time).slice(0, 5), paciente: a.patientName || pac.name || 'paciente deste telefone',
+        status: String(a.status || '').replace(/_/g, ' ') }));
+  } catch (e) {
+    console.warn('⚠️ Consultas do telefone no check_availability:', e?.message || e);
+    return [];
+  }
+}
+function avisoConsultasDoTelefone(lista) {
+  const horas = lista.map((c) => c.time).join(', ');
+  const desc = lista.map((c) => `${c.time} (${c.paciente}, ${c.status})`).join('; ');
+  const nomes = [...new Set(lista.map((c) => c.paciente))].join(' / ');
+  return {
+    consultasDesteTelefone: lista,
+    avisoConsultasDesteTelefone:
+      `⚠️ ${horas} NÃO aparece(m) em 'slots' porque JÁ É(SÃO) consulta marcada para ESTE MESMO TELEFONE: ${desc}. ` +
+      `Não é conflito com paciente de outro telefone e essa consulta continua marcada: NÃO diga que o horário "está ocupado" ` +
+      `ou "não está mais disponível", nem peça desculpas oferecendo outro como se ela tivesse se perdido. ` +
+      `Se pedirem uma consulta A MAIS nesse mesmo horário, explique que ele já é da consulta de ${nomes}.`,
+  };
+}
+
 export async function handleToolCall(toolName, toolInput, phone = null, turnCtx = null) {
   console.log(`🔧 Tool call: ${toolName}`, JSON.stringify(toolInput));
 
@@ -255,6 +316,15 @@ export async function handleToolCall(toolName, toolInput, phone = null, turnCtx 
           });
         }
 
+        // Horários desta data ocupados por consulta DESTE telefone no CRM (caso Beatriz 15/10).
+        // Os que o recentCreates já avisa ficam de fora (o aviso dele, abaixo, é mais forte).
+        const doTelefone = phone
+          ? (await consultasDoTelefoneNaData(phone, date, professionalName, slots))
+              .filter((c) => !ownCreates.some((o) => String(o.time).slice(0, 5) === c.time))
+          : [];
+        const avisoDoTelefone = doTelefone.length ? avisoConsultasDoTelefone(doTelefone) : null;
+        if (avisoDoTelefone) console.log(`📎 ${doTelefone.map((c) => c.time).join(', ')} de ${date} = consulta deste telefone no CRM — aviso anexado ao check_availability`);
+
         // Filtrar slots com mínimo 12h de antecedência
         const nowBRT = new Date(Date.now() - 3 * 3600000); // UTC-3
         const minTime = new Date(nowBRT.getTime() + 12 * 3600000); // +12h
@@ -274,6 +344,7 @@ export async function handleToolCall(toolName, toolInput, phone = null, turnCtx 
             message: `Não há horários disponíveis para ${professionalName} em ${formatDateBR(date)} (${dayOfWeek}). Agendamentos precisam de no mínimo 12h de antecedência.`,
             dayOfWeek,
             slots: [],
+            ...(avisoDoTelefone || {}),
           });
         }
 
@@ -297,6 +368,7 @@ export async function handleToolCall(toolName, toolInput, phone = null, turnCtx 
           response.liberadosPeloPaciente = proprios;
           response.aviso = `Os horários ${proprios.join(', ')} foram liberados por ESTE paciente quando pediu para reagendar; ele pode voltar a eles mesmo com menos de 12 h.`;
         }
+        if (avisoDoTelefone) Object.assign(response, avisoDoTelefone);
 
         // Se houver creates recentes nessa data, anexar aviso explícito.
         if (ownCreates.length > 0) {
