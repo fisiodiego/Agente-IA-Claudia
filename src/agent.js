@@ -1,6 +1,6 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { CRM_TOOLS } from './tools.js';
-import { handleToolCall } from './toolHandler.js';
+import { handleToolCall, registrarVagaLiberada, vagaLiberadaRecente, limparVagasLiberadas } from './toolHandler.js';
 import {
   getPatientByPhone,
   createPatient,
@@ -635,20 +635,6 @@ Paciente: "Daniela Ramos Silva, 15/03/1990"
 Claudia: [agora sim chama check_availability → find_or_create_patient com nome e birthDate → create_appointment]
 ⚠️ OTIMIZAÇÃO: NÃO chame list_professionals se o profissional já está no cache acima. Vá direto para check_availability com o ID do cache.
 ⚠️ NUNCA chame a mesma tool 2 vezes na mesma interação com os mesmos parâmetros.
-
-━━━ DUAS PESSOAS (paciente + acompanhante/familiar) ━━━
-Se o paciente pedir horário para ELE e para OUTRA pessoa ("preciso de 2 horários",
-"são duas pessoas", "eu e minha mãe"):
-1. Marque PRIMEIRO a consulta DELE, que já tem cadastro: check_availability →
-   create_appointment no horário que ele escolheu → "Agendado! ✅" com dia e hora.
-2. SÓ DEPOIS cuide da outra pessoa: peça nome completo e data de nascimento dela,
-   e aí find_or_create_patient + create_appointment no segundo horário.
-3. NUNCA deixe a vaga do paciente esperando os dados da outra pessoa, e NUNCA diga
-   que um horário "fica" reservado ou "fica assim" antes do create_appointment —
-   até lá, ele está apenas DISPONÍVEL. Se o paciente responder "pronto"/"ótimo"
-   sem você ter marcado, pergunte de forma direta: "Confirmo as 10h para você?".
-(Caso Luiza, 07/10/2026: pediu 2 vagas, a Claudia esperou o nascimento do
-acompanhante, a conversa parou e NINGUÉM foi marcado.)
    Se o paciente TEM plano de tratamento ativo, informe: "Será descontado do seu plano de tratamento (X/Y sessões usadas)"
    ⚠️ PLANO ATIVO COM SESSAO DISPONIVEL = SEMPRE DESCONTA DO PLANO. Vale mesmo
    que a data escolhida seja depois do "prazo" ou "vencimento" citado em algum
@@ -676,6 +662,32 @@ Exemplo de resposta IDEAL ao confirmar:
 
 Exemplo de resposta RUIM (NÃO faça isso):
 "Perfeito! Vou agendar... Preciso de algumas informações... 1. Qual dia? 2. Qual especialidade? 3. Qual telefone?" ← se ele já disse, NÃO pergunte
+
+━━━ DUAS PESSOAS (paciente + acompanhante/familiar) ━━━
+Se o paciente pedir horário para ELE e para OUTRA pessoa ("preciso de 2 horários",
+"são duas pessoas", "eu e minha mãe"):
+1. Marque PRIMEIRO a consulta DELE, que já tem cadastro: check_availability →
+   create_appointment no horário que ele escolheu → "Agendado! ✅" com dia e hora.
+2. SÓ DEPOIS cuide da outra pessoa: peça nome completo e data de nascimento dela,
+   e aí find_or_create_patient + create_appointment no segundo horário.
+3. NUNCA deixe a vaga do paciente esperando os dados da outra pessoa, e NUNCA diga
+   que um horário "fica" reservado ou "fica assim" antes do create_appointment —
+   até lá, ele está apenas DISPONÍVEL. Se o paciente responder "pronto"/"ótimo"
+   sem você ter marcado, pergunte de forma direta: "Confirmo as 10h para você?".
+(Caso Luiza, 07/10/2026: pediu 2 vagas, a Claudia esperou o nascimento do
+acompanhante, a conversa parou e NINGUÉM foi marcado.)
+
+━━━ DESISTIU DE REAGENDAR (manter o horário que foi liberado) ━━━
+Quando o paciente pede para reagendar, o horário dele é LIBERADO na hora (a consulta
+é cancelada). Se depois ele quiser MANTER aquele mesmo horário ("pode manter", "deixa
+como estava", "então fica o de hoje às 15h"):
+1. Chame create_appointment com a MESMA data e hora que foram liberadas — o sistema
+   permite voltar a esse horário mesmo com menos de 12 horas de antecedência (o
+   check_availability mostra esse horário em "liberadosPeloPaciente").
+2. Só depois do sucesso diga que marcou de novo ("Pronto, marquei de novo ✅" + dia e hora).
+3. NUNCA diga que a consulta "continua confirmada", "está mantida" ou "segue marcada"
+   sem create_appointment bem-sucedido — depois de liberada ela NÃO existe mais.
+(Caso Thiago, 15/10/2026: a Claudia disse "continua confirmada" e a consulta estava cancelada.)
 
 ━━━ CONFIRMAÇÃO DE AGENDAMENTO ━━━
 Quando o paciente responde *CONFIRMAR* ou *CANCELAR*, o sistema trata automaticamente.
@@ -1531,7 +1543,8 @@ export async function processMessage(phone, message, options = {}) {
           // Quando informar o novo horário, a Claudia cria nova consulta (create_appointment)
           // e o auto-update do CRM fecha o card. Caso Jessica (16/jun/2026).
           try {
-            await cancelAppointment(nextApt.id, 'Reagendamento solicitado — aguardando novo horário');
+            const rc = await cancelAppointment(nextApt.id, 'Reagendamento solicitado — aguardando novo horário');
+            if (rc?.ok) registrarVagaLiberada(phone, nextApt.date, nextApt.time, nextApt);
             console.log(`🗓️ Botão Reagendar: consulta ${nextApt.id} (${nextApt.date} ${nextApt.time}) cancelada — slot liberado`);
           } catch (e) {
             console.warn('⚠️ Botão Reagendar: erro ao cancelar consulta:', e.message);
@@ -1996,6 +2009,7 @@ export async function processMessage(phone, message, options = {}) {
     // resposta vazia fica em silêncio (5c) — sem nova tentativa.
     const ehAckCurtoMsg = msgTrimmed.length <= 20 && /^(ok|certo|beleza|blz|perfeito|show|fechado|obrigad[oa]|valeu|brigad[oa]|muito obrigad[oa]|combinado|ate la|até lá|tudo bem|ta bom|tá bom)[!\.\ ]*$/i.test(msgTrimmed);
     let tentouDeNovo = false;
+    let marcouNesteTurno = false; // create/reschedule com sucesso neste turno (rede de segurança 5d)
     while (true) {
       if (++iteracoes > MAX_ITERACOES_LLM) {
         console.warn(`⚠️ LAÇO DE TOOLS ESTOUROU (${MAX_ITERACOES_LLM} chamadas) — ${patient.name || phone}: tools=${toolsExecutadas.join(',') || 'nenhuma'}`);
@@ -2093,6 +2107,8 @@ export async function processMessage(phone, message, options = {}) {
             await registrarPedidoDeHorario(patient, phone, pushName);
           }
           if (!parsed.appointmentId || !['create_appointment', 'reschedule_appointment'].includes(toolBlock.name)) continue;
+          marcouNesteTurno = true;
+          limparVagasLiberadas(phone); // marcou: o horário liberado deixa de valer (exceção e 5d)
           perguntaTrocaPendente.delete(phone); // criou/remarcou: a pergunta acabou
           if (toolBlock.name !== 'create_appointment') continue;
           // Marcar paciente como recém-agendado quando create_appointment sucede
@@ -2134,6 +2150,37 @@ export async function processMessage(phone, message, options = {}) {
       registrarFalhaDeResposta(patient, phone, pushName).catch(() => {});
       return pendingLgpdAsk ? `${contingencia}\n\n${pendingLgpdAsk}` : contingencia;
     }
+
+    // 5d. Rede de segurança do caso Thiago (15/10/2026): o paciente LIBEROU um horário
+    // (pediu para reagendar) nas últimas 24 h, nada foi marcado desde então, o horário ainda
+    // não passou e a resposta diz que a consulta "continua/está mantida" citando o MESMO dia
+    // E a MESMA hora. Confere no CRM; se não há consulta ativa ali, troca a afirmação falsa
+    // por uma pergunta (que cita "reagendar", a hora e "?": o "sim" seguinte vai ao modelo).
+    try {
+      const liberada = vagaLiberadaRecente(phone);
+      const passou = liberada && new Date(`${liberada.date}T${liberada.time}:00-03:00`).getTime() < Date.now();
+      if (liberada && !passou && !marcouNesteTurno && assistantReply &&
+          /continua (confirmad|marcad|agendad|de p[eé])|(est[aá]|fica|segue|ficou) (mantid|confirmad|marcad|agendad)|mantive|consulta mantida/i.test(assistantReply)) {
+        const [, lm, ld] = liberada.date.split('-');
+        const hh = String(parseInt(liberada.time.slice(0, 2), 10)); const mi = liberada.time.slice(3, 5);
+        const horaTxt = mi === '00' ? `${hh}h` : `${hh}h${mi}`;
+        const citaHora = new RegExp(`\\b0?${hh}\\s*(h|:)`, 'i').test(assistantReply);
+        const citaData = assistantReply.includes(`${ld}/${lm}`) ||
+          (liberada.date === dataBRT() && /\bhoje\b/i.test(assistantReply)) ||
+          (liberada.date === dataBRT(Date.now() + 86400000) && /(?<!depois de\s)amanh[ãa]/i.test(assistantReply));
+        if (citaHora && citaData) {
+          const { getPatientAppointments } = await import('./crmApi.js');
+          const ap = await getPatientAppointments(patient.contact_phone || phone);
+          const existe = ap?.ok && Array.isArray(ap.data) && ap.data.some((x) =>
+            String(x.date).slice(0, 10) === liberada.date && String(x.time).slice(0, 5) === liberada.time && !['cancelado', 'faltou'].includes(x.status));
+          if (ap?.ok && !existe) {
+            console.warn(`🛑 Resposta dizia que a consulta continua, mas ${liberada.date} ${liberada.time} foi liberada e não remarcada (${patient.name || phone}) — trocada por pergunta`);
+            const nome1 = (patient.name && patient.name !== 'Novo Paciente') ? `, *${patient.name.split(' ')[0]}*` : '';
+            assistantReply = `Só pra confirmar${nome1}: quando você pediu para reagendar, o horário de ${ld}/${lm} às ${horaTxt} foi liberado. Quer que eu marque de novo nesse mesmo horário? 😊`;
+          }
+        }
+      }
+    } catch (e) { console.warn('⚠️ Conferência do horário liberado falhou:', e.message); }
 
     // 6. Cobrar o consentimento pendente no FIM da resposta (em vez de substituí-la)
     if (pendingLgpdAsk) {

@@ -157,6 +157,40 @@ function barrarContorno(tc, phone, apt, lista) {
  *   loteTemCreate / bloqueou: o lote atual tem create / uma trava já barrou no turno.
  *   perguntaFeita: a última fala da Claudia é a pergunta; ofertaHorario: foi oferta de horário.
  */
+// Horários que o PRÓPRIO paciente liberou ao pedir reagendamento (botão Reagendar ou
+// request_reschedule), guardados por 24 h. Se ele desistir e quiser MANTER, pode voltar a
+// ESSE horário mesmo com menos de 12 h de antecedência — mesmo telefone, mesma data e hora,
+// mesmo paciente e profissional (quando conhecidos). Caso Thiago (15/10/2026): o botão
+// cancelou a de hoje 15h, ele pediu para manter, o create era barrado pelas 12 h e a
+// Claudia respondeu "continua confirmada" sem consulta nenhuma. Memória do processo: um
+// restart esquece (vale a regra normal das 12 h). Marcar qualquer consulta zera a lista.
+const VAGA_LIBERADA_TTL_MS = 24 * 3600 * 1000;
+const vagasLiberadas = new Map(); // dígitos do telefone da conversa -> [{ date, time, ts, patientId, professionalId }]
+const chaveConversa = (p) => String(p || '').replace(/\D/g, '');
+const vigentes = (phone) => (vagasLiberadas.get(chaveConversa(phone)) || []).filter((v) => Date.now() - v.ts < VAGA_LIBERADA_TTL_MS);
+export function registrarVagaLiberada(phone, date, time, apt = {}) {
+  const k = chaveConversa(phone);
+  if (!k || !date || !time) return;
+  const lista = vigentes(phone);
+  lista.push({ date: String(date).slice(0, 10), time: String(time).slice(0, 5), ts: Date.now(),
+    patientId: apt?.patientId || null, professionalId: apt?.professionalId || null });
+  vagasLiberadas.set(k, lista);
+}
+// Com data e hora: aquele horário foi liberado por esta conversa nas últimas 24 h (e, se
+// informados dos dois lados, pelo mesmo paciente e com o mesmo profissional)?
+// Sem data e hora: o último horário liberado (ou null).
+export function vagaLiberadaRecente(phone, date, time, alvo = {}) {
+  const lista = vigentes(phone);
+  if (!(date && time)) return lista[lista.length - 1] || null;
+  return lista.find((v) => v.date === String(date).slice(0, 10) && v.time === String(time).slice(0, 5) &&
+    !(v.patientId && alvo?.patientId && v.patientId !== alvo.patientId) &&
+    !(v.professionalId && alvo?.professionalId && v.professionalId !== alvo.professionalId)) || null;
+}
+export function limparVagasLiberadas(phone) { vagasLiberadas.delete(chaveConversa(phone)); }
+const vagasLiberadasDoDia = (phone, date, professionalId) => vigentes(phone)
+  .filter((v) => v.date === String(date).slice(0, 10) && !(v.professionalId && professionalId && v.professionalId !== professionalId))
+  .map((v) => v.time);
+
 export async function handleToolCall(toolName, toolInput, phone = null, turnCtx = null) {
   console.log(`🔧 Tool call: ${toolName}`, JSON.stringify(toolInput));
 
@@ -229,6 +263,12 @@ export async function handleToolCall(toolName, toolInput, phone = null, turnCtx 
           return slotDate >= minTime;
         });
 
+        // O horário que o PRÓPRIO paciente liberou aparece mesmo com < 12 h, se ainda estiver
+        // livre no CRM e não tiver passado (sem isso o modelo nunca chegava ao create).
+        const proprios = phone ? vagasLiberadasDoDia(phone, date, professionalId)
+          .filter((h) => slots.includes(h) && !filteredSlots.includes(h) && new Date(`${date}T${h}:00`) >= nowBRT) : [];
+        if (proprios.length) { filteredSlots.push(...proprios); filteredSlots.sort(); }
+
         if (filteredSlots.length === 0) {
           return JSON.stringify({
             message: `Não há horários disponíveis para ${professionalName} em ${formatDateBR(date)} (${dayOfWeek}). Agendamentos precisam de no mínimo 12h de antecedência.`,
@@ -253,6 +293,10 @@ export async function handleToolCall(toolName, toolInput, phone = null, turnCtx 
           dayOfWeek,
           slots: filteredSlots,
         };
+        if (proprios.length) {
+          response.liberadosPeloPaciente = proprios;
+          response.aviso = `Os horários ${proprios.join(', ')} foram liberados por ESTE paciente quando pediu para reagendar; ele pode voltar a eles mesmo com menos de 12 h.`;
+        }
 
         // Se houver creates recentes nessa data, anexar aviso explícito.
         if (ownCreates.length > 0) {
@@ -320,7 +364,7 @@ export async function handleToolCall(toolName, toolInput, phone = null, turnCtx 
           if (last && (Date.now() - last.ts) < AVAILABILITY_TTL_MS) {
             const sameProf = last.professionalId === toolInput.professionalId;
             const sameDate = last.date === toolInput.date;
-            if (sameProf && !sameDate) {
+            if (sameProf && !sameDate && !vagaLiberadaRecente(phone, toolInput.date, toolInput.time, toolInput)) {
               console.warn(`⚠️ Date mismatch bloqueado — paciente ${phone}: check=${last.date}, create=${toolInput.date}`);
               return JSON.stringify({
                 error: 'DATE_MISMATCH',
@@ -337,7 +381,12 @@ export async function handleToolCall(toolName, toolInput, phone = null, turnCtx 
         const nowBRT2 = new Date(Date.now() - 3 * 3600000);
         const minTime2 = new Date(nowBRT2.getTime() + 12 * 3600000);
         if (aptDate < minTime2) {
-          return JSON.stringify({ error: 'Não é possível agendar com menos de 12 horas de antecedência. Por favor, escolha um horário mais adiante.' });
+          // Exceção: voltar ao horário que o PRÓPRIO paciente acabou de liberar (desistiu de reagendar).
+          const voltaAoSeu = phone && aptDate >= nowBRT2 && vagaLiberadaRecente(phone, toolInput.date, toolInput.time, toolInput);
+          if (!voltaAoSeu) {
+            return JSON.stringify({ error: 'Não é possível agendar com menos de 12 horas de antecedência. Por favor, escolha um horário mais adiante.' });
+          }
+          console.log(`↩️ ${phone} volta ao horário que ele mesmo liberou (${toolInput.date} ${toolInput.time}) — exceção às 12 h`);
         }
 
         // ⚠️ GUARD: bloqueia create_appointment se paciente já tem agendamento
@@ -639,6 +688,7 @@ export async function handleToolCall(toolName, toolInput, phone = null, turnCtx 
           return JSON.stringify({ error: cancelRes.error, message: 'Não consegui liberar o horário atual. Tente novamente.' });
         }
         console.log(`🗓️ request_reschedule: consulta ${nextApt.id} (${nextApt.date} ${nextApt.time}) cancelada — slot liberado`);
+        registrarVagaLiberada(phone, nextApt.date, nextApt.time, nextApt);
         turnCtx?.cancelledAppointmentIds?.add(nextApt.id);
 
         // 2) Cria card reagendar_pendente no Kanban (dedupe por apt_id)
