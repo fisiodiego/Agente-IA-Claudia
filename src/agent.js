@@ -1478,6 +1478,107 @@ export async function processMessage(phone, message, options = {}) {
       }
     }
 
+    // Botões da mensagem "quer remarcar?" (modelo remarcar_consulta_a, 20/10/2026; o envio
+    // está no scheduler). Só valem para quem RECEBEU essa mensagem nos últimos 30 dias
+    // (remarcar_envios, mesmo DDD + 8): "Remarcar"/"Agora nao" numa conversa comum seguem o
+    // caminho normal.
+    // - "Agora nao": resposta fixa, card → perdido (nao_remarcou), sem LLM; o scheduler não
+    //   manda mais essa mensagem para este telefone.
+    // - "Remarcar" de quem JÁ tem consulta futura (marcou por outro caminho depois da
+    //   mensagem): resposta fixa citando a consulta. Lendo só "Remarcar" com uma consulta
+    //   ativa, o LLM poderia chamar request_reschedule e CANCELAR a consulta nova. CRM sem
+    //   responder: pergunta fixa de dia e turno, pelo mesmo motivo. Sem consulta futura,
+    //   segue para o LLM, que oferece os horários (o texto da mensagem já está no histórico).
+    // Clique duplo chega junto pelo debounce ("Remarcar\nRemarcar"; 4 em ~900 cliques de botão
+    // de fev a out/2026): linhas iguais contam como um clique só.
+    const normBotao = (l) => l.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[!.\s]+$/, '');
+    const linhasMsg = msgTrimmed.split(/\s*\n\s*/).filter(Boolean);
+    const textoBotao = linhasMsg.length > 1 && linhasMsg.every((l) => normBotao(l) === normBotao(linhasMsg[0])) ? linhasMsg[0] : msgTrimmed;
+    const ehBotaoRemarcar = textoBotao.length <= 30 && /^remarcar[!.\s]*$/i.test(textoBotao);
+    const ehBotaoAgoraNao = textoBotao.length <= 30 && /^agora\s*n(a|ã)o[!.\s]*$/i.test(textoBotao);
+    if (ehBotaoRemarcar || ehBotaoAgoraNao) {
+      let envio = null;
+      try {
+        envio = db.prepare(
+          "SELECT * FROM remarcar_envios WHERE phone_suffix8 = ? AND sent_at > datetime('now','localtime','-30 days') ORDER BY id DESC LIMIT 1"
+        ).get(String(phone).replace(/\D/g, '').slice(-8)) || null;
+        if (envio && !mesmoTelefoneBR(envio.phone, phone)) envio = null;
+      } catch (err) {
+        console.warn('⚠️ Botões do "quer remarcar?": não consegui ler remarcar_envios:', err.message);
+      }
+      if (envio) {
+        const nomeLocal = patient.name && !/^novo paciente$/i.test(patient.name) ? patient.name.split(' ')[0] : '';
+        const nomeR = envio.primeiro_nome || nomeLocal;
+        if (ehBotaoAgoraNao) {
+          saveMessage(patient.id, 'user', message);
+          if (envio.resolution === 'agora_nao') {
+            console.log(`🔘 "Agora nao" repetido de ${patient.name || phone} — já tratado, sem nova resposta`);
+            return null;
+          }
+          try {
+            const { getFollowUpsByPhone, updateFollowUp } = await import('./crmApi.js');
+            const fuRes = await getFollowUpsByPhone(envio.phone);
+            const card = (Array.isArray(fuRes?.data) ? fuRes.data : []).find((c) => c.id === envio.card_id);
+            if (card && ['pendente', 'enviado', 'respondeu'].includes(card.status)) {
+              const up = await updateFollowUp(card.id, {
+                status: 'perdido',
+                lostReason: 'nao_remarcou',
+                notes: `${card.notes || ''}\nPaciente tocou em "Agora nao" na mensagem de remarcar em ${dataBRT().split('-').reverse().join('/')}.`.trim(),
+              });
+              console.log(up?.ok
+                ? `🚫 "Agora nao": card ${card.id} → perdido (${patient.name || phone})`
+                : `⚠️ "Agora nao": não consegui mover o card ${card.id}: ${up?.error || up?.status}`);
+            }
+          } catch (err) {
+            console.warn('⚠️ "Agora nao": erro ao mover o card:', err.message);
+          }
+          try {
+            db.prepare("UPDATE remarcar_envios SET resolved_at = datetime('now','localtime'), resolution = 'agora_nao' WHERE id = ?").run(envio.id);
+          } catch (err) {
+            console.warn('⚠️ "Agora nao": não consegui registrar a resposta:', err.message);
+          }
+          const reply = `Tudo bem${nomeR ? ', ' + nomeR : ''}! Quando quiser remarcar, é só me chamar por aqui.`;
+          saveMessage(patient.id, 'assistant', reply);
+          return reply;
+        }
+        try {
+          if (!envio.resolution) {
+            db.prepare("UPDATE remarcar_envios SET resolved_at = datetime('now','localtime'), resolution = 'remarcar' WHERE id = ?").run(envio.id);
+          }
+        } catch { /* só medição: não segura a resposta */ }
+        let futura = null;
+        let crmConferiu = false;
+        try {
+          const { getPatientAppointmentsById, getPatientAppointments } = await import('./crmApi.js');
+          const r = envio.patient_id ? await getPatientAppointmentsById(envio.patient_id) : await getPatientAppointments(envio.phone);
+          if (r?.ok && Array.isArray(r.data)) {
+            crmConferiu = true;
+            futura = r.data
+              .filter((a) => ['agendado', 'confirmado'].includes(a.status) && instanteConsultaBRT(a).getTime() > Date.now())
+              .sort((a, b) => instanteConsultaBRT(a) - instanteConsultaBRT(b))[0] || null;
+          }
+        } catch (err) {
+          console.warn('⚠️ "Remarcar": não consegui conferir as consultas no CRM:', err.message);
+        }
+        if (!crmConferiu) {
+          saveMessage(patient.id, 'user', message);
+          const reply = `${nomeR ? nomeR + ', qual' : 'Qual'} dia e turno ficam melhor pra você? 😊`;
+          saveMessage(patient.id, 'assistant', reply);
+          console.warn(`⚠️ "Remarcar" de ${patient.name || phone}: o CRM não respondeu — pergunta fixa de dia e turno, sem LLM`);
+          return reply;
+        }
+        if (futura) {
+          saveMessage(patient.id, 'user', message);
+          const [, fm, fd] = String(futura.date).slice(0, 10).split('-');
+          const reply = `${nomeR ? nomeR + ', vi' : 'Vi'} aqui que você já tem consulta marcada para ${fd}/${fm} às ${String(futura.time || '').slice(0, 5)}. 😊 Se precisar mudar o horário, é só me dizer.`;
+          saveMessage(patient.id, 'assistant', reply);
+          console.log(`🔘 "Remarcar" de ${patient.name || phone}: já tem consulta ${futura.date} ${futura.time} — resposta fixa, sem LLM`);
+          return reply;
+        }
+        console.log(`🔘 "Remarcar" de ${patient.name || phone}: sem consulta futura — segue para a Claudia oferecer horários`);
+      }
+    }
+
     // 2a. Se paciente acabou de agendar e manda msg curta tipo 'Ok', ignorar (não reprocessar)
     const recentSchedule = recentlyScheduled.get(phone);
     if (recentSchedule && Date.now() - recentSchedule < SCHEDULE_COOLDOWN) {

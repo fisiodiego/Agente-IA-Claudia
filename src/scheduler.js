@@ -1,10 +1,11 @@
 import cron from 'node-cron';
+import { existsSync } from 'node:fs';
 import { respostaClaramentePositiva } from './referralSentiment.js';
 import { getPendingFollowups, markFollowupSent, getPatientByPhone, createPatient, confirmDischarge, saveMessage } from './patientManager.js';
 import { followupTemplates, followupDescriptions, appointmentReminder24h, getGreeting, packageReminderLevel1, packageReminderLevel2, packageReminderLevel3, noShowRescheduling, waitlistNotification, postConsultationCheckIn, birthdayMessage, reactivationMessage, weeklyReportMessage, packageCompletedMessage, referralMessage, sameDayReminder } from './messageTemplates.js';
 import { getUpcomingAppointments, getRecentDischarges, getStalePackages, getRecentNoShows, getWaitlistMatches, removeFromWaitlist, getCompletedAppointments, getBirthdays, getInactivePatients, getWeeklyReport, getCompletedPackages, logClaudiaActivity, getFollowUpsByPhone } from './crmApi.js';
 import db from './database.js';
-import { recentReminderPhones, recentReminderNames } from './agent.js';
+import { recentReminderPhones, recentReminderNames, chaveFone } from './agent.js';
 
 let sendMessageFn = null;
 let sendTemplateFn = null;
@@ -354,7 +355,8 @@ function campanhaBloqueada(phone, templateName) {
   }
 }
 
-async function smartSend(phone, text, templateName, templateParams = []) {
+// soModelo: a mensagem SÓ faz sentido como modelo (tem botões) — sem o texto livre de reserva.
+export async function smartSend(phone, text, templateName, templateParams = [], { soModelo = false } = {}) {
   const permissao = podeEnviarAutomatica(phone, text, templateName);
   if (!permissao.pode) {
     bloqueiosAntiFlood++;
@@ -414,6 +416,10 @@ async function smartSend(phone, text, templateName, templateParams = []) {
   // Fallback: texto normal - so funciona DENTRO da janela de 24h.
   // Antes ele mandava as cegas: a API aceitava (200 OK), a Meta derrubava depois
   // e o chamador gravava como enviado. Agora a janela e conferida antes.
+  if (!sentOk && soModelo) {
+    console.warn(`⚠️ Template ${templateName} não saiu para ${phone} — esta mensagem depende dos botões, sem texto livre de reserva. Nao enviado.`);
+    return false;
+  }
   if (!sentOk) {
     if (!janelaTextoLivreAberta(phone)) {
       naoEntreguesJanelaFechada++;
@@ -614,6 +620,13 @@ export function startScheduler() {
   // completa por dia.
   cron.schedule('30,40,50 14 * * *', async () => {
     await runKanbanDaily();
+  });
+
+  // ── "Quer remarcar?": 10:30 BRT (13:30 UTC), 3 chances (10:30/10:40/10:50) ──
+  // Meia hora depois do pós-consulta (10h), para não sair junto. config.remarcarDailyRun
+  // (dia) + guarda remarcarRodando = uma rodada por dia. Desligado sem data/remarcar.ligado.
+  cron.schedule('30,40,50 13 * * *', async () => {
+    await enviarQuerRemarcar();
   });
 }
 
@@ -971,6 +984,279 @@ async function expireStaleRescheduleCards() {
     }
   } catch (err) {
     console.error('❌ Erro na expiração de cards de reagendamento:', err.message);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// "Quer remarcar?" — modelo remarcar_consulta_a (UTILITY), 20/10/2026
+// Teste de 30 dias pedido pelo Dr. Diego em 19/10/2026. Card vermelho do Kanban
+// (cancelamento / reagendamento) parado de 2 a 7 dias, sem consulta nova: UMA
+// mensagem com os botões "Remarcar" (a Claudia oferece horários) e "Agora nao"
+// (card → perdido, sem insistir); os botões são tratados no agent.js. Medido antes
+// do teste: de quem passa 2 dias sem remarcar, cerca de 1 em 3 remarca sozinho.
+// Só sai com o arquivo data/remarcar.ligado (liga/desliga sem reiniciar), com o
+// modelo APROVADO como UTILITY na Meta (se ela reclassificar como MARKETING, para:
+// o Dr. Diego pediu mensagem de utilidade) e passando em cada filtro de
+// tentarQuerRemarcar. Na dúvida, NÃO envia.
+// ═══════════════════════════════════════════════════════════════════════════════
+const REMARCAR_TEMPLATE = 'remarcar_consulta_a';
+const REMARCAR_LIGADO = new URL('../data/remarcar.ligado', import.meta.url);
+const REMARCAR_MIN_DIAS = 2;               // card parado há 2 dias ou mais...
+const REMARCAR_MAX_DIAS = 7;               // ...e há 7 no máximo
+const REMARCAR_TETO_DIA = 10;
+const REMARCAR_INTERVALO_DIAS = 30;        // no máximo 1 por telefone a cada 30 dias
+const REMARCAR_SILENCIO_HORAS = 48;        // conversou nas últimas 48 h → não manda
+const REMARCAR_CONSULTA_PASSADA_DIAS = 10; // nota citando consulta mais velha → não manda
+let remarcarRodando = false;
+
+function garantirTabelaRemarcar() {
+  db.exec(`CREATE TABLE IF NOT EXISTS remarcar_envios (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    card_id       TEXT UNIQUE,
+    apt_id        TEXT,
+    patient_id    TEXT,
+    phone         TEXT,
+    phone_suffix8 TEXT,
+    primeiro_nome TEXT,
+    consulta      TEXT,
+    sent_at       TEXT DEFAULT (datetime('now','localtime')),
+    resolved_at   TEXT,
+    resolution    TEXT
+  )`);
+}
+// Também na carga do módulo: o agent.js lê esta tabela quando os botões chegam.
+try {
+  garantirTabelaRemarcar();
+} catch (err) {
+  console.error('❌ Falha ao garantir a tabela remarcar_envios:', err.message);
+}
+
+function remarcarJaEnviadoParaConsulta(aptId) {
+  if (!aptId) return false;
+  try {
+    return !!db.prepare('SELECT 1 FROM remarcar_envios WHERE apt_id = ? LIMIT 1').get(String(aptId));
+  } catch {
+    return false;
+  }
+}
+
+// "dd/mm às HH:MM" da consulta citada na nota do card. Vale a ÚLTIMA citação: o card
+// acumula a história ("Cancelou consulta de 12/08 ... Agendou 31/08 ... Consulta de
+// 16/09 às 16:00 foi cancelada"). Formatos: "Cancelou consulta de", "Pediu reagendar
+// consulta de", "Consulta de ... cancelada no CRM em dd/mm às" (o "em" não conta) e o
+// "(de dd/mm às" da arrumação automática. Esta acrescenta ", marcada para Fulano" quando a
+// consulta era de OUTRA pessoa do mesmo telefone: aí deOutraPessoa (quem chama não envia).
+const RE_CONSULTA_NA_NOTA = /(?:consulta|\()\s*de (\d{2})\/(\d{2}) [àa]s (\d{1,2}):(\d{2})/gi;
+export function consultaDaNota(notes, agoraMs = Date.now()) {
+  const texto = String(notes || '');
+  const achados = [...texto.matchAll(RE_CONSULTA_NA_NOTA)];
+  const m = achados[achados.length - 1];
+  if (!m) return null;
+  const deOutraPessoa = /^,\s*marcada para\b/i.test(texto.slice(m.index + m[0].length));
+  const dd = m[1], mm = m[2], hh = m[3].padStart(2, '0'), mi = m[4];
+  if (Number(hh) > 23 || Number(mi) > 59) return null;
+  const hoje = new Date(agoraMs - 3 * 3600000);
+  const ref = Date.UTC(hoje.getUTCFullYear(), hoje.getUTCMonth(), hoje.getUTCDate());
+  // A nota não tem o ano: vale o que deixa a data mais perto de hoje (dezembro lido em janeiro).
+  const ano = [-1, 0, 1].map((k) => hoje.getUTCFullYear() + k)
+    .sort((a, b) => Math.abs(Date.UTC(a, mm - 1, dd) - ref) - Math.abs(Date.UTC(b, mm - 1, dd) - ref))[0];
+  const t = Date.UTC(ano, mm - 1, dd);
+  const d = new Date(t);
+  if (d.getUTCDate() !== Number(dd) || d.getUTCMonth() !== Number(mm) - 1) return null; // 31/02 etc.
+  const dias = Math.round((t - ref) / 86400000);
+  if (dias < -REMARCAR_CONSULTA_PASSADA_DIAS || dias > 120) return null;
+  return { data: `${ano}-${mm}-${dd}`, texto: `${dd}/${mm} as ${hh}:${mi}`, deOutraPessoa };
+}
+
+// "MARIA DA SILVA" → "Maria". Sem nome de verdade → saudação neutra ("Ola, tudo bem.").
+export function primeiroNomeRemarcar(nome) {
+  const p = String(nome || '').trim().split(/\s+/)[0] || '';
+  if (!/[a-zà-ú]/i.test(p) || /^(paciente|contato|novo)$/i.test(p)) return 'tudo bem';
+  return p.charAt(0).toUpperCase() + p.slice(1).toLowerCase();
+}
+
+// O mapa do takeover guarda o telefone no formato em que o WhatsApp mandou (com ou sem o 9):
+// confere os dois, senão o Dr. Diego na conversa passaria despercebido.
+export function variantesWaId(fone) {
+  const k = chaveFone(fone);
+  return k ? [`55${k.slice(0, 2)}9${k.slice(2)}`, `55${k}`] : [];
+}
+const mesmoFoneComDDD = (a, b) => { const k = chaveFone(a); return !!k && k === chaveFone(b); };
+const diaBRT = (ms) => new Date(ms - 3 * 3600000).toISOString().slice(0, 10);
+const diaBR = (ms = Date.now()) => diaBRT(ms).split('-').reverse().join('/');
+
+async function modeloRemarcarAprovado() {
+  try {
+    const url = `https://api.chakrahq.com/v1/ext/plugin/whatsapp/api/v22.0/${WABA_CHAKRA_ID}/message_templates?name=${REMARCAR_TEMPLATE}`;
+    const res = await fetch(url, { headers: { Authorization: `Bearer ${process.env.WA_ACCESS_TOKEN}` } });
+    const json = await res.json();
+    const t = (Array.isArray(json?.data) ? json.data : []).find((x) => x.name === REMARCAR_TEMPLATE);
+    if (t?.status === 'APPROVED' && t.category === 'UTILITY') return true;
+    if (t?.status === 'APPROVED') {
+      console.warn(`⚠️ "Quer remarcar?": a Meta aprovou o modelo como ${t.category}, não UTILITY — nada enviado (o Dr. Diego pediu mensagem de utilidade)`);
+    } else {
+      console.log(`⏳ "Quer remarcar?": modelo ${REMARCAR_TEMPLATE} ${t ? 'ainda ' + t.status : 'não encontrado'} na Meta — nada enviado`);
+    }
+  } catch (err) {
+    console.warn('⚠️ "Quer remarcar?": não consegui conferir o modelo na Meta:', err.message);
+  }
+  return false;
+}
+
+// Um card: devolve 'enviado' ou o motivo de ficar de fora (vai para o resumo do log).
+// Filtros baratos primeiro (banco local), CRM por último; qualquer dúvida → não envia.
+async function tentarQuerRemarcar(card, crm, { idsDiego, soDiego, tocado }) {
+  const idadeDias = (Date.now() - tocado) / 86400000;
+  if (!tocado || idadeDias < REMARCAR_MIN_DIAS || idadeDias > REMARCAR_MAX_DIAS) return 'fora da janela de 2 a 7 dias';
+  // "Adiar" no card: o Dr. Diego já está cuidando (inclusive depois de o prazo vencer).
+  if (card.snoozedUntil) return 'adiado pelo Dr. Diego';
+  const digits = String(card.phone || '').replace(/\D/g, '');
+  const s8 = digits.slice(-8);
+  if (!isValidBRPhone(digits) || /^(\d)\1{7}$/.test(s8) || !chaveFone(digits)) return 'telefone inválido';
+  // Card sem paciente vinculado: a arrumação do Kanban só vincula quando o telefone tem UM
+  // cadastro, então costuma ser telefone de família — a mensagem sairia com o nome de outra
+  // pessoa ("Ola, Beatriz. Sua consulta…" que era do filho). Revisão de 20/10/2026.
+  if (!card.patientId) return 'card sem paciente vinculado (telefone de família?)';
+  const notas = String(card.notes || '');
+  const consulta = consultaDaNota(notas);
+  if (!consulta) return 'nota sem a data da consulta';
+  if (consulta.deOutraPessoa) return 'a nota cita consulta de outra pessoa do telefone';
+  if (notas.includes('Mensagem automática "quer remarcar?"')) return 'já recebeu (nota do card)';
+  const aptIds = [...notas.matchAll(/\[apt_id:([^\]\s]+)\]/g)].map((m) => m[1]);
+  const aptId = aptIds[aptIds.length - 1] || null;
+  if (db.prepare('SELECT 1 FROM remarcar_envios WHERE card_id = ?').get(String(card.id))) return 'já recebeu (card)';
+  if (remarcarJaEnviadoParaConsulta(aptId)) return 'já recebeu (consulta)';
+  if (db.prepare(
+    "SELECT 1 FROM remarcar_envios WHERE phone_suffix8 = ? AND (resolution = 'agora_nao' OR sent_at > datetime('now','localtime', ?)) LIMIT 1"
+  ).get(s8, `-${REMARCAR_INTERVALO_DIAS} days`)) return 'recebeu nos últimos 30 dias ou disse "Agora nao"';
+  if (aptId && db.prepare('SELECT 1 FROM processed_noshows WHERE appointment_id = ?').get(aptId)) return 'já recebeu a mensagem de falta';
+  if (campanhaBloqueada(digits, REMARCAR_TEMPLATE)) return 'lista de exclusão de campanhas';
+  if (db.prepare(
+    "SELECT 1 FROM message_log WHERE substr(replace(replace(replace(replace(replace(phone,' ',''),'-',''),'(',''),')',''),'+',''), -8) = ? AND created_at > datetime('now','localtime', ?) LIMIT 1"
+  ).get(s8, `-${REMARCAR_SILENCIO_HORAS} hours`)) return 'conversou nas últimas 48 h';
+  if (isHumanActiveFn && variantesWaId(digits).some((v) => { try { return isHumanActiveFn(v); } catch { return true; } })) return 'Dr. Diego na conversa';
+
+  // CRM: o telefone tem de ser do paciente do card (mesmo DDD + 8) e ele não pode ter
+  // consulta nova. Falha do CRM → fica para amanhã.
+  const busca = await crm.searchPatientByPhone(digits);
+  if (!busca?.ok) return 'CRM falhou (busca do paciente)';
+  const pac = busca.data?.found ? busca.data.patient : null;
+  if (!pac) return 'telefone sem cadastro no CRM';
+  if (!mesmoFoneComDDD(pac.phone, digits)) return 'cadastro do CRM com outro DDD';
+  if (pac.id !== card.patientId) return 'telefone de outra pessoa no CRM (família)';
+  if (String(pac.status || '').toLowerCase() === 'alta') return 'paciente de alta';
+  if (!soDiego && !idsDiego.has(pac.professionalId)) return 'pode ser consulta de outro profissional';
+  const futuras = await crm.getPatientAppointmentsById(pac.id);
+  if (!futuras?.ok || !Array.isArray(futuras.data)) return 'CRM falhou (consultas)';
+  if (futuras.data.some((a) => !['cancelado', 'faltou', 'concluido'].includes(a.status))) return 'já tem consulta marcada';
+  // Remarcou e até já veio (concluída), desde o cancelamento ou desde a data da consulta.
+  const todas = await crm.getPatientAppointments(digits, { includeCompleted: true });
+  if (!todas?.ok || !Array.isArray(todas.data)) return 'CRM falhou (consultas)';
+  const tCriado = new Date(card.createdAt || 0).getTime() || tocado;
+  const desde = [diaBRT(tCriado), consulta.data].sort()[0];
+  if (todas.data.some((a) => String(a.date || '') >= desde && !['cancelado', 'faltou'].includes(a.status))) return 'remarcou ou já voltou';
+
+  const nome = primeiroNomeRemarcar(pac.name || card.patientName);
+  // Texto como o paciente vê, para o histórico: quando ele tocar num botão, a Claudia sabe do que se trata.
+  const texto = `*Consulta desmarcada*\nOla, ${nome}. Sua consulta de ${consulta.texto} com o Dr. Diego Matos foi desmarcada e ainda esta sem nova data. Para escolher um novo horario ou encerrar esta pendencia, use as opcoes abaixo.\n_Instituto Holiz_\n[Botoes: Remarcar | Agora nao]`;
+  // Registra ANTES de enviar (revisão de 20/10/2026): se o banco falhar depois do envio
+  // (busy_timeout 0) ou a Claudia reiniciar no meio, o pior caso é ninguém receber — nunca
+  // receber duas vezes. Envio que não sai apaga o registro e o card tenta de novo amanhã.
+  let registro;
+  try {
+    registro = db.prepare('INSERT INTO remarcar_envios (card_id, apt_id, patient_id, phone, phone_suffix8, primeiro_nome, consulta) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run(String(card.id), aptId, pac.id, digits, s8, nome === 'tudo bem' ? null : nome, consulta.texto).lastInsertRowid;
+  } catch (err) {
+    console.warn(`⚠️ "Quer remarcar?": não consegui registrar antes de enviar para ${digits} (${err.message}) — fica para amanhã`);
+    return 'banco ocupado ao registrar (tenta de novo amanhã)';
+  }
+  const ok = await smartSend(digits, texto, REMARCAR_TEMPLATE, [nome, consulta.texto], { soModelo: true });
+  if (!ok) {
+    try {
+      db.prepare('DELETE FROM remarcar_envios WHERE id = ?').run(registro);
+    } catch (err) {
+      console.warn(`⚠️ "Quer remarcar?": não saiu para ${digits} e o registro ficou (${err.message}) — este card não tenta de novo`);
+    }
+    return 'envio barrado ou falhou (tenta de novo amanhã)';
+  }
+  const up = await crm.updateFollowUp(card.id, { notes: `${notas}\nMensagem automática "quer remarcar?" enviada pela Claudia em ${diaBR()}.`.trim() });
+  if (!up?.ok) console.warn(`⚠️ "Quer remarcar?": não consegui anotar no card ${card.id}:`, up?.error || up?.status);
+  console.log(`📅 "Quer remarcar?" enviado para ${pac.name || card.patientName || digits} (${s8}) — consulta de ${consulta.texto}, card ${card.id}`);
+  return 'enviado';
+}
+
+export async function enviarQuerRemarcar() {
+  if (!sendTemplateFn) return;
+  if (remarcarRodando) {
+    console.log('⏳ "Quer remarcar?": rodada anterior ainda em execução — pulando esta chance');
+    return;
+  }
+  const hoje = new Date().toISOString().slice(0, 10);
+  try {
+    if (db.prepare("SELECT value FROM config WHERE key = 'remarcarDailyRun'").get()?.value === hoje) return;
+  } catch (err) {
+    console.warn('⚠️ "Quer remarcar?": não consegui ler a marca do dia, rodando assim mesmo:', err.message);
+  }
+  if (!existsSync(REMARCAR_LIGADO)) {
+    console.log('💤 "Quer remarcar?" desligado (sem data/remarcar.ligado) — nada enviado');
+    return;
+  }
+  remarcarRodando = true;
+  try {
+    garantirTabelaRemarcar();
+    // Sem a marca do dia nos "return" abaixo: a próxima chance (ou o dia seguinte) tenta de novo.
+    if (!(await modeloRemarcarAprovado())) return;
+    const crm = await import('./crmApi.js');
+    const cards = [];
+    for (const type of RESCHEDULE_CARD_TYPES) {
+      const r = await crm.listFollowUps(type, ['pendente', 'enviado', 'respondeu']);
+      if (!r?.ok || !Array.isArray(r.data)) {
+        console.warn(`⚠️ "Quer remarcar?": o CRM não listou os cards de ${type} (${r?.error || r?.status}) — a próxima chance tenta de novo`);
+        return;
+      }
+      cards.push(...r.data);
+    }
+    const profs = await crm.listProfessionals();
+    if (!profs?.ok || !Array.isArray(profs.data)) {
+      console.warn('⚠️ "Quer remarcar?": o CRM não listou os profissionais — a próxima chance tenta de novo');
+      return;
+    }
+    // O modelo diz "com o Dr. Diego Matos" e a consulta cancelada não vem pela API: com outro
+    // profissional ativo no CRM, só vai para quem tem o cadastro ligado ao Dr. Diego.
+    const idsDiego = new Set(profs.data.filter((p) => /diego/i.test(p.name || '')).map((p) => p.id));
+    const soDiego = idsDiego.size > 0 && profs.data.every((p) => idsDiego.has(p.id));
+
+    const tocadoEm = (c) => Math.max(new Date(c.createdAt || 0).getTime() || 0, new Date(c.updatedAt || 0).getTime() || 0);
+    cards.sort((a, b) => tocadoEm(a) - tocadoEm(b)); // mais antigos primeiro: quem está perto dos 7 dias não perde a vez
+    let enviados = db.prepare("SELECT COUNT(*) AS n FROM remarcar_envios WHERE sent_at >= date('now','localtime')").get().n;
+    const jaHoje = enviados;
+    const fora = {};
+    for (const card of cards) {
+      if (enviados >= REMARCAR_TETO_DIA) {
+        console.log(`📅 "Quer remarcar?": teto de ${REMARCAR_TETO_DIA} por dia atingido — o resto fica para amanhã`);
+        break;
+      }
+      let r;
+      try {
+        r = await tentarQuerRemarcar(card, crm, { idsDiego, soDiego, tocado: tocadoEm(card) });
+      } catch (err) {
+        r = 'erro';
+        console.warn(`⚠️ "Quer remarcar?": erro no card ${card.id}:`, err.message);
+      }
+      if (r === 'enviado') {
+        enviados++;
+        await sleep(2000);
+      } else {
+        fora[r] = (fora[r] || 0) + 1;
+      }
+    }
+    db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('remarcarDailyRun', ?)").run(hoje);
+    const resumo = Object.entries(fora).map(([m, n]) => `${n} ${m}`).join('; ');
+    console.log(`📅 "Quer remarcar?": ${enviados - jaHoje} enviada(s) de ${cards.length} card(s) vermelho(s)${resumo ? ` | fora: ${resumo}` : ''}`);
+  } catch (err) {
+    console.error('❌ Erro no "quer remarcar?":', err.message);
+  } finally {
+    remarcarRodando = false;
   }
 }
 
@@ -1530,7 +1816,7 @@ async function checkStalePackages() {
 // Feature 2: Reagendamento de faltantes
 // ═══════════════════════════════════════════════════════════════════════════════
 
-async function checkNoShows() {
+export async function checkNoShows() {
   if (!sendMessageFn) return;
 
   try {
@@ -1562,6 +1848,13 @@ async function checkNoShows() {
         ).get(ns.appointmentId);
 
         if (already) continue;
+
+        // A mesma consulta já recebeu o "quer remarcar?" (20/10/2026): não manda as duas.
+        if (remarcarJaEnviadoParaConsulta(ns.appointmentId)) {
+          db.prepare('INSERT OR IGNORE INTO processed_noshows (appointment_id, processed_at) VALUES (?, ?)').run(ns.appointmentId, new Date().toISOString());
+          console.log(`🚫 Falta de ${ns.patientName} (${ns.date} ${ns.time}): a consulta já teve a mensagem "quer remarcar?" — a de falta não sai`);
+          continue;
+        }
 
         const message = noShowRescheduling(
           ns.patientName,
