@@ -14,6 +14,18 @@
 // dados da sombra calibram os limiares antes de qualquer resposta ao paciente.
 // Ausente/off/qualquer outro valor = ignorado como sempre foi.
 //
+// v3 (03/11/2026, opção B aprovada pelo Dr. Diego depois de 24 áudios na
+// sombra, 0 falha): AUDIO_TRANSCRICAO=on liga a REDE DE SEGURANÇA. O áudio é
+// transcrito e registrado como na sombra (a sombra continua idêntica) e, se
+// em 30 min NINGUÉM respondeu, a Claudia entra: transcrição "ok" → o texto vai
+// para ela como se o paciente tivesse escrito; qualquer outra coisa (incerta,
+// baixa, vazio, falha, áudio longo) → pede para o paciente escrever. Fica
+// quieta se o Dr. Diego falou com o paciente de 2 h antes do áudio em diante,
+// se já houve resposta por texto ou se o paciente escreveu depois do áudio.
+// Áudio de antes do último restart — e das 2 h seguintes a ele — não é
+// respondido (o takeover vive na memória: não dá para saber se o Diego falou). Voltar para sombra =
+// trocar a linha no .env, sem restart. A resposta fica na coluna `resposta`.
+//
 // O que o laboratório de 30/09 mediu e está aplicado aqui:
 //  - whisper-cli devolve exit 0 MESMO quando não lê o áudio → sucesso = r.json
 //    existir e ser JSON válido, nunca o exit code;
@@ -72,6 +84,9 @@ export const deps = {
   memoriaLivre: () => os.freemem(),
   tmpdir: () => os.tmpdir(),
   db: () => db,
+  // Subida do processo (s): a rede de segurança não sabe o que o Dr. Diego falou
+  // antes dela (takeover e últimas mensagens dele vivem na memória).
+  subidaS: Math.floor(Date.now() / 1000),
 };
 
 // ─── Chave liga/desliga (AUDIO_TRANSCRICAO=off|sombra) ──────────────────────
@@ -456,6 +471,8 @@ export function resumoTranscricao(r) {
 // não na subida (com off o banco fica igual). Telefone só pelo sufixo-8.
 // wamid UNIQUE = dedupe da reentrega da Meta que sobrevive a restart.
 let tabelaOk = false;
+let temColunasV3 = false;
+const COLUNAS_V3 = [['wa_id', 'TEXT'], ['resposta', 'TEXT'], ['ts_resposta', 'INTEGER']];
 function garantirTabela() {
   if (tabelaOk) return;
   deps.db().exec(`
@@ -493,19 +510,37 @@ function garantirTabela() {
     );
     CREATE INDEX IF NOT EXISTS idx_audio_sombra_fone ON audio_sombra(fone8, ts_audio);
   `);
-  tabelaOk = true;
+  // v3: colunas da rede de segurança (só preenchidas com 'on'). Se o ALTER falhar
+  // (banco ocupado: busy_timeout 0), a chegada é gravada SEM elas, como na v2, e
+  // a criação é tentada de novo no próximo áudio.
+  const existentes = new Set(deps.db().prepare('PRAGMA table_info(audio_sombra)').all().map((c) => c.name));
+  for (const [nome, tipo] of COLUNAS_V3) {
+    if (existentes.has(nome)) continue;
+    try {
+      deps.db().exec(`ALTER TABLE audio_sombra ADD COLUMN ${nome} ${tipo}`);
+      existentes.add(nome);
+    } catch (e) {
+      console.warn(`⚠️🎤 audio_sombra: coluna ${nome} não criada agora (${e?.message})`);
+    }
+  }
+  temColunasV3 = COLUNAS_V3.every(([nome]) => existentes.has(nome));
+  tabelaOk = temColunasV3;
 }
 
 const sqlv = (x) => (x === undefined || (typeof x === 'number' && !Number.isFinite(x)) ? null : typeof x === 'boolean' ? (x ? 1 : 0) : x);
 
 // Registra a chegada. Devolve o id da linha, 0 se o wamid já existe (reentrega)
 // ou null se o banco falhou (segue transcrevendo; o dedupe em memória cobre).
-function registrarChegada({ wamid, fone8, tsAudio, modo, takeover }) {
+function registrarChegada({ wamid, fone8, tsAudio, modo, takeover, waId }) {
   try {
     garantirTabela();
     const d = deps.db();
-    const r = d.prepare(`INSERT OR IGNORE INTO audio_sombra (wamid, fone8, ts_audio, ts_chegada, modo, takeover) VALUES (?, ?, ?, ?, ?, ?)`)
-      .run(sqlv(wamid), sqlv(fone8), sqlv(tsAudio), Math.floor(Date.now() / 1000), sqlv(modo), sqlv(takeover));
+    // wa_id (telefone inteiro) só com 'on': é para onde a rede de segurança responde.
+    const r = temColunasV3
+      ? d.prepare(`INSERT OR IGNORE INTO audio_sombra (wamid, fone8, ts_audio, ts_chegada, modo, takeover, wa_id) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+        .run(sqlv(wamid), sqlv(fone8), sqlv(tsAudio), Math.floor(Date.now() / 1000), sqlv(modo), sqlv(takeover), modo === 'on' ? sqlv(waId || null) : null)
+      : d.prepare(`INSERT OR IGNORE INTO audio_sombra (wamid, fone8, ts_audio, ts_chegada, modo, takeover) VALUES (?, ?, ?, ?, ?, ?)`)
+        .run(sqlv(wamid), sqlv(fone8), sqlv(tsAudio), Math.floor(Date.now() / 1000), sqlv(modo), sqlv(takeover));
     if (!r?.changes) return 0;
     const id = Number(r.lastInsertRowid);
     // Intervalo desde o áudio anterior do mesmo telefone: preenche a linha ANTERIOR
@@ -542,7 +577,6 @@ function registrarResultado(id, r) {
 
 // ─── Entrada do webhook ─────────────────────────────────────────────────────
 const vistos = new Map();   // wamid -> ts (2ª barreira, se o banco falhar)
-let avisouOn = false;
 let orfaos = null;
 const MOTIVOS_TECNICOS = new Set(['download', 'opusdec', 'whisper', 'timeout', 'memoria', 'fila', 'erro']);
 let falhasTecnicas = [];    // ts das falhas técnicas na última hora (só log)
@@ -551,20 +585,18 @@ let falhasTecnicas = [];    // ts das falhas técnicas na última hora (só log)
  * Áudio recebido no webhook (chamada sem await, com .catch). Com off retorna
  * na 1ª linha, antes de qualquer log, timer, gravação ou download.
  * opts.takeoverAtivo: () => boolean, leitura sem efeito colateral.
+ * opts.waId: telefone normalizado (55…) — com 'on', para onde a rede responde.
  */
-export async function receberAudio(msg, { takeoverAtivo } = {}) {
+export async function receberAudio(msg, { takeoverAtivo, waId } = {}) {
   const modo = modoAudio();
   if (modo === 'off') return; // como sempre foi: áudio ignorado
+  const rotulo = modo === 'on' ? '[ON]' : '[SOMBRA]';
   try {
-    if (modo === 'on' && !avisouOn) {
-      avisouOn = true;
-      console.warn('⚠️🎤 AUDIO_TRANSCRICAO=on ainda não existe nesta versão — tratado como SOMBRA (nada vai ao paciente)');
-    }
     const agora = Date.now();
     const fone8 = String(msg?.from || '').replace(/\D/g, '').slice(-8) || '?';
     const wamid = String(msg?.id || `sem-wamid-${agora}-${fone8}`);
     if (vistos.has(wamid)) {
-      console.log(`🎤 [SOMBRA] áudio ${wamid.slice(0, 30)}... reentregue pela Meta — ignorado`);
+      console.log(`🎤 ${rotulo} áudio ${wamid.slice(0, 30)}... reentregue pela Meta — ignorado`);
       return;
     }
     if (vistos.size > 2000) for (const [w, ts] of vistos) if (agora - ts > 24 * 3600000) vistos.delete(w);
@@ -572,27 +604,120 @@ export async function receberAudio(msg, { takeoverAtivo } = {}) {
     let takeover = null;
     try { takeover = takeoverAtivo ? (takeoverAtivo() ? 1 : 0) : null; } catch { /* sem leitura */ }
     const tsAudio = Number(msg?.timestamp) || null;
-    const id = registrarChegada({ wamid, fone8, tsAudio, modo, takeover });
+    const id = registrarChegada({ wamid, fone8, tsAudio, modo, takeover, waId });
     if (id === 0) {
-      console.log(`🎤 [SOMBRA] áudio ${wamid.slice(0, 30)}... já registrado (reentrega) — ignorado`);
+      console.log(`🎤 ${rotulo} áudio ${wamid.slice(0, 30)}... já registrado (reentrega) — ignorado`);
       return;
     }
-    console.log(`🎤 [SOMBRA] áudio de …${fone8} recebido — transcrevendo só para registro${takeover ? ' (Dr. Diego na conversa)' : ''}`);
+    console.log(`🎤 ${rotulo} áudio de …${fone8} recebido — ${modo === 'on' ? 'transcrevendo (a Claudia entra se ninguém responder em 30 min)' : 'transcrevendo só para registro'}${takeover ? ' (Dr. Diego na conversa)' : ''}`);
     if (!orfaos) orfaos = limparOrfaos();
     await orfaos;
     const a = msg?.audio || {};
     const r = await transcreverAudio({ mediaId: a.id, sha256: a.sha256, mime: a.mime_type });
     registrarResultado(id, r);
-    console.log(`🎤 [SOMBRA] …${fone8}: ${resumoTranscricao(r)}`);
+    console.log(`🎤 ${rotulo} …${fone8}: ${resumoTranscricao(r)}`);
     // Falha sistêmica (whisper quebrado, opusdec removido, token): só log. Na
-    // sombra nenhum paciente é afetado — não há card nem WhatsApp ao Dr. Diego.
+    // sombra nenhum paciente é afetado; com 'on' o paciente recebe o pedido
+    // para escrever (rede de segurança) — não há card nem WhatsApp ao Dr. Diego.
     if (!r?.ok && MOTIVOS_TECNICOS.has(r?.motivo)) {
       const t = Date.now();
       falhasTecnicas = falhasTecnicas.filter((x) => t - x < 3600000);
       falhasTecnicas.push(t);
-      if (falhasTecnicas.length === 3) console.error(`🚨🎤 [SOMBRA] 3 falhas técnicas de transcrição na última hora (última: ${r.motivo}${r.detalhe ? '/' + r.detalhe : ''}) — conferir o log 🎤 (sombra: nenhum paciente afetado)`);
+      if (falhasTecnicas.length === 3) console.error(`🚨🎤 ${rotulo} 3 falhas técnicas de transcrição na última hora (última: ${r.motivo}${r.detalhe ? '/' + r.detalhe : ''}) — conferir o log 🎤 (${modo === 'on' ? 'com on: o paciente recebe o pedido para escrever' : 'sombra: nenhum paciente afetado'})`);
     }
   } catch (e) {
-    console.warn('⚠️🎤 [SOMBRA] erro no registro do áudio:', e?.message);
+    console.warn(`⚠️🎤 ${rotulo} erro no registro do áudio:`, e?.message);
+  }
+}
+
+// ─── Rede de segurança (v3, AUDIO_TRANSCRICAO=on) ───────────────────────────
+// Varredura de 1 em 1 minuto sobre as linhas 'on' ainda sem resposta. Os áudios
+// do mesmo telefone vão juntos, e só quando o ÚLTIMO deles completa 30 min (a
+// rajada de 5 áudios em 5 min da Hannah, 22/10, vira uma resposta só). A linha
+// é marcada ANTES de responder: se a Claudia cair no meio, aquele áudio fica sem
+// resposta automática — nunca com duas. Funções do webhook injetadas (sem
+// import circular): responder(waId, texto), pedirEscrita(waId),
+// takeoverAtivo(waId), diegoFalouDesde(waId, desdeMs).
+const ESPERA_RESPOSTA_S = 30 * 60;        // B: 30 min — o Diego sempre respondeu em ≤ 25 min
+const DIEGO_ANTES_S = 2 * 3600;           // Diego falou com o paciente até 2 h antes do áudio → é conversa dele
+const IDADE_MAX_S = 3 * 3600;             // áudio mais velho que isso (Claudia fora do ar) → não responde
+const TRANSCRICAO_PRESA_S = 15 * 60;      // ainda 'pendente' depois disso → trata como falha
+let rede = null;
+let varrendo = false;
+
+export function iniciarRespostaAudio(funcs) {
+  if (rede || !funcs) return;
+  rede = funcs;
+  const t = setInterval(() => {
+    varrerAudiosSemResposta().catch((e) => console.warn('⚠️🎤 [ON] rede de segurança:', e?.message));
+  }, 60000);
+  t.unref?.();
+}
+
+const SUFIXO_FONE = "substr(replace(replace(replace(replace(replace(phone,' ',''),'-',''),'(',''),')',''),'+',''), -8)";
+
+export async function varrerAudiosSemResposta(agoraS = Math.floor(Date.now() / 1000)) {
+  if (!rede || varrendo) return;
+  if (modoAudio() !== 'on') return; // sombra/off: nada a responder (nem lê o banco)
+  varrendo = true;
+  try {
+    garantirTabela();
+    if (!temColunasV3) return;
+    const d = deps.db();
+    const linhas = d.prepare(`SELECT id, fone8, wa_id, ts_audio, ts_chegada, takeover, estado, nivel, texto
+                              FROM audio_sombra WHERE modo = 'on' AND resposta IS NULL ORDER BY ts_audio, id`).all();
+    const grupos = new Map();
+    for (const l of linhas) {
+      const k = l.wa_id || `?${l.fone8}`;
+      if (!grupos.has(k)) grupos.set(k, []);
+      grupos.get(k).push(l);
+    }
+    for (const g of grupos.values()) {
+      const ids = g.map((l) => l.id);
+      const marcar = (resposta) => {
+        d.prepare(`UPDATE audio_sombra SET resposta = ?, ts_resposta = ? WHERE id IN (${ids.map(() => '?').join(',')})`)
+          .run(resposta, Math.floor(Date.now() / 1000), ...ids);
+      };
+      const quando = (l) => Number(l.ts_audio || l.ts_chegada) || agoraS;
+      const tsPrimeiro = Math.min(...g.map(quando));
+      const tsUltimo = Math.max(...g.map(quando));
+      const fone8 = g[0].fone8;
+      const wa = g[0].wa_id;
+      if (!wa) { marcar('pulado:sem_telefone'); continue; }
+      if (g.some((l) => (Number(l.ts_chegada) || 0) < deps.subidaS)) { marcar('pulado:antes_do_restart'); continue; }
+      if (agoraS - tsPrimeiro > IDADE_MAX_S) { marcar('pulado:velho'); continue; }
+      const transcrevendo = g.some((l) => l.estado === 'pendente' && agoraS - (Number(l.ts_chegada) || 0) < TRANSCRICAO_PRESA_S);
+      if (transcrevendo || agoraS - tsUltimo < ESPERA_RESPOSTA_S) continue; // ainda não é hora
+      // Nas 2 h depois de um restart a memória não cobre a janela de "o Dr. Diego
+      // falou desde 2 h antes do áudio": na dúvida, quieta (revisão de 03/11/2026).
+      // Depois da espera: a rajada inteira é decidida pelo 1º áudio, sem partir.
+      if (tsPrimeiro - DIEGO_ANTES_S < deps.subidaS) { marcar('pulado:restart_recente'); continue; }
+      // Erro ao ler o takeover = trata como Dr. Diego na conversa (na dúvida, quieta).
+      const lerDiego = (fn) => { try { return !!fn(); } catch { return true; } };
+      if (g.some((l) => l.takeover === 1) || lerDiego(() => rede.takeoverAtivo(wa))) { marcar('pulado:diego_na_conversa'); continue; }
+      if (lerDiego(() => rede.diegoFalouDesde(wa, (tsPrimeiro - DIEGO_ANTES_S) * 1000))) { marcar('pulado:diego_falou'); continue; }
+      const mov = d.prepare(`SELECT COALESCE(SUM(direction = 'outbound' AND type = 'text'), 0) AS saidas,
+                                    COALESCE(SUM(direction = 'inbound'), 0) AS entradas
+                             FROM message_log WHERE ${SUFIXO_FONE} = ? AND created_at > datetime(?, 'unixepoch', 'localtime')`)
+        .get(fone8, tsPrimeiro);
+      if (Number(mov?.saidas) > 0) { marcar('pulado:ja_respondido'); continue; }
+      if (Number(mov?.entradas) > 0) { marcar('pulado:paciente_escreveu'); continue; }
+      const todosOk = g.every((l) => l.estado === 'ok' && l.nivel === 'ok' && String(l.texto || '').trim());
+      marcar('enviando');
+      let res;
+      try {
+        res = todosOk
+          ? await rede.responder(wa, g.map((l) => String(l.texto).trim()).join('\n'))
+          : await rede.pedirEscrita(wa);
+      } catch (e) {
+        res = `erro:${String(e?.message || e).slice(0, 60)}`;
+      }
+      marcar(`${todosOk ? 'claudia' : 'pediu_escrita'}:${res}`);
+      console.log(`🎤 [ON] …${fone8}: ${g.length} áudio(s) sem resposta em 30 min → ${todosOk ? 'Claudia responde pelo texto transcrito' : 'pedido para escrever'} (${res})`);
+    }
+  } catch (e) {
+    console.warn('⚠️🎤 [ON] rede de segurança (varredura):', e?.message);
+  } finally {
+    varrendo = false;
   }
 }

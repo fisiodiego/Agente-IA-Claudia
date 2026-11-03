@@ -29,6 +29,12 @@ import db from './database.js';
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
+// Aviso que a rede de segurança dos áudios (whatsapp-cloudapi.js, v8) põe na
+// frente do texto transcrito — e o marcador do áudio que não deu para entender.
+// O LLM lê; as travas de troca × sessão a mais e o "ok" curto, não.
+const RE_AVISO_AUDIO = /\[Mensagem de voz do paciente[^\]]*\]\s*/g;
+const semAvisoAudio = (t) => String(t ?? '').replace(RE_AVISO_AUDIO, '');
+
 // ── Rate limit por paciente ────────────────────────────────────────────────
 // Protege contra abuso/loop infinito de mensagens consumindo tokens da API.
 // Se paciente passa de RATE_LIMIT_MAX msgs em RATE_LIMIT_WINDOW_MIN, Claudia
@@ -1610,6 +1616,58 @@ export async function processMessage(phone, message, options = {}) {
       }
     }
 
+    // 2d. Botão "Agendar" do convite de acompanhamento (retorno_*_a: 1, 3, 6 e
+    // 12 meses depois da alta) → resposta FIXA, aprovada pelo Dr. Diego em
+    // 03/11/2026: diz o valor do retorno ANTES de pedir dia e turno. Caso Orlando
+    // (02/11): marcou pelo convite, só soube do valor na véspera e desmarcou
+    // chateado — o retorno é sempre cobrado como consulta (decisão do Diego).
+    // Só vale se a ÚLTIMA mensagem nossa para este telefone, nos últimos 7 dias,
+    // foi um desses convites; qualquer outra coisa (Agendar de plano, de lead,
+    // conversa já andando) segue para o LLM como antes. Vem depois do 2b, que
+    // já passou o card do retorno para "respondeu".
+    if (!isNewPatient && !options.emTakeover && !perguntaTrocaAtiva &&
+        msgTrimmed.split('\n').every((l) => /^agendar[!.\s]*$/i.test(l.trim()))) {
+      let convite = null;
+      try {
+        const s8 = String(phone).replace(/\D/g, '').slice(-8);
+        const SUF = "substr(replace(replace(replace(replace(replace(phone,' ',''),'-',''),'(',''),')',''),'+',''), -8)";
+        const ultima = db.prepare(
+          `SELECT id, phone, type, content, created_at FROM message_log WHERE ${SUF} = ? AND direction = 'outbound' AND created_at > datetime('now','localtime','-7 days') ORDER BY id DESC LIMIT 1`
+        ).get(s8);
+        const m = ultima && ultima.type === 'template' ? /^\[TEMPLATE\] (retorno_\w+)/.exec(String(ultima.content || '')) : null;
+        // Mesmo DDD (o sufixo-8 tem 2 exceções: Idma 71 × Francisco Cirilo 79).
+        const ddd = (p) => { const d = String(p || '').replace(/\D/g, ''); return d.startsWith('55') && d.length >= 12 ? d.slice(2, 4) : null; };
+        const outroDDD = m && ddd(ultima.phone) && ddd(phone) && ddd(ultima.phone) !== ddd(phone);
+        // Depois do convite o paciente só tocou "Agendar" AGORA: qualquer outra fala,
+        // clique anterior (ex.: durante o takeover, sem resposta nossa) ou áudio, o
+        // Dr. Diego pode ter respondido à mão (isso não entra no message_log) — LLM.
+        const entradas = m ? db.prepare(
+          `SELECT content FROM message_log WHERE ${SUF} = ? AND direction = 'inbound' AND id > ?`
+        ).all(s8, ultima.id) : [];
+        const linhasAgora = msgTrimmed.split('\n').filter((l) => l.trim()).length;
+        let audioDepois = false;
+        if (m) {
+          try {
+            audioDepois = !!db.prepare("SELECT 1 FROM audio_sombra WHERE fone8 = ? AND ts_chegada > CAST(strftime('%s', ?, 'utc') AS INTEGER) LIMIT 1").get(s8, ultima.created_at);
+          } catch { /* sem a tabela de áudio: nenhum áudio recebido */ }
+        }
+        const falouOutraCoisa = m && (entradas.length > linhasAgora || audioDepois ||
+          entradas.some((r) => !String(r.content || '').split('\n').every((l) => /^agendar[!.\s]*$/i.test(l.trim()))));
+        convite = m && !outroDDD && !falouOutraCoisa ? m[1] : null;
+      } catch (e) {
+        console.warn('⚠️ "Agendar" do acompanhamento: falha ao ler message_log —', e.message, '(segue para o LLM)');
+      }
+      if (convite) {
+        const primeiro = (patient.name && patient.name !== 'Novo Paciente') ? String(patient.name).trim().split(/\s+/)[0] : '';
+        const nome = primeiro ? primeiro.charAt(0).toUpperCase() + primeiro.slice(1) : '';
+        const reply = `Ótimo${nome ? `, ${nome}` : ''}! 😊\nO retorno é uma nova consulta com o Dr. Diego, no valor de *R$ 280,00*.\nQual dia e turno você prefere — manhã ou tarde?`;
+        saveMessage(patient.id, 'user', message);
+        saveMessage(patient.id, 'assistant', reply);
+        console.log(`📅 "Agendar" do convite de acompanhamento (${convite}) de ${patient.name || phone} — resposta fixa com o valor do retorno`);
+        return reply;
+      }
+    }
+
     // 2c. Botão "Reagendar" → fluxo DETERMINÍSTICO completo: cancela a consulta
     // (libera o slot), cria o card no Kanban e RESPONDE DIRETO (com return).
     // Antes, após cancelar, o texto "Reagendar" seguia pro LLM — que consultava a
@@ -2086,19 +2144,23 @@ export async function processMessage(phone, message, options = {}) {
     //  - loteTemCreate/bloqueou: cancelar nesse contexto é mover (toolHandler);
     //  - perguntaFeita: a pergunta chegou ao paciente (só então a resposta libera);
     //  - ofertaHorario: a última fala ofereceu horário; cancelar aqui também é mover.
-    let userText = message;
+    //  - o aviso das mensagens de voz (rede de segurança dos áudios, v8) é para o
+    //    LLM, não para as travas: ele tem "cancelar"/"remarcar" (RE_TROCA) e faria
+    //    toda fala de áudio — e as 3 h seguintes — parecer pedido de troca, além
+    //    de nenhuma resposta por áudio contar como vaga (revisão de 03/11/2026).
+    let userText = semAvisoAudio(message);
     try {
       const falas = db.prepare(
         "SELECT content FROM conversations WHERE patient_id = ? AND role = 'user' AND created_at > datetime('now','localtime','-3 hours') ORDER BY id"
-      ).all(patient.id).map((r) => r.content);
-      userText = [...falas, message].join(' / ');
+      ).all(patient.id).map((r) => semAvisoAudio(r.content));
+      userText = [...falas, semAvisoAudio(message)].join(' / ');
     } catch (e) { /* sem histórico: só a mensagem atual */ }
     const turnCtx = {
       createdAppointmentIds: new Set(),
       cancelledAppointmentIds: new Set(),
       additionalSessionPatients: new Set(),
       perguntaPendente: perguntaTrocaAtiva,
-      msgAtual: message,
+      msgAtual: semAvisoAudio(message),
       userText,
       loteTemCreate: false,
       bloqueou: false,
@@ -2108,7 +2170,8 @@ export async function processMessage(phone, message, options = {}) {
     let iteracoes = 0;
     // Mesma lista do guard de msg curta pós-agendamento: agradecimento curto com
     // resposta vazia fica em silêncio (5c) — sem nova tentativa.
-    const ehAckCurtoMsg = msgTrimmed.length <= 20 && /^(ok|certo|beleza|blz|perfeito|show|fechado|obrigad[oa]|valeu|brigad[oa]|muito obrigad[oa]|combinado|ate la|até lá|tudo bem|ta bom|tá bom)[!\.\ ]*$/i.test(msgTrimmed);
+    const msgSemAviso = semAvisoAudio(msgTrimmed).trim();
+    const ehAckCurtoMsg = msgSemAviso.length <= 20 && /^(ok|certo|beleza|blz|perfeito|show|fechado|obrigad[oa]|valeu|brigad[oa]|muito obrigad[oa]|combinado|ate la|até lá|tudo bem|ta bom|tá bom)[!\.\ ]*$/i.test(msgSemAviso);
     let tentouDeNovo = false;
     let marcouNesteTurno = false; // create/reschedule com sucesso neste turno (rede de segurança 5d)
     while (true) {

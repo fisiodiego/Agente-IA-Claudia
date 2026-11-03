@@ -9,8 +9,8 @@ import express from 'express';
 import { extrairIp, checarOrigemMeta, TOTAL_FAIXAS } from './metaIps.js';
 import { processMessage } from './agent.js';
 import { isValidPhone } from './lidMap.js';
-import { logMessage, wasRecentBotOutbound } from './patientManager.js';
-import { receberAudio } from './transcricao.js';
+import { logMessage, wasRecentBotOutbound, getPatientByPhone, saveMessage } from './patientManager.js';
+import { receberAudio, iniciarRespostaAudio } from './transcricao.js';
 
 // ─── Config via .env ────────────────────────────────────────────────────────
 const PHONE_NUMBER_ID = process.env.WA_PHONE_NUMBER_ID;   // 1045271008668555
@@ -84,9 +84,73 @@ function normalizeBRPhone(phone) {
 function activateHumanTakeover(phone) {
   const wasActive = humanTakeoverMap.has(phone) && humanTakeoverMap.get(phone) > Date.now();
   humanTakeoverMap.set(phone, Date.now() + HUMAN_TAKEOVER_DURATION);
+  ultimaMsgDiego.set(String(phone).replace(/\D/g, '').slice(-8), Date.now());
   if (!wasActive) {
     console.log(`👨‍⚕️ Dr. Diego assumiu conversa com ${phone} — Cláudia pausada por 30 min`);
   }
+}
+
+// ─── Áudio sem resposta (rede de segurança, v3 — 03/11/2026) ────────────────
+// Quando o Dr. Diego falou por último com cada telefone (sufixo-8 → ms). Só na
+// memória, como o takeover: a rede não responde áudio de antes do restart.
+const ultimaMsgDiego = new Map();
+const sufixo8 = (p) => String(p || '').replace(/\D/g, '').slice(-8);
+
+// Takeover pelo sufixo-8: a chave do mapa é o telefone como chegou (com OU sem o
+// 9), e a do áudio pode vir no outro formato. Sem efeito colateral (não apaga).
+function takeoverAtivoPorSufixo(phone) {
+  const agora = Date.now();
+  if ((humanTakeoverMap.get('__ALL__') || 0) > agora) return true;
+  const s8 = sufixo8(phone);
+  for (const [k, ate] of humanTakeoverMap) {
+    if (k !== '__ALL__' && sufixo8(k) === s8 && ate > agora) return true;
+  }
+  return false;
+}
+
+function diegoFalouDesde(phone, desdeMs) {
+  const t = ultimaMsgDiego.get(sufixo8(phone));
+  return !!t && t >= desdeMs;
+}
+
+const conversaEmAndamento = (phone) => messageBuffer.has(phone) || processingLock.get(phone) || pendingQueue.has(phone);
+
+// Transcrição "ok": vai para a Claudia como se o paciente tivesse escrito, pelo
+// mesmo caminho do texto (trava, prazo, re-checagem do takeover antes do envio,
+// entrega atrasada). Não grava no message_log: o áudio nunca entrou lá.
+const AVISO_AUDIO = '[Mensagem de voz do paciente, transcrita automaticamente — pode haver pequenos erros. Se o pedido for cancelar ou remarcar, confirme com o paciente antes de executar.]';
+function responderAudioSemResposta(phone, texto) {
+  if (!String(phone || '').startsWith('55')) return 'nao_br';
+  if (takeoverAtivoPorSufixo(phone)) return 'diego_na_conversa';
+  if (conversaEmAndamento(phone)) return 'conversa_em_andamento';
+  messageBuffer.set(phone, {
+    texts: [`${AVISO_AUDIO}\n${texto}`],
+    pushName: null,
+    timer: setTimeout(() => processBuffered(phone), 1000),
+  });
+  return 'ok';
+}
+
+// Transcrição incerta/baixa/vazia, falha ou áudio longo: pede para escrever.
+async function pedirEscritaAudio(phone) {
+  if (!String(phone || '').startsWith('55')) return 'nao_br';
+  if (takeoverAtivoPorSufixo(phone)) return 'diego_na_conversa';
+  if (conversaEmAndamento(phone)) return 'conversa_em_andamento';
+  if (!isValidPhone(String(phone))) return 'telefone_invalido'; // sendMessage não enviaria e não avisaria
+  // Nome e histórico só da ficha DESTE telefone: o getPatientByPhone também acha
+  // pelo contact_phone, que pode ser de outra pessoa da família (revisão 03/11).
+  const achado = getPatientByPhone(phone);
+  const pac = achado && sufixo8(achado.phone) === sufixo8(phone) ? achado : null;
+  const primeiro = pac?.name && pac.name !== 'Novo Paciente' ? String(pac.name).trim().split(/\s+/)[0] : '';
+  const nome = primeiro ? primeiro.charAt(0).toUpperCase() + primeiro.slice(1) : '';
+  const texto = `Oi${nome ? `, ${nome}` : ''}! Recebi seu áudio, mas não consegui entender direito. 😊 Pode me escrever, por favor?`;
+  await sendMessage(phone, texto);
+  // No histórico, para a Claudia saber do que se trata quando o paciente escrever.
+  if (pac?.id) {
+    saveMessage(pac.id, 'user', '[Mensagem de voz do paciente — não foi possível entender a gravação]');
+    saveMessage(pac.id, 'assistant', texto);
+  }
+  return 'ok';
 }
 
 /**
@@ -771,7 +835,7 @@ function createWebhookServer() {
                 // Takeover lido sem efeito colateral (isHumanActive loga e apaga).
                 const fone = normalizeBRPhone(msg.from);
                 const takeoverAtivo = () => [fone, '__ALL__'].some((k) => (humanTakeoverMap.get(k) || 0) > Date.now());
-                receberAudio(msg, { takeoverAtivo }).catch((e) => console.error('🎤 Erro no ramo de áudio:', e?.message));
+                receberAudio(msg, { takeoverAtivo, waId: fone }).catch((e) => console.error('🎤 Erro no ramo de áudio:', e?.message));
               }
               // TODO: suportar mensagens de imagem, áudio, etc.
             }
@@ -925,6 +989,15 @@ export async function startWhatsApp() {
       console.log(`📡 Webhook escutando na porta ${WEBHOOK_PORT}`);
       console.log(`📞 Phone Number ID: ${PHONE_NUMBER_ID}`);
       console.log(`🤖 Agente pronto para receber mensagens!\n`);
+
+      // Rede de segurança dos áudios (AUDIO_TRANSCRICAO=on). Com sombra/off a
+      // varredura de cada minuto sai na 1ª linha, sem ler o banco.
+      iniciarRespostaAudio({
+        responder: responderAudioSemResposta,
+        pedirEscrita: pedirEscritaAudio,
+        takeoverAtivo: takeoverAtivoPorSufixo,
+        diegoFalouDesde,
+      });
 
       // Retornar a função sendMessage (mesma interface do Baileys)
       resolve(sendMessage);

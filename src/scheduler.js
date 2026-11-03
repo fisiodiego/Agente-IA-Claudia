@@ -2291,7 +2291,33 @@ async function sendBirthdayMessages() {
 // Reativação de pacientes inativos
 // ═══════════════════════════════════════════════════════════════════════════════
 
-async function sendReactivationMessages() {
+// Quem acabou de cancelar não recebe "sentimos sua falta" (pedido do Dr. Diego,
+// 03/11/2026). Caso Rodrigo M. T. Costa: consulta de 24/10 cancelada → "quer
+// remarcar?" em 26/10 e a reativação em 27/10, duas automáticas em dois dias. O
+// GET /patients/inactive ignora consultas canceladas, então quem estava sumido
+// havia 90+ dias, marcou e cancelou cai nas duas campanhas. Pula se recebeu o
+// "quer remarcar?" nos últimos 30 dias ou se tem card vermelho aberto no Kanban
+// (Reagendar/Cancelou). Na dúvida (banco ou CRM com erro) também pula: o
+// paciente não é marcado em sent_reactivations e volta na próxima terça.
+async function motivoPularReativacao(p) {
+  const s8 = String(p.phone || '').replace(/\D/g, '').slice(-8);
+  try {
+    if (s8.length === 8 && db.prepare(
+      "SELECT 1 FROM remarcar_envios WHERE phone_suffix8 = ? AND sent_at > datetime('now','localtime','-30 days') LIMIT 1"
+    ).get(s8)) return 'recebeu o "quer remarcar?" nos últimos 30 dias';
+  } catch (e) {
+    return `não consegui ler os envios do "quer remarcar?" (${e.message})`;
+  }
+  const cards = await getFollowUpsByPhone(p.phone);
+  if (!cards?.ok || !Array.isArray(cards.data)) return 'o CRM não respondeu na busca dos cards';
+  const vermelho = cards.data.find((f) =>
+    ['cancelamento', 'reagendamento'].includes(String(f.type || '')) &&
+    ['pendente', 'enviado', 'respondeu'].includes(String(f.status || '')));
+  return vermelho ? `tem card vermelho aberto no Kanban (${vermelho.type})` : null;
+}
+
+// Exportada para a bancada (v8, 03/11/2026).
+export async function sendReactivationMessages() {
   if (!sendMessageFn) return;
 
   try {
@@ -2334,8 +2360,22 @@ async function sendReactivationMessages() {
       return;
     }
 
-    // Teto de 10 por execução (cron semanal) para não disparar a fila inteira de uma vez
-    const batch = naoReceberam.slice(0, 10);
+    // Teto de 10 por execução (cron semanal) para não disparar a fila inteira de uma vez.
+    // Os pulos abaixo vêm ANTES do teto, pelo mesmo motivo da lista de exclusão.
+    const batch = [];
+    for (const p of naoReceberam) {
+      if (batch.length >= 10) break;
+      const motivo = await motivoPularReativacao(p);
+      if (motivo) {
+        console.log(`🔄 Reativação de ${p.name} fica para depois — ${motivo}`);
+        continue;
+      }
+      batch.push(p);
+    }
+    if (batch.length === 0) {
+      console.log('🔄 Nenhum inativo liberado para reativação nesta semana');
+      return;
+    }
 
     for (const patient of batch) {
       try {
